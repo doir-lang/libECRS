@@ -1,15 +1,8 @@
 #pragma once
 
 #include "component_id.hpp"
-#include "fp/pointer.h"
 
-#include <fp/dynarray.h>
-
-#include <algorithm>
-#include <limits>
-#include <utility>
 #include <numeric>
-#include <optional>
 
 namespace ecrs {
 

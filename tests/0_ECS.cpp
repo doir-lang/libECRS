@@ -2,12 +2,14 @@
 #include <doctest/doctest.h>
 
 #define ECRS_IMPLEMENTATION
-#include <ECRS/ecs.hpp>
+#include <ECRS/ecrs.hpp>
 #include <ECRS/adapter.hpp>
 
 #ifdef FP_ENABLE_BENCHMARKING
 	#include <nanobench.h>
 #endif
+
+#include "../libfp/tests/profile.config.hpp"
 
 TEST_SUITE("ECS") {
 #ifndef FP_DISABLE_STRING_COMPONENT_LOOKUP

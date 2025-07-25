@@ -1,6 +1,5 @@
 #pragma once
 
-#include <fp/dynarray.h>
 #include <fp/string.h>
 
 #ifdef ECRS_IMPLEMENTATION
