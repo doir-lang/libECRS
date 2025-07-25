@@ -63,7 +63,7 @@ namespace ecrs::kanren {
 	};
 
 	struct Term: public std::variant<Variable, ecrs::Entity, std::list<Term>> {};
-	size_t term2size_t(const Term& t) {
+	inline static size_t term2size_t(const Term& t) {
 		switch (t.index()) {
 		case 0: // Variable
 			return std::get<Variable>(t).id;
@@ -78,7 +78,7 @@ namespace ecrs::kanren {
 		default: return -1;
 		}
 	}
-	bool term_equivalence(const Term& a, const Term& b) {
+	inline static bool term_equivalence(const Term& a, const Term& b) {
 		if(a.index() != b.index()) return false;
 		switch (a.index()) {
 		case 0: // Variable
@@ -114,26 +114,26 @@ namespace ecrs::kanren {
 	template<typename T>
 	concept Goal = std::convertible_to<T, OwnedGoal> || std::is_same_v<T, OwnedGoal>;
 
-	Variable Variable::next(State& state) {
+	inline Variable Variable::next(State& state) {
 		return {state.counter++};
 	}
 
 	inline namespace micro {
-		std::optional<Term> assoc(const Term& key, const Substitutions& s) {
+		inline static std::optional<Term> assoc(const Term& key, const Substitutions& s) {
 			for (const auto& [k, v] : s)
 				if (term_equivalence(k, key))
 					return v;
 			return std::nullopt;
 		}
 
-		Term find(const Term& u, const Substitutions& s) {
+		inline static Term find(const Term& u, const Substitutions& s) {
 			if (std::holds_alternative<Variable>(u))
 				if (auto res = assoc(u, s); res)
 					return find(*res, s);
 			return u;
 		}
 
-		bool occurs(const Term& x, const Term& u, const Substitutions& s) {
+		inline static bool occurs(const Term& x, const Term& u, const Substitutions& s) {
 			Term u_ = find(u, s);
 			if (std::holds_alternative<Variable>(u_)) return term_equivalence(x, u_);
 			if (std::holds_alternative<std::list<Term>>(u_)) {
@@ -145,14 +145,14 @@ namespace ecrs::kanren {
 			return false;
 		}
 
-		std::optional<Substitutions> extend_substitutions(const Term& x, const Term& v, const Substitutions& s) {
+		inline static std::optional<Substitutions> extend_substitutions(const Term& x, const Term& v, const Substitutions& s) {
 			if (occurs(x, v, s)) return std::nullopt;
 			auto new_s = s;
 			new_s.emplace_back(x, v);
 			return new_s;
 		}
 
-		std::optional<Substitutions> unify(const Term& u, const Term& v, Substitutions s) {
+		inline static std::optional<Substitutions> unify(const Term& u, const Term& v, Substitutions s) {
 			Term u_ = find(u, s);
 			Term v_ = find(v, s);
 			if (term_equivalence(u_, v_)) return s;
@@ -177,25 +177,25 @@ namespace ecrs::kanren {
 			return std::nullopt;
 		}
 
-		std::generator<State> unit(State s) {
+		inline static std::generator<State> unit(State s) {
 			co_yield s;
 		}
 
-		std::generator<State> null(State s) {
+		inline static std::generator<State> null(State s) {
 			co_return;
 		}
 
-		Goal auto eq(const Term& u, const Term& v) {
+		inline static Goal auto eq(const Term& u, const Term& v) {
 			return [=](State sc) -> std::generator<State> {
 				auto [m, s, c] = sc;
 				if (auto s_ = unify(u, v, s); s_)
 					co_yield {m, *s_, c};
 			};
 		}
-		inline Goal auto operator==(const Term& u, const Term& v) { return eq(u, v); }
+		inline static Goal auto operator==(const Term& u, const Term& v) { return eq(u, v); }
 
 		template<Goal G>
-		Goal auto next_variable(std::convertible_to<std::function<G(Variable)>> auto f) {
+		inline Goal auto next_variable(std::convertible_to<std::function<G(Variable)>> auto f) {
 			return [f](State state) -> std::generator<State> {
 				Variable next{state.counter++};
 				auto f_next = f(next);
@@ -207,7 +207,7 @@ namespace ecrs::kanren {
 		inline Goal auto fresh(std::convertible_to<std::function<G(Variable)>> auto f) { return next_variable(f); }
 
 		template<typename F, size_t arity = detail::function_traits<F>::arity>
-		Goal auto next_variables(const F& f) {
+		inline Goal auto next_variables(const F& f) {
 			return [f](State state) -> std::generator<State> {
 				Variable next{state.counter++};
 				if constexpr(arity > 1) {
@@ -224,7 +224,7 @@ namespace ecrs::kanren {
 			};
 		}
 
-		std::generator<State> append(std::generator<State> g1, std::generator<State> g2) {
+		inline static std::generator<State> append(std::generator<State> g1, std::generator<State> g2) {
 			auto it1 = g1.begin();
 			auto it2 = g2.begin();
 
@@ -240,7 +240,7 @@ namespace ecrs::kanren {
 			}
 		}
 
-		Goal auto disjunction(Goal auto g1, Goal auto g2) {
+		inline static Goal auto disjunction(Goal auto g1, Goal auto g2) {
 			return [=](State state) {
 				return append(g1(state), g2(state));
 			};
@@ -248,17 +248,17 @@ namespace ecrs::kanren {
 		inline Goal auto operator|(Goal auto g1, Goal auto g2) { return disjunction(g1, g2); }
 
 		template <Goal... Goals>
-		Goal auto disjunction(Goal auto g1, Goal auto g2, Goals... rest) {
+		inline Goal auto disjunction(Goal auto g1, Goal auto g2, Goals... rest) {
 			return disjunction(g1, disjunction(g2, rest...));
 		}
 
-		std::generator<State> append_map(std::generator<State> g, Goal auto goal) {
+		inline std::generator<State> append_map(std::generator<State> g, Goal auto goal) {
 			for (auto s1 : g)
 				for(auto s2: goal(s1))
 					co_yield s2;
 		}
 
-		Goal auto conjunction(Goal auto g1, Goal auto g2) {
+		inline Goal auto conjunction(Goal auto g1, Goal auto g2) {
 			return [=](State state) {
 				return append_map(g1(state), g2);
 			};
@@ -266,13 +266,13 @@ namespace ecrs::kanren {
 		inline Goal auto operator&(Goal auto g1, Goal auto g2) { return conjunction(g1, g2); }
 
 		template <Goal... Goals>
-		Goal auto conjunction(Goal auto g1, Goal auto g2, Goals... rest) {
+		inline Goal auto conjunction(Goal auto g1, Goal auto g2, Goals... rest) {
 			return conjunction(g1, conjunction(g2, rest...));
 		}
 	} // kanren::micro
 
 	inline namespace mini {
-		Goal auto split_head(const Term& list, const Term& out) {
+		inline static Goal auto split_head(const Term& list, const Term& out) {
 			return [=](State state) -> std::generator<State> {
 				auto& [m, subs, c] = state;
 				auto out_ = find(out, subs);
@@ -293,7 +293,7 @@ namespace ecrs::kanren {
 			};
 		}
 
-		Goal auto split_tail(const Term& list, const Term& out) {
+		inline static Goal auto split_tail(const Term& list, const Term& out) {
 			return [=](State state) -> std::generator<State> {
 				auto& [m, subs, c] = state;
 				auto out_ = find(out, subs);
@@ -323,7 +323,7 @@ namespace ecrs::kanren {
 			};
 		}
 
-		Goal auto wrap_list(const Term& var, const Term& list) {
+		inline static Goal auto wrap_list(const Term& var, const Term& list) {
 			return [=](State state) -> std::generator<State> {
 				auto& [m, subs, c] = state;
 				auto var_ = find(var, subs);
@@ -341,13 +341,13 @@ namespace ecrs::kanren {
 			};
 		}
 
-		Goal auto split_tail_ensure_list(const Term& list, const Term& out) {
+		inline static Goal auto split_tail_ensure_list(const Term& list, const Term& out) {
 			return next_variables([=](Variable tmp){
 				return split_tail(list, {tmp}) & wrap_list({tmp}, out);
 			});
 		}
 
-		Goal auto split_head_and_tail(const Term& list, const Term& head, const Term& tail) {
+		inline static Goal auto split_head_and_tail(const Term& list, const Term& head, const Term& tail) {
 			return [=](State state) -> std::generator<State> {
 				auto& [m, subs, c] = state;
 				auto list_ = find(list, subs);
@@ -375,7 +375,7 @@ namespace ecrs::kanren {
 			};
 		}
 
-		Goal auto append(const Term& a, const Term& b, const Term& out) {
+		inline static Goal auto append(const Term& a, const Term& b, const Term& out) {
 			return [=](State state) -> std::generator<State> {
 				auto& [m, subs, c] = state;
 				auto a_ = find(a, subs);
@@ -436,7 +436,7 @@ namespace ecrs::kanren {
 			};
 		}
 
-		Goal auto element_of(const Term& list, const Term& element) {
+		inline static Goal auto element_of(const Term& list, const Term& element) {
 			return [=](State state) -> std::generator<State> {
 				auto& [m, subs, c] = state;
 				auto list_ = find(list, subs);
@@ -466,7 +466,7 @@ namespace ecrs::kanren {
 			};
 		}
 
-		OwnedGoal map(const Term& a, const Term& b, auto f) {
+		inline static OwnedGoal map(const Term& a, const Term& b, auto f) {
 			return next_variables([=](Variable aHead, Variable aTail, Variable bHead, Variable bTail){
 				return disjunction(
 					conjunction(eq(a, {std::list<Term>{}}), eq(b, {std::list<Term>{}})),
@@ -481,7 +481,7 @@ namespace ecrs::kanren {
 			});
 		}
 
-		Goal auto passthrough_if_not(Goal auto goal) {
+		inline Goal auto passthrough_if_not(Goal auto goal) {
 			return [=](State state) -> std::generator<State> {
 				for(auto s: goal(state))
 					co_return;
@@ -490,14 +490,14 @@ namespace ecrs::kanren {
 		}
 	}
 
-	Goal auto condition(bool condition) {
+	inline static Goal auto condition(bool condition) {
 		return [=](State state) -> std::generator<State> {
 			if(condition)
 				co_yield state;
 		};
 	}
 
-	Goal auto condition(const Goal auto& g, bool cond) {
+	inline static Goal auto condition(const Goal auto& g, bool cond) {
 		return g & condition(cond);
 	}
 }
@@ -505,18 +505,18 @@ namespace ecrs::kanren {
 namespace std {
 	template<>
 	struct hash<std::pair<ecrs::kanren::Term, ecrs::kanren::Term>> {
-		size_t operator()(const std::pair<ecrs::kanren::Term, ecrs::kanren::Term>& pair) const {
+		inline size_t operator()(const std::pair<ecrs::kanren::Term, ecrs::kanren::Term>& pair) const {
 			return ecrs::kanren::term2size_t(pair.first) ^ ecrs::kanren::term2size_t(pair.second);
 		}
 	};
 
-	bool operator==(const std::pair<ecrs::kanren::Term, ecrs::kanren::Term>& a, const std::pair<ecrs::kanren::Term, ecrs::kanren::Term>& b) {
+	inline static bool operator==(const std::pair<ecrs::kanren::Term, ecrs::kanren::Term>& a, const std::pair<ecrs::kanren::Term, ecrs::kanren::Term>& b) {
 		return ecrs::kanren::term_equivalence(a.first, b.first) && ecrs::kanren::term_equivalence(a.second, b.second);
 	}
 }
 
 namespace ecrs::kanren { inline namespace query {
-	std::generator<Substitution> unique_substitutions(auto& substitutions, std::unordered_set<Substitution>& found)
+	inline std::generator<Substitution> unique_substitutions(auto& substitutions, std::unordered_set<Substitution>& found)
 		requires(std::convertible_to<decltype(*substitutions.begin()), Substitution>)
 	{
 		for(auto& sub: substitutions)
@@ -526,7 +526,7 @@ namespace ecrs::kanren { inline namespace query {
 			}
 	}
 
-	std::generator<Substitution> unique_substitutions(auto& substitutions)
+	inline std::generator<Substitution> unique_substitutions(auto& substitutions)
 		requires(std::convertible_to<decltype(*substitutions.begin()), Substitution>)
 	{
 		std::unordered_set<Substitution> found;
@@ -534,25 +534,25 @@ namespace ecrs::kanren { inline namespace query {
 			co_yield sub;
 	}
 
-	std::generator<Substitution> unique_substitutions(std::convertible_to<std::generator<State>> auto states) {
+	inline std::generator<Substitution> unique_substitutions(std::convertible_to<std::generator<State>> auto states) {
 		std::unordered_set<Substitution> found;
 		for (const auto& [module, subs, counter] : states)
 			for(auto sub: unique_substitutions(subs, found))
 				co_yield sub;
 	}
 
-	std::generator<Substitution> unique_substitutions(Goal auto& goal, State& state) {
+	inline std::generator<Substitution> unique_substitutions(Goal auto& goal, State& state) {
 		for(const auto& s: unique_substitutions(goal(state)))
 			co_yield s;
 	}
 
-	std::generator<Substitution> all_substitutions(std::convertible_to<std::generator<State>> auto states) {
+	inline std::generator<Substitution> all_substitutions(std::convertible_to<std::generator<State>> auto states) {
 		for (const auto& [module, subs, counter] : states)
 			for(const auto& sub: subs)
 				co_yield sub;
 	}
 
-	std::generator<Substitution> all_substitutions(Goal auto& goal, State& state) {
+	inline std::generator<Substitution> all_substitutions(Goal auto& goal, State& state) {
 		for(const auto& s: all_substitutions(goal(state)))
 			co_yield s;
 	}

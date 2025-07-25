@@ -2,13 +2,6 @@
 #define __ECS_ADAPTER_HPP__
 
 #include "ecrs.hpp"
-#include "fp/dynarray.h"
-
-#include <bit>
-#include <cmath>
-#include <cstdint>
-#include <span>
-#include <type_traits>
 
 namespace ecrs {
 	template<typename T>

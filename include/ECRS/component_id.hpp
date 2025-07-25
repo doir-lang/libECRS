@@ -4,12 +4,10 @@
 #define FP_IMPLEMENTATION
 #endif
 
-#include <fp/string.h>
-#include <fp/hash/map.h>
-#include <stdexcept>
-#include <utility>
+#include <fp/hash/dictionary.hpp>
+#include <fp/hash/fnv1a.hpp>
 
-#include "../../libfp/tests/profile.config.hpp"
+#include <stdexcept>
 
 #include <typeinfo>
 #ifdef __GNUC__
@@ -19,38 +17,14 @@
 
 namespace ecrs {
 #ifndef ecrs_DISABLE_STRING_COMPONENT_LOOKUP
-	using ForwardPair = std::pair<fp_string, size_t>;
-	using ReversePair = std::pair<size_t, fp_string>;
+	using ForwardPair = std::pair<fp::string, size_t>;
+	using ReversePair = std::pair<size_t, fp::string>;
 
 	fp_hashmap(ForwardPair)& ecrs_get_forward_map() noexcept
 #ifdef ECRS_IMPLEMENTATION
 	{
-		static fp_hashmap(ForwardPair) map = [] {
-			fp_hashmap(ForwardPair) map = nullptr;
-			fp_hash_map_create_empty_table(ForwardPair, map, true);
-			// Only hash and compare the first element in the pair (makes it a map!)
-			fp_hash_map_set_hash_function(map, [](const fp_void_view key) noexcept -> uint64_t {
-				assert(fp_view_size(key) == sizeof(ForwardPair));
-				ForwardPair& pair = *fp_view_data(ForwardPair, key);
-				{
-					auto view = fp_string_to_view(pair.first);
-					return FP_HASH_FUNCTION({fp_view_data_void(view), fp_view_size(view)});
-				}
-			});
-			fp_hash_map_set_equal_function(map, [](const fp_void_view _a, const fp_void_view _b) noexcept -> bool {
-				assert(fp_view_size(_a) == sizeof(ForwardPair)); assert(fp_view_size(_b) == sizeof(ForwardPair));
-				ForwardPair& a = *fp_view_data(ForwardPair, _a);
-				ForwardPair& b = *fp_view_data(ForwardPair, _b);
-				return fp_string_compare(a.first, b.first) == 0;
-			});
-			fp_hash_map_set_finalize_function(map, [](fp_void_view _key) noexcept {
-				assert(fp_view_size(_key) == sizeof(ForwardPair));
-				ForwardPair& key = *fp_view_data(ForwardPair, _key);
-				fp_string_free(key.first);
-			});
-			return map;
-		}();
-		return map;
+		static fp::dictionary<fp::string, size_t, fp::fnv1a<fp::string>> map;
+		return map.raw;
 	}
 #else
 		;
@@ -59,25 +33,8 @@ namespace ecrs {
 	fp_hashmap(ReversePair)& ecrs_get_reverse_map() noexcept
 #ifdef ECRS_IMPLEMENTATION
 	{
-		static fp_hashmap(ReversePair) map = [] {
-			fp_hashmap(ReversePair) map = nullptr;
-			fp_hash_map_create_empty_table(ReversePair, map, false);
-			// Only hash and compare the first element in the pair (makes it a map!)
-			fp_hash_map_set_hash_function(map, [](const fp_void_view key) noexcept -> uint64_t {
-				assert(fp_view_size(key) == sizeof(ReversePair));
-				ReversePair& pair = *fp_view_data(ReversePair, key);
-				return FP_HASH_FUNCTION(fp_void_view_literal(&pair.first, sizeof(pair.first)));
-			});
-			fp_hash_map_set_equal_function(map, [](const fp_void_view _a, const fp_void_view _b) noexcept -> bool{
-				assert(fp_view_size(_a) == sizeof(ReversePair)); assert(fp_view_size(_b) == sizeof(ReversePair));
-				ReversePair& a = *fp_view_data(ReversePair, _a);
-				ReversePair& b = *fp_view_data(ReversePair, _b);
-				return a.first == b.first;
-			});
-			// NOTE: Reverse map doesn't need a finalizer function, since both maps use the same string, they should all be freed by the forward map finalizer
-			return map;
-		}();
-		return map;
+		static fp::dictionary<size_t, fp::string, fp::fnv1a<size_t>> map;
+		return map.raw;
 	}
 #else
 		;
@@ -133,7 +90,7 @@ namespace ecrs {
 			ReversePair lookup{componentID, nullptr};
 			auto res = fp_hash_map_find(ReversePair, ecrs_get_reverse_map(), lookup);
 			if(res == nullptr) return nullptr;
-			return res->second;
+			return res->second.raw;
 		}
 #else
 		;

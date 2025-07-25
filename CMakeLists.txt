@@ -16,7 +16,7 @@ target_link_libraries(libecrs INTERFACE libfp)
 
 
 if(${ECRS_ENABLE_TESTS} AND ${FP_ENABLE_TESTS})
-	add_executable(tst-libecrs tests/ECS.cpp)
+	add_executable(tst-libecrs tests/0_ECS.cpp tests/1_ECRS.cpp)
 	target_link_libraries(tst-libecrs PUBLIC doctest libecrs)
 	set_property(TARGET tst-libecrs PROPERTY CXX_STANDARD 23)
 	set_property(TARGET tst-libecrs PROPERTY C_STANDARD 23)

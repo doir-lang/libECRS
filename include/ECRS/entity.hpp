@@ -1,9 +1,8 @@
 #pragma once
 
 #include "ecs.hpp"
-#include <compare>
+
 #include <format>
-#include <cstdint>
 
 namespace ecrs {
 	inline namespace relational {
@@ -166,9 +165,9 @@ namespace ecrs {
 #ifdef ECRS_RELATION_IS_AVAILABLE
 		// NOTE: Defined in ecrs.hpp
 		template<typename T, size_t Unique = 0>
-		inline auto get_related_entities(const TrivialRelationalModule& module) const noexcept;
+		auto get_related_entities(const TrivialRelationalModule& module) const noexcept;
 		template<typename T, size_t Unique = 0>
-		inline auto get_related_entities() const noexcept;
+		auto get_related_entities() const noexcept;
 #endif
 	};
 
