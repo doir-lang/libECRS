@@ -1,0 +1,3 @@
+[submodule "libfp"]
+	path = libfp
+	url = https://github.com/ecrs-lang/libfp
