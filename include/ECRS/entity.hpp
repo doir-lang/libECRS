@@ -164,9 +164,19 @@ namespace ecrs {
 
 #ifdef ECRS_RELATION_IS_AVAILABLE
 		// NOTE: Defined in ecrs.hpp
-		template<typename T, size_t Unique = 0>
+		template<typename R, size_t Unique = 0>
+		auto& add_relation(TrivialRelationalModule& module);
+		template<typename R, size_t Unique = 0>
+		auto& add_relation();
+		
+		template<typename R, size_t Unique = 0>
+		bool has_relation(const TrivialRelationalModule& module) const;
+		template<typename R, size_t Unique = 0>
+		bool has_relation() const;
+
+		template<typename R, size_t Unique = 0>
 		auto get_related_entities(const TrivialRelationalModule& module) const noexcept;
-		template<typename T, size_t Unique = 0>
+		template<typename R, size_t Unique = 0>
 		auto get_related_entities() const noexcept;
 #endif
 	};
