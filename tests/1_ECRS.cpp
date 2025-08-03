@@ -1,4 +1,3 @@
-#include "fp/string.hpp"
 #include <doctest/doctest.h>
 
 #include <iostream>
@@ -29,10 +28,10 @@ TEST_SUITE("ECRS") {
 		jackie.add_component<fp::raii::string>() = "Jackie"_fp;
 
 		struct parent : public ecrs::Relation<> {};
-		bart.add_component<parent>() = {{homer, marg}};
-		lisa.add_component<parent>() = {{homer, marg}};
-		homer.add_component<parent>() = {{abraham}};
-		marg.add_component<parent>() = {{jackie}};
+		bart.add_relation<parent>() = {homer, marg};
+		lisa.add_relation<parent>() = {homer, marg};
+		homer.add_relation<parent>() = {abraham};
+		marg.add_relation<parent>() = {jackie};
 
 		struct male : public ecrs::Tag {};
 		bart.add_component<male>();
@@ -83,20 +82,20 @@ TEST_SUITE("ECRS") {
 		struct type_of: public ecrs::Relation<1, true> {};
 
 		ecrs::Entity A = mod.create_entity();
-		A.add_component<type_of>() = {{{i32}}};
+		A.add_relation<type_of>() = {{i32}};
 		A.add_component<fp::raii::string>() = "A"_fp;
 		ecrs::Entity B = mod.create_entity();
-		B.add_component<type_of>() = {{{i32}}};
+		B.add_relation<type_of>() = {{i32}};
 		B.add_component<fp::raii::string>() = "B"_fp;
 
 		auto T = mod.next_logic_variable();
 		ecrs::Entity add = mod.create_entity();
-		add.add_component<function_types>() = {{{T}, {T}, {T}}};
+		add.add_relation<function_types>() = {{T}, {T}, {T}};
 		add.add_component<fp::raii::string>() = "add"_fp;
 
 		ecrs::Entity call = mod.create_entity();
-		call.add_component<struct call>() = {{add}};
-		call.add_component<arguments>() = {{A, B}};
+		call.add_relation<struct call>() = {add};
+		call.add_relation<arguments>() = {A, B};
 
 		constexpr auto typecheck_function = [](ecrs::Entity function, ecrs::Entity call) {
 			return kr::next_variables([=](kr::Variable func_type, kr::Variable param_types, kr::Variable args, kr::Variable arg_types) {

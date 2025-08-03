@@ -247,7 +247,7 @@ namespace ecrs {
 			if(freelist) fpda_free_and_null(freelist);
 		}
 
-		size_t entity_count() { return fpda_size(entity_component_indices); }
+		size_t entity_count() const { return fpda_size(entity_component_indices); }
 
 		Storage& get_storage(component_t componentID, size_t element_size = Storage::invalid) noexcept {
 			if(!storages || fpda_size(storages) <= componentID) {

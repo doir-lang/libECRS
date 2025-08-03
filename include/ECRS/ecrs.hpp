@@ -65,10 +65,18 @@ namespace ecrs {
 				return {};
 			}
 
-			template<std::derived_from<RelationBase> R>
-			std::span<entity_or_term<R::can_be_term>> get_related_entities(entity_t e) {
-				if(!has_component<R>()) return {};
-				return get_component<R>().related;
+			template<std::derived_from<RelationBase> R, size_t Unique = 0>
+			inline auto& add_relation(entity_t e) {
+				return add_component<R, Unique>(e).related;
+			}
+
+			template<std::derived_from<RelationBase> R, size_t Unique = 0>
+			inline bool has_relation(entity_t e) const { return has_component<R, Unique>(e); }
+
+			template<std::derived_from<RelationBase> R, size_t Unique = 0>
+			std::span<const entity_or_term<R::can_be_term>> get_related_entities(entity_t e) const {
+				if(!has_component<R, Unique>(e)) return {};
+				return get_component<R, Unique>(e).related;
 			}
 
 			kanren::Variable next_logic_variable() { return logic_state.next_variable(); }
@@ -282,14 +290,36 @@ namespace ecrs {
 		}
 	} // namespace ecrs::relational
 
-	template<typename T, size_t Unique>
-	inline auto Entity::get_related_entities(const TrivialRelationalModule& module) const noexcept {
-		return module.get_related_entities<T, Unique>(entity);
+	template<typename R, size_t Unique /* = 0 */>
+	inline auto& Entity::add_relation(TrivialRelationalModule& module) {
+		return module.add_relation<R, Unique>(entity);
 	}
-	template<typename T, size_t Unique>
+	template<typename R, size_t Unique /* = 0 */>
+	inline auto& Entity::add_relation() {
+		assert(current_module != nullptr);
+		// assert(dynamic_cast<TrivialRelationalModule*>(current_module) != nullptr);
+		return add_relation<R, Unique>(*(TrivialRelationalModule*)current_module);
+	}
+	
+	template<typename R, size_t Unique /* = 0 */>
+	inline bool Entity::has_relation(const TrivialRelationalModule& module) const {
+		return module.has_relation<R, Unique>(entity);
+	}
+	template<typename R, size_t Unique /* = 0 */>
+	inline bool Entity::has_relation() const {
+		assert(current_module != nullptr);
+		// assert(dynamic_cast<TrivialRelationalModule*>(current_module) != nullptr);
+		return has_relation<R, Unique>(*(TrivialRelationalModule*)current_module);
+	}
+
+	template<typename R, size_t Unique>
+	inline auto Entity::get_related_entities(const TrivialRelationalModule& module) const noexcept {
+		return module.get_related_entities<R, Unique>(entity);
+	}
+	template<typename R, size_t Unique>
 	inline auto Entity::get_related_entities() const noexcept {
 		assert(current_module != nullptr);
 		// assert(dynamic_cast<TrivialRelationalModule*>(current_module) != nullptr);
-		return get_related_entities<T, Unique>(*current_module);
+		return get_related_entities<R, Unique>(*(TrivialRelationalModule*)current_module);
 	}
 }
