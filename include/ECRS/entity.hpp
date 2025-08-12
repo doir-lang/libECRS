@@ -200,7 +200,7 @@ template<>
 struct std::hash<ecrs::Entity> : public std::hash<ecrs::entity_t> {
 	using super = std::hash<ecrs::entity_t>;
 
-	std::uint64_t operator()(const ecrs::Entity& e) const {
+	uint64_t operator()(const ecrs::Entity& e) const {
 		return super::operator()(e);
 	}
 };

@@ -74,9 +74,9 @@ namespace ecrs {
 			inline bool has_relation(entity_t e) const { return has_component<R, Unique>(e); }
 
 			template<std::derived_from<RelationBase> R, size_t Unique = 0>
-			std::span<const entity_or_term<R::can_be_term>> get_related_entities(entity_t e) const {
+			fp::view<entity_or_term<R::can_be_term>> get_related_entities(entity_t e) const {
 				if(!has_component<R, Unique>(e)) return {};
-				return get_component<R, Unique>(e).related;
+				return get_component<R, Unique>(e).related.full_view();
 			}
 
 			kanren::Variable next_logic_variable() { return logic_state.next_variable(); }
