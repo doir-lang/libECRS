@@ -4,6 +4,7 @@
 #include <functional>
 #include <generator>
 #include <list>
+#include <unordered_map>
 #include <unordered_set>
 #include <variant>
 
@@ -100,9 +101,37 @@ namespace ecrs::kanren {
 		default: return false;
 		}
 	}
+}
+
+namespace std {
+	template<>
+	struct hash<ecrs::kanren::Term> {
+		inline size_t operator()(const ecrs::kanren::Term& term) const {
+			return ecrs::kanren::term2size_t(term);
+		}
+	};
+	template<>
+	struct equal_to<ecrs::kanren::Term> {
+		inline bool operator()(const ecrs::kanren::Term& a, const ecrs::kanren::Term& b) const {
+			return ecrs::kanren::term_equivalence(a, b);
+		}
+	};
+	template<>
+	struct hash<std::pair<ecrs::kanren::Term, ecrs::kanren::Term>> {
+		inline size_t operator()(const std::pair<ecrs::kanren::Term, ecrs::kanren::Term>& pair) const {
+			return ecrs::kanren::term2size_t(pair.first) ^ ecrs::kanren::term2size_t(pair.second);
+		}
+	};
+
+	inline static bool operator==(const std::pair<ecrs::kanren::Term, ecrs::kanren::Term>& a, const std::pair<ecrs::kanren::Term, ecrs::kanren::Term>& b) {
+		return ecrs::kanren::term_equivalence(a.first, b.first) && ecrs::kanren::term_equivalence(a.second, b.second);
+	}
+}
+
+namespace ecrs::kanren {
 
 	using Substitution = std::pair<Term, Term>;
-	using Substitutions = std::list<Substitution>;
+	using Substitutions = std::unordered_map<Term, Term>;
 	struct State {
 		ecrs::TrivialModule* module;
 		Substitutions sub;
@@ -148,7 +177,7 @@ namespace ecrs::kanren {
 		inline static std::optional<Substitutions> extend_substitutions(const Term& x, const Term& v, const Substitutions& s) {
 			if (occurs(x, v, s)) return std::nullopt;
 			auto new_s = s;
-			new_s.emplace_back(x, v);
+			new_s[x] = v;
 			return new_s;
 		}
 
@@ -452,14 +481,14 @@ namespace ecrs::kanren {
 
 					for(auto& term: std::get<std::list<Term>>(list_))
 						if(elem || term_equivalence(term, element_)) {
-							subs.emplace_front(element_, term);
+							subs[element_] = term;
 							co_yield {m, subs, c};
-							subs.pop_front();
+							subs.erase(subs.find(element_));
 						} else if(std::holds_alternative<Variable>(term) && !std::holds_alternative<Variable>(element_)) {
-							subs.emplace_front(term, element_);
+							subs[term] = element_;
 							term = element_; // TODO: Is this bad?
 							co_yield {m, subs, c};
-							subs.pop_front();
+							subs.erase(subs.find(term));
 						}
 				}
 				}
@@ -502,18 +531,7 @@ namespace ecrs::kanren {
 	}
 }
 
-namespace std {
-	template<>
-	struct hash<std::pair<ecrs::kanren::Term, ecrs::kanren::Term>> {
-		inline size_t operator()(const std::pair<ecrs::kanren::Term, ecrs::kanren::Term>& pair) const {
-			return ecrs::kanren::term2size_t(pair.first) ^ ecrs::kanren::term2size_t(pair.second);
-		}
-	};
 
-	inline static bool operator==(const std::pair<ecrs::kanren::Term, ecrs::kanren::Term>& a, const std::pair<ecrs::kanren::Term, ecrs::kanren::Term>& b) {
-		return ecrs::kanren::term_equivalence(a.first, b.first) && ecrs::kanren::term_equivalence(a.second, b.second);
-	}
-}
 
 namespace ecrs::kanren { inline namespace query {
 	inline std::generator<Substitution> unique_substitutions(auto& substitutions, std::unordered_set<Substitution>& found)

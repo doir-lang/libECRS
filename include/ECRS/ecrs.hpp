@@ -109,19 +109,19 @@ namespace ecrs {
 
 		inline kanren::Goal auto stream_of_all_entities(const kanren::Variable& var, bool include_error = false) {
 			return [=](kanren::State state) -> std::generator<kanren::State> {
-				auto [m, s, c] = state;
+				auto& [m, s, c] = state;
 				for(size_t e = include_error ? 0 : 1, size = fp_size(state.module->entity_component_indices); e < size; ++e)
 					if(!state.module->freelist || !fp_contains(state.module->freelist, e)) {
-						s.emplace_front(var, kanren::Term{e});
+						s[{var}] = {e};
 						co_yield {m, s, c};
-						s.pop_front();
+						s.erase(s.find({var}));
 					}
 			};
 		}
 
 		inline kanren::Goal auto has_component(const kanren::Term& var, ecrs::component_t componentID) {
 			return [=](kanren::State state) -> std::generator<kanren::State> {
-				auto [m, s, c] = state;
+				auto& [m, s, c] = state;
 
 				auto var_ = kanren::find(var, s);
 				if(std::holds_alternative<ecrs::Entity>(var_)) {
@@ -132,9 +132,9 @@ namespace ecrs {
 					for(size_t e = 0, size = fp_size(m->entity_component_indices); e < size; ++e) {
 						auto comps = m->entity_component_indices[e];
 						if(fp_size(comps) > componentID && comps[componentID] != ecrs::Storage::invalid) {
-							s.emplace_front(std::get<kanren::Variable>(var_), kanren::Term{e});
+							s[var_] = {e};
 							co_yield {m, s, c};
-							s.pop_front();
+							s.erase(s.find(var_));
 						}
 					}
 			};
@@ -146,7 +146,7 @@ namespace ecrs {
 		inline kanren::Goal auto related_entities(const kanren::Term& base, const kanren::Term& relate) {
 			const auto componentID = get_global_component_id<T, Unique>();
 			return [=](kanren::State state) -> std::generator<kanren::State> {
-				auto [m, s, c] = state;
+				auto& [m, s, c] = state;
 				auto base_ = kanren::find(base, s);
 				auto relate_ = kanren::find(relate, s);
 
@@ -157,13 +157,13 @@ namespace ecrs {
 						if(m->has_component<T, Unique>(e)) {
 							auto& related = m->get_component<T, Unique>(e).related;
 							if(related.size()) {
-								s.emplace_front(std::get<kanren::Variable>(base_), kanren::Term{e});
+								s[base_] = {e};
 								for(const auto& r: related) {
-									s.emplace_front(std::get<kanren::Variable>(relate_), kanren::Term{r});
+									s[relate_] = {r};
 									co_yield {m, s, c};
-									s.pop_front();
+									s.erase(s.find(relate_));
 								}
-								s.pop_front();
+								s.erase(s.find(base_));
 							}
 						}
 
@@ -173,9 +173,9 @@ namespace ecrs {
 						if(m->has_component<T, Unique>(e)) {
 							for(const auto& r: m->get_component<T, Unique>(e).related)
 								if(kanren::term_equivalence({r}, relate_)) {
-									s.emplace_front(std::get<kanren::Variable>(base_), kanren::Term{e});
+									s[base_] = {e};
 									co_yield {m, s, c};
-									s.pop_front();
+									s.erase(s.find(base_));
 								}
 						}
 
@@ -184,9 +184,9 @@ namespace ecrs {
 					auto e = std::get<ecrs::Entity>(base_);
 					if(m->has_component<T, Unique>(e)) {
 						for(const auto& r: m->get_component<T, Unique>(e).related) {
-							s.emplace_front(std::get<kanren::Variable>(relate_), kanren::Term{r});
+							s[relate_] = {r};
 							co_yield {m, s, c};
-							s.pop_front();
+							s.erase(s.find({relate_}));
 						}
 					}
 
@@ -210,7 +210,7 @@ namespace ecrs {
 		inline kanren::Goal auto related_entities_list(const kanren::Term& base, const kanren::Term& relate) {
 			const auto componentID = get_global_component_id<T, Unique>();
 			return [=](kanren::State state) -> std::generator<kanren::State> {
-				auto [m, s, c] = state;
+				auto& [m, s, c] = state;
 				auto base_ = kanren::find(base, s);
 				auto relate_ = kanren::find(relate, s);
 
@@ -220,11 +220,11 @@ namespace ecrs {
 						if(m->has_component<T, Unique>(e)) {
 							auto& related = m->get_component<T, Unique>(e).related;
 							if(related.size()) {
-								s.emplace_front(std::get<kanren::Variable>(base_), kanren::Term{e});
-								s.emplace_front(std::get<kanren::Variable>(relate_), kanren::Term{std::list<kanren::Term>(related.begin(), related.end())});
+								s[base_] = {e};
+								s[relate_] = kanren::Term{std::list<kanren::Term>(related.begin(), related.end())};
 								co_yield {m, s, c};
-								s.pop_front();
-								s.pop_front();
+								s.erase(s.find({base_}));
+								s.erase(s.find({relate_}));
 							}
 						}
 
@@ -271,9 +271,9 @@ namespace ecrs {
 					auto e = std::get<ecrs::Entity>(base_);
 					if(m->has_component<T, Unique>(e))
 						if(auto r = m->get_component<T, Unique>(e).related; r.size()) {
-							s.emplace_front(relate_, kanren::Term{std::list<kanren::Term>(r.begin(), r.end())});
+							s[relate_] = kanren::Term{std::list<kanren::Term>(r.begin(), r.end())};
 							co_yield {m, s, c};
-							s.pop_front();
+							s.erase(s.find({relate_}));
 						}
 
 				// Both fixed... unify the related lists
