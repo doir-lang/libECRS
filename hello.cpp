@@ -1,6 +1,6 @@
 #define FP_IMPLEMENTATION
 #define ECRS_IMPLEMENTATION
-#include "storage.hpp"
+#include "context.hpp"
 #include "component_registry.h"
 
 #include <iostream>
@@ -22,17 +22,26 @@ int main() {
 	key = *fpht_find(*sizes, key);
 	printf("%zu\n", key.size);
 
-	fp::dynarray<fp::dynarray<size_t>> entity_component_indicies;
-	entity_component_indicies.push_back(nullptr).push_back(0);
-	entity_component_indicies.push_back(nullptr).push_back(1);
+	ecrs::raii::context ctx;
+	ecrs::context::entity e1, e2, e3;
+	{
+		e1 = ctx.make_current().add_entity();
+		auto& c1 = e1.add_component<c>();
+		c1.value = {1, 2};
 
-	ecrs::component_storage s(c{});
-	s.get_or_allocate<c>(0) = {1, 2, 0};
-	s.get_or_allocate<c>(1) = {3, 4, 1};
-	s.swap<c>(entity_component_indicies, 0, 1);
+		e2 = ctx.add_entity();
+		auto& c2 = e2.add_component<c>();
+		c2.value = {3, 4};
 
-	auto a = s.get<c>(0);
-	std::cout << a.entity << std::endl;
-	auto b  = s.get<c>(1);
-	std::cout << b.entity << std::endl;
+		e3 = ctx.add_entity();
+		auto& c3 = e3.add_component<c>();
+		c3.value = {5, 6};
+	}
+
+	e2.remove();
+
+	for(ecrs::context::entity e: ctx.entities()) {
+		auto comp = e.get_component<c>();
+		std::cout << e << ": " << comp->x << ", " << comp->y << std::endl;
+	}
 }
