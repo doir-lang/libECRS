@@ -9,33 +9,33 @@
 #include <cxxabi.h>
 #endif
 
-namespace ecrs {
+namespace ecrs { inline namespace registry {
 
-	fp::hash_map<fp::raii::string, size_t>& get_forward_map()
+	fp::hash_map<fp::raii::string, size_t>* get_forward_map()
 	#ifdef ECRS_IMPLEMENTATION
 	{
 		static fp::raii::hash_map<fp::raii::string, size_t> map;
-		return map;
+		return &map;
 	}
 	#else
 	;
 	#endif
 
-	fp::hash_map<size_t, fp::string_view>& get_reverse_map()
+	fp::hash_map<size_t, fp::string_view>* get_reverse_map()
 	#ifdef ECRS_IMPLEMENTATION
 	{
 		static fp::raii::hash_map<size_t, fp::string_view> map;
-		return map;
+		return &map;
 	}
 	#else
 	;
 	#endif
 
-	fp::hash_map<size_t, size_t>& get_size_map()
+	fp::hash_map<size_t, size_t>* get_size_map()
 	#ifdef ECRS_IMPLEMENTATION
 	{
 		static fp::raii::hash_map<size_t, size_t> map;
-		return map;
+		return &map;
 	}
 	#else
 	;
@@ -53,9 +53,9 @@ namespace ecrs {
 
 	inline static size_t register_type(fp::raii::string name, size_t component_id, size_t type_size) {
 		fp::string_view view = name.view_full();
-		get_forward_map()[std::move(name)] = component_id;
-		get_reverse_map()[component_id] = view;
-		get_size_map()[component_id] = type_size;
+		(*get_forward_map())[std::move(name)] = component_id;
+		(*get_reverse_map())[component_id] = view;
+		(*get_size_map())[component_id] = type_size;
 		return component_id;
 	}
 
@@ -89,13 +89,13 @@ namespace ecrs {
 	}
 
 	inline static size_t lookup_component_id(fp::string_view name) {
-		const auto& m = get_forward_map();
+		const auto& m = *get_forward_map();
 		fp::auto_free key = name.make_dynamic();
 		if(!m.contains(key)) return fp::not_found;
 		return m[name.make_dynamic()];
 	}
 
 	inline static size_t lookup_component_size(size_t component_id) {
-		return get_size_map().get_or_default(component_id, std::numeric_limits<size_t>::max());
+		return get_size_map()->get_or_default(component_id, std::numeric_limits<size_t>::max());
 	}
-}
+}}
