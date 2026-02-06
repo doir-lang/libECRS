@@ -1,7 +1,25 @@
 #pragma once
-
-#include <fp/hash.hpp>
 #include <fp/string.hpp>
+
+#ifndef _MSC_VER
+	#include <fp/hash.hpp>
+	#define ECRS_HASH_MAP fp::hash_map
+	#define ECRS_RAII_HASH_MAP fp::raii::hash_map
+#else
+	#include <unordered_map>
+	#define ECRS_HASH_MAP std::unordered_map
+	#define ECRS_RAII_HASH_MAP std::unordered_map
+
+	namespace std {
+		template<>
+		struct hash<fp::raii::string> {
+			uint64_t operator()(const fp::raii::string& s) const {
+				auto view = s.full_view();
+				return std::hash<std::string_view>{}({view.data(), view.size()});
+			}
+		};
+	}
+#endif
 #include <limits>
 #include <stdexcept>
 
@@ -11,30 +29,30 @@
 
 namespace ecrs { inline namespace registry {
 
-	fp::hash_map<fp::raii::string, size_t>* get_forward_map()
+	ECRS_HASH_MAP<fp::raii::string, size_t>* get_forward_map()
 	#ifdef ECRS_IMPLEMENTATION
 	{
-		static fp::raii::hash_map<fp::raii::string, size_t> map;
+		static ECRS_RAII_HASH_MAP<fp::raii::string, size_t> map;
 		return &map;
 	}
 	#else
 	;
 	#endif
 
-	fp::hash_map<size_t, fp::string_view>* get_reverse_map()
+	ECRS_HASH_MAP<size_t, fp::string_view>* get_reverse_map()
 	#ifdef ECRS_IMPLEMENTATION
 	{
-		static fp::raii::hash_map<size_t, fp::string_view> map;
+		static ECRS_RAII_HASH_MAP<size_t, fp::string_view> map;
 		return &map;
 	}
 	#else
 	;
 	#endif
 
-	fp::hash_map<size_t, size_t>* get_size_map()
+	ECRS_HASH_MAP<size_t, size_t>* get_size_map()
 	#ifdef ECRS_IMPLEMENTATION
 	{
-		static fp::raii::hash_map<size_t, size_t> map;
+		static ECRS_RAII_HASH_MAP<size_t, size_t> map;
 		return &map;
 	}
 	#else
@@ -92,10 +110,20 @@ namespace ecrs { inline namespace registry {
 		const auto& m = *get_forward_map();
 		fp::auto_free key = name.make_dynamic();
 		if(!m.contains(key)) return fp::not_found;
+#ifdef _MSC_VER
+		return m.at(name.make_dynamic());
+#else
 		return m[name.make_dynamic()];
+#endif
 	}
 
 	inline static size_t lookup_component_size(size_t component_id) {
-		return get_size_map()->get_or_default(component_id, std::numeric_limits<size_t>::max());
+#ifdef _MSC_VER
+		if (!get_size_map()->contains(component_id))
+			return (std::numeric_limits<size_t>::max)();
+		return get_size_map()->at(component_id);
+#else
+		return get_size_map()->get_or_default(component_id, (std::numeric_limits<size_t>::max)());
+#endif
 	}
 }}

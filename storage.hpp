@@ -115,7 +115,7 @@ namespace ecrs {
 	}
 
 	struct component_storage: protected fp::dynarray<std::byte> {
-		static constexpr size_t invalid = std::numeric_limits<size_t>::max();
+		static constexpr size_t invalid = (std::numeric_limits<size_t>::max)();
 		using super = fp::dynarray<std::byte>;
 
 		size_t element_size = invalid;
