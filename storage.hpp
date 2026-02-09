@@ -34,7 +34,7 @@ namespace ecrs {
 			return other.entity == entity && other.value == value;
 		}
 
-		static void swap_entities(with_entity& a, fp::dynarray<fp::dynarray<size_t>>& entity_component_indicies, entity_t eA, entity_t eB) {
+		static void swap_entities(with_entity& a, fp::dynarray<fp::dynarray<size_t>>& entity_component_indices, entity_t eA, entity_t eB) {
 			if(a.entity == eA) a.entity = eB;
 			else if(a.entity == eB) a.entity = eA;
 		}
