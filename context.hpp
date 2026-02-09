@@ -19,7 +19,7 @@ namespace ecrs {
 	}
 
 	struct context : protected fp::dynarray<component_storage> {
-		fp::dynarray<fp::dynarray<size_t>> entity_component_indicies = nullptr;
+		fp::dynarray<fp::dynarray<size_t>> entity_component_indices = nullptr;
 		fp::hash_table<size_t> freelist = nullptr;
 
 		context() {}
@@ -63,26 +63,29 @@ namespace ecrs {
 					freelist.remove_at_position(pos);
 					return pos;
 				}
-			entity_t out = entity_component_indicies.size();
-			entity_component_indicies.emplace_back();
+			entity_t out = entity_component_indices.size();
+			entity_component_indices.emplace_back();
 			return out;
 		}
 
 		void remove_entity(entity_t e) {
-			assert(e < entity_component_indicies.size());
-			entity_component_indicies[e].free(true);
-			if(!freelist)
-				freelist = fp::hash_table<size_t>::create(fp::hash_table<size_t>::config{.neighborhood_size = 2});
+			assert(e < entity_component_indices.size());
+			entity_component_indices[e].free(true);
+			if (!freelist) {
+				fp::hash_table<size_t>::config config;
+				config.neighborhood_size = 2;
+				freelist = fp::hash_table<size_t>::create(config);
+			}
 			freelist.insert(e);
 		}
 
 		bool has_component(entity_t e, size_t component_id) const {
 			assert(!freelist || !freelist.contains(e));
-			return entity_component_indicies
-				&& e < entity_component_indicies.size()
-				&& entity_component_indicies[e]
-				&& entity_component_indicies[e].size() > component_id
-				&& entity_component_indicies[e][component_id] != component_storage::invalid;
+			return entity_component_indices
+				&& e < entity_component_indices.size()
+				&& entity_component_indices[e]
+				&& entity_component_indices[e].size() > component_id
+				&& entity_component_indices[e][component_id] != component_storage::invalid;
 		}
 		template<typename Tcomponent, size_t Unique = 0>
 		bool has_component(entity_t e) const {
@@ -93,12 +96,12 @@ namespace ecrs {
 			assert(!has_component(e, component_id));
 			auto& storage = get_storage(component_id, element_size.value_or(lookup_component_size(component_id)));
 			if(
-				!entity_component_indicies[e]
-				|| !entity_component_indicies.size()
-				|| entity_component_indicies[e].size() <= component_id
+				!entity_component_indices[e]
+				|| !entity_component_indices.size()
+				|| entity_component_indices[e].size() <= component_id
 			)
-				entity_component_indicies[e].grow_to_size(component_id + 1, component_storage::invalid);
-			auto idx = entity_component_indicies[e][component_id] = storage.size();
+				entity_component_indices[e].grow_to_size(component_id + 1, component_storage::invalid);
+			auto idx = entity_component_indices[e][component_id] = storage.size();
 			storage.allocate(1);
 			return storage.get(idx);
 		}
@@ -113,12 +116,12 @@ namespace ecrs {
 		void* get_component(entity_t e, size_t component_id, std::optional<size_t> element_size = {}) {
 			assert(has_component(e, component_id));
 			auto& storage = get_storage(component_id, element_size.value_or(lookup_component_size(component_id)));
-			return storage.get(entity_component_indicies[e][component_id]);
+			return storage.get(entity_component_indices[e][component_id]);
 		}
 		const void* get_component(entity_t e, size_t component_id, std::optional<size_t> element_size = {}) const {
 			assert(has_component(e, component_id));
 			auto& storage = get_storage(component_id, element_size.value_or(lookup_component_size(component_id)));
-			return storage.get(entity_component_indicies[e][component_id]);
+			return storage.get(entity_component_indices[e][component_id]);
 		}
 
 		template<typename Tcomponent, size_t Unique = 0>
@@ -157,16 +160,16 @@ namespace ecrs {
 		};
 	public:
 		void swap_entities(entity_t a, std::optional<entity_t> _b = {}) {
-			entity_t b = _b.value_or(entity_component_indicies.size() - 1);
+			entity_t b = _b.value_or(entity_component_indices.size() - 1);
 
-			assert(a < entity_component_indicies.size());
-			assert(b < entity_component_indicies.size());
-			std::swap(entity_component_indicies[a], entity_component_indicies[b]);
+			assert(a < entity_component_indices.size());
+			assert(b < entity_component_indices.size());
+			std::swap(entity_component_indices[a], entity_component_indices[b]);
 		}
 
 		template<typename... Tcomponents2notify>
 		void swap_entities(entity_t a, std::optional<entity_t> _b = {}) {
-			entity_t b = _b.value_or(entity_component_indicies.size() - 1);
+			entity_t b = _b.value_or(entity_component_indices.size() - 1);
 
 			[&, this]<std::size_t... I>(std::index_sequence<I...>) {
 				(NotifySwapOp<detail::nth_type<I, Tcomponents2notify...>>{}(*this, a, b), ...);
@@ -213,7 +216,7 @@ public:
 		template<typename Tcomponent>
 		struct MonotonicOp {
 			inline void operator()(context& self, component_storage& storage) const {
-				storage.sort_monotonic<Tcomponent>(self.entity_component_indicies);
+				storage.sort_monotonic<Tcomponent>(self.entity_component_indices);
 			}
 		};
 	public:
@@ -225,14 +228,14 @@ public:
 		}
 		template<typename Tcomponent, size_t Unique = 0>
 		void make_monotonic() {
-			get_storage<Tcomponent, Unique>()->template sort_monotonic<Tcomponent, Unique>(entity_component_indicies);
+			get_storage<Tcomponent, Unique>()->template sort_monotonic<Tcomponent, Unique>(entity_component_indices);
 		}
 		void make_monotonic(fp_view(size_t) component_ids) {
 			fp_view_iterate_named(size_t, component_ids, id)
 				make_monotonic(*id);
 		}
 		void make_monotonic(size_t component_id, std::optional<size_t> element_size = {}) {
-			get_storage(component_id, element_size.value_or(lookup_component_size(component_id))).sort_monotonic(entity_component_indicies, component_id);
+			get_storage(component_id, element_size.value_or(lookup_component_size(component_id))).sort_monotonic(entity_component_indices, component_id);
 		}
 
 		void make_all_monotonic() {
@@ -240,18 +243,18 @@ public:
 			for(auto& storage: *this) {
 				++id;
 				if(storage.element_size == component_storage::invalid) continue; // Only initialized storages can be made monotonic
-				storage.sort_monotonic(entity_component_indicies, id);
+				storage.sort_monotonic(entity_component_indices, id);
 			}
 		}
 
 		void free(bool nullify = true) {
 			fp::dynarray<component_storage>::free(nullify);
-			entity_component_indicies.free(nullify);
+			entity_component_indices.free(nullify);
 			freelist.free(nullify);
 		}
 		void free() const {
 			fp::dynarray<component_storage>::free();
-			entity_component_indicies.free();
+			entity_component_indices.free();
 			freelist.free();
 		}
 
@@ -264,7 +267,7 @@ public:
 			}
 
 			void skip_freed() {
-				while (index < ctx->entity_component_indicies.size()
+				while (index < ctx->entity_component_indices.size()
 					&& ctx->freelist && ctx->freelist.contains(index)
 				)
 					++index;
@@ -306,7 +309,7 @@ public:
 			}
 
 			entity_iterator end() const {
-				return entity_iterator(ctx, ctx->entity_component_indicies.size());
+				return entity_iterator(ctx, ctx->entity_component_indices.size());
 			}
 		};
 
