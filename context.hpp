@@ -20,7 +20,7 @@ namespace ecrs {
 
 	struct context : protected fp::dynarray<component_storage> {
 		fp::dynarray<fp::dynarray<size_t>> entity_component_indices = nullptr;
-		fp::hash_table<size_t> freelist = nullptr;
+		fp::dynarray<size_t> freelist = nullptr;
 
 		context() { add_entity(); } // Make sure the invalid entity is always allocated
 		context(std::nullptr_t) : context() {}
@@ -58,11 +58,9 @@ namespace ecrs {
 		}
 
 		entity_t add_entity() {
-			if(freelist)
-				if(auto pos = freelist.find_first_occupied_position(); pos != fp::not_found) {
-					freelist.remove_at_position(pos);
-					return pos;
-				}
+			if(freelist && freelist.size())
+				return freelist.pop_back();
+
 			entity_t out = entity_component_indices.size();
 			entity_component_indices.emplace_back();
 			return out;
@@ -71,16 +69,11 @@ namespace ecrs {
 		void remove_entity(entity_t e) {
 			assert(e < entity_component_indices.size());
 			entity_component_indices[e].free(true);
-			if (!freelist) {
-				fp::hash_table<size_t>::config config;
-				config.neighborhood_size = 2;
-				freelist = fp::hash_table<size_t>::create(config);
-			}
-			freelist.insert(e);
+			freelist.push_back(e);
 		}
 
 		bool has_component(entity_t e, size_t component_id) const {
-			assert(!freelist || !freelist.contains(e));
+			assert(!freelist || !fp::contains(freelist.begin(), freelist.end(), e));
 			return entity_component_indices
 				&& e < entity_component_indices.size()
 				&& entity_component_indices[e]
@@ -294,7 +287,7 @@ public:
 
 			void skip_freed() {
 				while (index < ctx->entity_component_indices.size()
-					&& ctx->freelist && ctx->freelist.contains(index)
+					&& ctx->freelist && ctx->freelist.size() && fp::contains(ctx->freelist.begin(), ctx->freelist.end(), index)
 				)
 					++index;
 			}

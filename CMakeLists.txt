@@ -9,8 +9,7 @@ if(NOT TARGET libfp)
 	FetchContent_Declare(
 		fetch_libfp
 		GIT_REPOSITORY https://github.com/doir-lang/libfp.git
-		# GIT_TAG main
-		GIT_TAG Hash
+		GIT_TAG main
 	)
 
 	FetchContent_MakeAvailable(fetch_libfp)
