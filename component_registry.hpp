@@ -39,10 +39,10 @@ namespace ecrs { inline namespace registry {
 	;
 	#endif
 
-	ECRS_HASH_MAP<size_t, fp::string_view>* get_reverse_map()
+	ECRS_HASH_MAP<size_t, fp::string::view>* get_reverse_map()
 	#ifdef ECRS_IMPLEMENTATION
 	{
-		static ECRS_RAII_HASH_MAP<size_t, fp::string_view> map;
+		static ECRS_RAII_HASH_MAP<size_t, fp::string::view> map;
 		return &map;
 	}
 	#else
@@ -70,7 +70,7 @@ namespace ecrs { inline namespace registry {
 	#endif
 
 	inline static size_t register_type(fp::raii::string name, size_t component_id, size_t type_size) {
-		fp::string_view view = name.view_full();
+		fp::string::view view = name.view_full();
 		(*get_forward_map())[std::move(name)] = component_id;
 		(*get_reverse_map())[component_id] = view;
 		(*get_size_map())[component_id] = type_size;
@@ -106,7 +106,7 @@ namespace ecrs { inline namespace registry {
 		(component_id<Ts>() + ...);
 	}
 
-	inline static size_t lookup_component_id(fp::string_view name) {
+	inline static size_t lookup_component_id(fp::string::view name) {
 		const auto& m = *get_forward_map();
 		fp::auto_free key = name.make_dynamic();
 		if(!m.contains(key)) return fp::not_found;
