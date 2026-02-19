@@ -6,11 +6,12 @@ include(FetchContent)
 if(NOT TARGET libfp)
     message(STATUS "Fetching libfp...")
 
-    FetchContent_Declare(
-        libfp
-        GIT_REPOSITORY https://github.com/doir-lang/libfp.git
-        GIT_TAG        Hash    # or a specific commit/tag for reproducibility
-    )
+	FetchContent_Declare(
+		fetch_libfp
+		GIT_REPOSITORY https://github.com/doir-lang/libfp.git
+		GIT_TAG main
+		# GIT_TAG Hash
+	)
 
     FetchContent_MakeAvailable(libfp)
 endif()
