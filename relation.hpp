@@ -1,6 +1,7 @@
 #pragma once
 
 #include "context.hpp"
+#include "storage.hpp"
 #include <span>
 
 namespace ecrs {
@@ -24,6 +25,12 @@ namespace ecrs {
 		relation(const relation&) = default;
 		relation& operator=(relation&&) = default;
 		relation& operator=(const relation&) = default;
+
+		static void swap_entities(relation& self, const context&, entity_t a, entity_t b) {
+			for(auto& e: self.related)
+				if(e == a) e = b;
+				else if(e == b) e = a;
+		}
 	};
 	template<bool CAN_BE_TERM>
 
@@ -38,6 +45,12 @@ namespace ecrs {
 		relation(const relation&) = default;
 		relation& operator=(relation&&) = default;
 		relation& operator=(const relation&) = default;
+
+		static void swap_entities(relation& self, const context&, entity_t a, entity_t b) {
+			for(auto& e: self.related)
+				if(e == a) e = b;
+				else if(e == b) e = a;
+		}
 	};
 
 }
