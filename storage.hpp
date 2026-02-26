@@ -10,7 +10,7 @@
 
 namespace ecrs {
 	using entity_t = uint32_t;
-	static constexpr entity_t invalid_entity = std::numeric_limits<entity_t>::max();
+	static constexpr entity_t invalid_entity = 0;
 
 	template<typename T>
 	struct with_entity {
@@ -403,4 +403,3 @@ namespace ecrs {
 		}
 	};
 }
-
