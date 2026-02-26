@@ -22,8 +22,8 @@ namespace ecrs {
 		fp::dynarray<fp::dynarray<size_t>> entity_component_indices = nullptr;
 		fp::hash_table<size_t> freelist = nullptr;
 
-		context() {}
-		context(std::nullptr_t) {}
+		context() { add_entity(); } // Make sure the invalid entity is always allocated
+		context(std::nullptr_t) : context() {}
 		context(const context&) = default;
 		context(context&&) = default;
 		context& operator=(const context&) = default;
@@ -54,7 +54,7 @@ namespace ecrs {
 		}
 
 		size_t entity_count() {
-			return size() - freelist.occupied_size();
+			return entity_component_indices.size() - freelist.size();
 		}
 
 		entity_t add_entity() {
@@ -182,7 +182,8 @@ protected:
     template<typename SwapFunc>
     void reorder_entities_impl(fp::view<size_t> order, SwapFunc&& swap_func) {
         size_t size = order.size();
-        assert(size == this->size()); /* Require order to have an entry for every element in the array */
+        auto dbg = this->entity_count();
+        assert(size == this->entity_count()); /* Require order to have an entry for every element in the array */
         auto swaps = fp_alloca(size_t, size);
 
         /* Transpose the order (it now stores what needs to be swapped with what) */
