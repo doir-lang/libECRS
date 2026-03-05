@@ -113,14 +113,24 @@ namespace ecrs {
 			return *out;
 		}
 
+		void remove_component(entity_t e, size_t component_id) {
+			assert(has_component(e, component_id));
+			entity_component_indices[e][component_id] = component_storage::invalid;
+			// TODO: Ideally this would also remove it from the storage
+		}
+		template<typename Tcomponent, size_t Unique = 0>
+		void remove_component(entity_t e) {
+			remove_component(e, component_id<Tcomponent, Unique>());
+		}
+
 		void* get_component(entity_t e, size_t component_id, std::optional<size_t> element_size = {}) {
 			assert(has_component(e, component_id));
-			auto& storage = get_storage(component_id, element_size.value_or(lookup_component_size(component_id)));
+			auto& storage = get_storage(component_id, element_size ? *element_size : lookup_component_size(component_id));
 			return storage.get(entity_component_indices[e][component_id]);
 		}
 		const void* get_component(entity_t e, size_t component_id, std::optional<size_t> element_size = {}) const {
 			assert(has_component(e, component_id));
-			auto& storage = get_storage(component_id, element_size.value_or(lookup_component_size(component_id)));
+			auto& storage = get_storage(component_id, element_size ? *element_size : lookup_component_size(component_id));
 			return storage.get(entity_component_indices[e][component_id]);
 		}
 
