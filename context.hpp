@@ -53,7 +53,7 @@ namespace ecrs {
 			return get_storage(component_id<Tcomponent, Unique>(), sizeof(Tcomponent));
 		}
 
-		size_t entity_count() {
+		size_t entity_count() const {
 			return entity_component_indices.size() - freelist.size();
 		}
 
