@@ -3,8 +3,8 @@ project(libECRS C CXX)
 
 include(FetchContent)
 
-option(ECRS_PARALLEL_SYSTEMS "Weather or not parrallel systems should be enabled")
-option(ECRS_BUILD_TESTS "Weather or not the test program should be built")
+option(ECRS_PARALLEL_SYSTEMS "Weather or not parallel systems should be enabled")
+option(ECRS_BUILD_TESTS "Weather or not the test program should be built" ${PROJECT_IS_TOP_LEVEL})
 
 if(NOT TARGET libfp)
 	message(STATUS "libECRS Fetching libfp...")
