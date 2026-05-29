@@ -96,8 +96,8 @@ namespace ecrs {
 			assert(!has_component(e, component_id));
 			auto& storage = get_storage(component_id, element_size.value_or(lookup_component_size(component_id)));
 			if(
-				!entity_component_indices[e]
-				|| !entity_component_indices.size()
+				entity_component_indices.size() <= e
+				|| !entity_component_indices[e]
 				|| entity_component_indices[e].size() <= component_id
 			)
 				entity_component_indices[e].grow_to_size(component_id + 1, component_storage::invalid);
