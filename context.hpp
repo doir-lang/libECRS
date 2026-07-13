@@ -96,8 +96,8 @@ namespace ecrs {
 			assert(!has_component(e, component_id));
 			auto& storage = get_storage(component_id, element_size.value_or(lookup_component_size(component_id)));
 			if(
-				entity_component_indices.size() <= e
-				|| !entity_component_indices[e]
+				//entity_component_indices.size() <= e
+				!entity_component_indices[e]
 				|| entity_component_indices[e].size() <= component_id
 			)
 				entity_component_indices[e].grow_to_size(component_id + 1, component_storage::invalid);
@@ -256,6 +256,21 @@ public:
 				if(storage.element_size == component_storage::invalid) continue; // Only initialized storages can be made monotonic
 				storage.sort_monotonic(entity_component_indices, id);
 			}
+		}
+
+		// TODO: We really don't want this function to be available! But its currently nessicary for the comptime evaluation... this should not be true!
+		context& clone(context& out) const {
+			// auto& storages = (fp::dynarray<component_storage>&)out;
+			// storages = ((fp::dynarray<component_storage>*)this)->clone();
+			// for(auto& storage: storages) {
+			// 	auto bytes = (fp::dynarray<std::byte>&)storage;
+			// 	if(bytes.raw) bytes.raw = fpda_clone(bytes.raw);
+			// }
+			out.entity_component_indices = entity_component_indices.clone();
+			for(auto& list: out.entity_component_indices) 
+				list = list.clone();
+			out.freelist = freelist.clone();
+			return out;
 		}
 
 		void free(bool nullify = true) {
