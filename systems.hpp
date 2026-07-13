@@ -24,7 +24,7 @@ namespace ecrs::system {
 	}
 
 	template<typename... Targs>
-	auto sequential(const std::vector<std::function<bool(context&, entity_t, Targs...)>>& systems) {
+	auto sequential(const std::vector<std::function<bool(context&, Targs...)>>& systems) {
 		return [=](context& context, auto... args) -> bool {
 			bool valid = true;
 			for(auto& system: systems)
@@ -68,7 +68,7 @@ namespace ecrs::system {
 	}
 
 	template<typename... Targs>
-	auto parallel(const std::vector<std::function<bool(context&, entity_t, Targs...)>>& systems) {
+	auto parallel(const std::vector<std::function<bool(context&, Targs...)>>& systems) {
 		return [=](context& context, auto... args) -> bool {
 			std::atomic<uint8_t> valid = 1;
 			std::for_each(std::execution::par_unseq, systems.begin(), systems.end(), [&](const auto& system){
