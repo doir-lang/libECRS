@@ -85,6 +85,11 @@ namespace ecrs {
 			return has_component(e, component_id<Tcomponent, Unique>());
 		}
 
+		// NOTE: This overload is type-erased (only a runtime component_id is
+		// available, no compile-time type), so the new slot can only be allocated as
+		// raw zero-filled bytes - it cannot invoke a constructor. Prefer the
+		// templated overload below whenever the component type is known at the call
+		// site, since it properly placement-news the component (see the note there).
 		void* add_component(entity_t e, size_t component_id, std::optional<size_t> element_size = {}) {
 			assert(!has_component(e, component_id));
 			auto& storage = get_storage(component_id, element_size.value_or(lookup_component_size(component_id)));
@@ -98,9 +103,27 @@ namespace ecrs {
 			storage.allocate(1);
 			return storage.get(idx);
 		}
+		// NOTE: This does *not* delegate to the type-erased overload above, because
+		// that overload can only zero-fill the new slot's bytes (it has no
+		// compile-time type to construct), which never actually begins the object's
+		// lifetime per the C++ object model - merely "working by accident" for types
+		// whose value-initialized state happens to be all-zero-bytes on the current
+		// ABI (true of every component type in this codebase today, but not
+		// guaranteed, and not true in general for e.g. std::variant/std::optional).
+		// This overload knows Tcomponent, so it placement-news it properly instead.
 		template<typename Tcomponent, size_t Unique = 0>
 		Tcomponent& add_component(entity_t e) {
-			auto out = (Tcomponent*)add_component(e, component_id<Tcomponent, Unique>(), sizeof(Tcomponent));
+			assert(!has_component<Tcomponent, Unique>(e));
+			auto id = component_id<Tcomponent, Unique>();
+			auto& storage = get_storage<Tcomponent, Unique>();
+			if(
+				!entity_component_indices[e]
+				|| entity_component_indices[e].size() <= id
+			)
+				entity_component_indices[e].grow_to_size(id + 1, component_storage::invalid);
+			auto idx = entity_component_indices[e][id] = storage.size();
+			storage.template allocate<Tcomponent>(1);
+			auto out = &storage.template get<Tcomponent>(idx);
 			if constexpr (detail::is_with_entity_v<Tcomponent>)
 				out->entity = e;
 			return *out;
@@ -141,9 +164,14 @@ namespace ecrs {
 				return get_component(e, component_id, element_size);
 			return add_component(e, component_id, element_size);
 		}
+		// NOTE: Deliberately does not delegate to the type-erased overload above -
+		// see the note on the templated add_component overload; going through it
+		// keeps newly-added components properly constructed instead of zero-filled.
 		template<typename Tcomponent, size_t Unique = 0>
 		Tcomponent& get_or_add_component(entity_t e) {
-			return *(Tcomponent*)get_or_add_component(e, component_id<Tcomponent, Unique>(), sizeof(Tcomponent));
+			if(has_component<Tcomponent, Unique>(e))
+				return get_component<Tcomponent, Unique>(e);
+			return add_component<Tcomponent, Unique>(e);
 		}
 
 	protected:
@@ -249,21 +277,6 @@ public:
 				if(storage.element_size == component_storage::invalid) continue; // Only initialized storages can be made monotonic
 				storage.sort_monotonic(entity_component_indices, id);
 			}
-		}
-
-		// TODO: We really don't want this function to be available! But its currently nessicary for the comptime evaluation... this should not be true!
-		context& clone(context& out) const {
-			// auto& storages = (fp::dynarray<component_storage>&)out;
-			// storages = ((fp::dynarray<component_storage>*)this)->clone();
-			// for(auto& storage: storages) {
-			// 	auto bytes = (fp::dynarray<std::byte>&)storage;
-			// 	if(bytes.raw) bytes.raw = fpda_clone(bytes.raw);
-			// }
-			out.entity_component_indices = entity_component_indices.clone();
-			for(auto& list: out.entity_component_indices) 
-				list = list.clone();
-			out.freelist = freelist.clone();
-			return out;
 		}
 
 		void free(bool nullify = true) {
