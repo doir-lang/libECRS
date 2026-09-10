@@ -1,0 +1,47 @@
+{
+    "name": "libecrs",
+    "description": "A -betterC D entity-component-relation-system library",
+    "targetType": "sourceLibrary",
+    "sourcePaths": ["source"],
+    "importPaths": ["source"],
+    "dflags-ldc": ["-betterC", "-checkaction=C"],
+    "dflags-dmd": ["-betterC", "-checkaction=C"],
+    "dependencies": {
+        "libfp": {
+            "repository": "git+https://github.com/doir-lang/libfp.git",
+            "version": "eb78056f75bb95d0a0f1348048693d660a9ae941"
+        },
+        "bc-threads": {
+            "repository": "git+https://github.com/doir-lang/bc-thread.git",
+            "version": "5818909ba47173a7ae7041c7bca0d4a20166dff5"
+        }
+    },
+    "subConfigurations": {
+        "libfp": "library",
+        "bc-threads": "library"
+    },
+    "configurations": [
+        {
+            "name": "library",
+            "targetType": "sourceLibrary"
+        },
+        {
+            "name": "unittest",
+            "targetType": "executable",
+            "mainSourceFile": "tests/runner.d",
+            "sourcePaths": ["source", "tests"],
+            "importPaths": ["source", "tests"],
+            "dflags-ldc": ["-betterC", "-checkaction=C"],
+            "dflags-dmd": ["-betterC", "-checkaction=C"]
+        },
+        {
+            "name": "simple",
+            "targetType": "executable",
+            "mainSourceFile": "examples/simple.d",
+            "sourcePaths": ["source", "examples"],
+            "importPaths": ["source", "examples"],
+            "dflags-ldc": ["-betterC", "-checkaction=C"],
+            "dflags-dmd": ["-betterC", "-checkaction=C"]
+        }
+    ]
+}

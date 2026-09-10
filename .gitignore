@@ -1,0 +1,6 @@
+.cache
+build*
+.dub
+*.o
+libecrs*
+dub.selections.json
