@@ -13,7 +13,7 @@
         },
         "bc-threads": {
             "repository": "git+https://github.com/doir-lang/bc-thread.git",
-            "version": "5818909ba47173a7ae7041c7bca0d4a20166dff5"
+            "version": "4537a84e8151cf7f6fcf2c21b9f68057b30ae958"
         }
     },
     "subConfigurations": {

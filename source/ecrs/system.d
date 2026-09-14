@@ -1,8 +1,8 @@
 module ecrs.system;
 
-import ecrs.context : Context;
+import ecrs.context;
 import ecrs.storage : EntityId;
-import bct.threadpool;
+import bc.threadpool;
 
 import fp.dynarray;
 
@@ -13,21 +13,19 @@ import std.algorithm.searching : all;
 
 template sequential(alias fn) {
 	bool sequential(ref Context context) {
-		import fp.dynarray : length;
-
-		bool valid = true;
 		foreach (e; context.entities())
-			valid &= fn(context, cast(EntityId) e);
-		return valid;
+			if(!fn(context, cast(EntityId) e))
+				return false;
+		return true;
 	}
 
 }
 
 bool sequential(Systems...)(ref Context context, Systems systems) {
-	bool valid = true;
 	static foreach (system; systems)
-		valid &= system(context);
-	return valid;
+		if(!system(context)) 
+			return false;
+	return true;
 }
 
 
@@ -43,7 +41,7 @@ template parallel(alias fn) {
 		item.result = fn(*item.context, item.entity);
 	}
 
-	bool parallel(ref Context context, ThreadPool* pool) @trusted @nogc nothrow {
+	private bool dispatch(ref Context context, ThreadPool* pool) @trusted @nogc nothrow {
 		if (pool.workerCount() <= 1)
 			return sequential!fn(context);
 
@@ -67,6 +65,27 @@ template parallel(alias fn) {
 
 		pool.run(jobs[0 .. n]);
 		return fp.dynarray.slice(items).all!(item => item.result);
+	}
+
+	bool parallel(ref Context context, ThreadPool* pool) @trusted @nogc nothrow {
+		return dispatch(context, pool);
+	}
+
+	/// Binds `pool` up front, returning a savable, copyable callable
+	/// (`bool opCall(ref Context) @nogc nothrow`) so `parallel!fn(pool)` can
+	/// be used as a whole system - e.g. passed to `sequential(Systems...)`
+	/// or the whole-system `parallel(Systems...)` combinator, both of which
+	/// only invoke each system with `(ref Context)` - or simply called as
+	/// `parallel!fn(pool)(context)`. A plain struct is used instead of a
+	/// closure since capturing `pool` in a delegate would need GC
+	/// allocation, which isn't available under `-betterC`.
+	struct Bound {
+		private ThreadPool* pool;
+		this(ThreadPool* pool) @nogc nothrow { this.pool = pool; }
+		bool opCall(ref Context context) @nogc nothrow { return dispatch(context, pool); }
+	}
+	Bound parallel(ThreadPool* pool) @nogc nothrow {
+		return Bound(pool);
 	}
 
 }
@@ -126,8 +145,6 @@ bool parallel(Systems...)(ref Context context, ThreadPool* pool, Systems systems
 // ============================================================================
 
 unittest {
-	import ecrs.context : Entity;
-
 	struct Counter { int value; }
 
 	static bool bump(ref Context ctx, EntityId e) @nogc nothrow {
@@ -138,24 +155,21 @@ unittest {
 		return true;
 	}
 
-	auto ctx = Context.create();
-	scope(exit) ctx.free();
-	ctx.makeCurrent();
+	auto ctx = ecrs.context.create();
+	scope(exit) ecrs.context.free(ctx);
 
-	Entity a = ctx.addEntity();
-	a.addComponent!Counter().value = 1;
+	EntityId a = ctx.addEntity();
+	ctx.addComponent!Counter(a).value = 1;
 
-	Entity b = ctx.addEntity();
-	b.addComponent!Counter().value = 10;
+	EntityId b = ctx.addEntity();
+	ctx.addComponent!Counter(b).value = 10;
 
 	assert(sequential!bump(ctx));
-	assert(a.getComponent!Counter().value == 2);
-	assert(b.getComponent!Counter().value == 11);
+	assert(ctx.getComponent!Counter(a).value == 2);
+	assert(ctx.getComponent!Counter(b).value == 11);
 }
 
 unittest {
-	import ecrs.context : Entity;
-
 	struct Counter { int value; }
 
 	static bool bump(ref Context ctx, EntityId e) @nogc nothrow {
@@ -166,18 +180,17 @@ unittest {
 		return true;
 	}
 
-	auto ctx = Context.create();
-	scope(exit) ctx.free();
-	ctx.makeCurrent();
+	auto ctx = ecrs.context.create();
+	scope(exit) ecrs.context.free(ctx);
 
 	foreach (i; 0 .. 50) {
-		Entity e = ctx.addEntity();
-		e.addComponent!Counter().value = cast(int) i;
+		EntityId e = ctx.addEntity();
+		ctx.addComponent!Counter(e).value = cast(int) i;
 	}
 
-	auto pool = bct.threadpool.create(4);
+	auto pool = bc.threadpool.create(4);
 	scope(exit)
-		bct.threadpool.free(pool);
+		bc.threadpool.free(pool);
 
 	assert(parallel!bump(ctx, pool));
 	foreach (i; 0 .. 50)
@@ -194,8 +207,6 @@ unittest {
 	// Whole-systems combinator: each system touches a disjoint component
 	// type, so running them concurrently is safe. Systems here are plain
 	// `sequential!fn` instances, per the combinator's own doc comment.
-	import ecrs.context : Entity;
-
 	struct A { int value; }
 	struct B { int value; }
 	struct C { int value; }
@@ -218,22 +229,56 @@ unittest {
 		return true;
 	}
 
-	auto ctx = Context.create();
-	scope(exit) ctx.free();
-	ctx.makeCurrent();
+	auto ctx = ecrs.context.create();
+	scope(exit) ecrs.context.free(ctx);
 
-	Entity e = ctx.addEntity();
-	e.addComponent!A().value = 1;
-	e.addComponent!B().value = 10;
-	e.addComponent!C().value = 100;
+	EntityId e = ctx.addEntity();
+	ctx.addComponent!A(e).value = 1;
+	ctx.addComponent!B(e).value = 10;
+	ctx.addComponent!C(e).value = 100;
 
-	auto pool = bct.threadpool.create(4);
-	scope(exit) bct.threadpool.free(pool);
+	auto pool = bc.threadpool.create(4);
+	scope(exit) bc.threadpool.free(pool);
 
 	assert(parallel(ctx, pool, &sequential!bumpA, &sequential!bumpB, &sequential!bumpC));
 
-	assert(e.getComponent!A().value == 2);
-	assert(e.getComponent!B().value == 11);
-	assert(e.getComponent!C().value == 101);
+	assert(ctx.getComponent!A(e).value == 2);
+	assert(ctx.getComponent!B(e).value == 11);
+	assert(ctx.getComponent!C(e).value == 101);
 
+}
+
+unittest {
+	// The `sequential(Systems...)` combinator can also compose systems that
+	// are themselves `parallel!fn` calls, bound to a pool via `parallel!fn(pool)`,
+	// so each parallel pass fully completes before the next one starts.
+	struct Counter { int value; }
+
+	static bool bump(ref Context ctx, EntityId e) @nogc nothrow {
+		if (!ctx.hasComponent!Counter(e))
+			return true;
+
+		ctx.getComponent!Counter(e).value++;
+		return true;
+	}
+
+	auto ctx = ecrs.context.create();
+	scope(exit) ecrs.context.free(ctx);
+
+	foreach (i; 0 .. 50) {
+		EntityId e = ctx.addEntity();
+		ctx.addComponent!Counter(e).value = cast(int) i;
+	}
+
+	auto pool = bc.threadpool.create(4);
+	scope(exit) bc.threadpool.free(pool);
+
+	auto runBump = parallel!bump(pool);
+	assert(runBump(ctx));
+	foreach (i; 0 .. 50)
+		assert(ctx.getComponent!Counter(cast(EntityId)(i + 1)).value == cast(int) i + 1);
+
+	assert(sequential(ctx, runBump, parallel!bump(pool)));
+	foreach (i; 0 .. 50)
+		assert(ctx.getComponent!Counter(cast(EntityId)(i + 1)).value == cast(int) i + 3);
 }

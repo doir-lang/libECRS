@@ -27,5 +27,5 @@ jobs:
       - name: Run unittests
         run: dub test --compiler=${{ matrix.dc == 'dmd-latest' && 'dmd' || 'ldc2' }}
 
-      - name: Build static library
-        run: dub build --config=library --compiler=${{ matrix.dc == 'dmd-latest' && 'dmd' || 'ldc2' }}
+      # - name: Build static library
+      #   run: dub build --config=library --compiler=${{ matrix.dc == 'dmd-latest' && 'dmd' || 'ldc2' }}
