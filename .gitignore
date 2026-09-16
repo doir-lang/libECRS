@@ -4,3 +4,6 @@ build*
 *.o
 libecrs*
 dub.selections.json
+bin
+*.lst
+*.pdb
