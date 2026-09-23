@@ -2,15 +2,12 @@
 ///
 /// Styled after `fp.dynarray`/`bc.mutex`/`ecrs.storage`: `Context` is plain
 /// data with no methods of its own, and every operation on it is a free
-/// function taking it by `ref` - which also means the module-level
-/// `@nogc nothrow:` colon-attribute below actually applies to all of them (it
-/// does not propagate into struct member functions in D). There is
-/// deliberately no `Entity` handle wrapping a thread-local "current context" -
-/// callers just pass the `Context` (and an `EntityId` where relevant)
-/// explicitly to every free function below.
+/// function taking it by `ref` - which also puts them all under the
+/// module-level `@nogc nothrow:` below, since that does not reach into a
+/// struct body. There is deliberately no `Entity` handle wrapping a
+/// thread-local "current context" - callers just pass the `Context` (and an
+/// `EntityId` where relevant) explicitly to every free function below.
 module ecrs.context;
-
-// import core.stdc.stdlib : cMalloc = malloc, cFree = free;
 
 import fp.dynarray;
 import fp.pointer : allocFunction, notFound;
@@ -21,30 +18,13 @@ import ecrs.storage;
 @nogc nothrow:
 
 
-private bool freelistContains(inout size_t* freelist, size_t value) @trusted @nogc nothrow {
+private bool freelistContains(inout size_t* freelist, size_t value) @trusted {
 	if (freelist is null) return false;
 	immutable n = fp.dynarray.length(cast(size_t*) freelist);
 	foreach (i; 0 .. n)
 		if ((cast(size_t*) freelist)[i] == value) return true;
 	return false;
 }
-
-private void reorderEntitiesCore(ref Context self, const(size_t)[] order, void function(ref Context, size_t, size_t) @nogc nothrow swapFunction) @trusted @nogc nothrow {
-	immutable n = order.length;
-	assert(n == entityCount(self));
-	if (n <= 1) return;
-
-	size_t* swaps = cast(size_t*) allocFunction(null, n * size_t.sizeof);
-	scope(exit) allocFunction(swaps, 0);
-	foreach (i; 0 .. n) swaps[order[i]] = i;
-
-	foreach (i; 0 .. n)
-		while (swaps[i] != i) {
-			swapFunction(self, swaps[i], i);
-			immutable t = swaps[swaps[i]]; swaps[swaps[i]] = swaps[i]; swaps[i] = t;
-		}
-}
-
 
 /// A lazily-populated view over the live (non-freelisted) entities of a
 /// `Context`, usable directly in a `foreach`.
@@ -87,13 +67,13 @@ struct Context {
 
 /// Constructs a context with the permanently-reserved invalid entity (id 0)
 /// already allocated. Use this instead of `Context.init` directly.
-Context create() @nogc nothrow {
+Context create() {
 	Context c;
 	cast(void) addEntity(c);
 	return c;
 }
 
-void free(ref Context self) @trusted @nogc nothrow {
+void free(ref Context self) @trusted {
 	if (self.storages !is null) {
 		foreach (i; 0 .. fp.dynarray.length(self.storages))
 			ecrs.storage.free(self.storages[i]);
@@ -113,10 +93,10 @@ void free(ref Context self) @trusted @nogc nothrow {
 // a "fill in the default" match and the const overload's "convert self to
 // const" match as equally good, which makes the 2-arg call ambiguous.
 // Keeping the 2-arg and 3-arg mutable overloads exact-arity-only avoids that.
-ref ComponentStorage getStorage(ref Context self, size_t componentIdVal, size_t elementSize) @trusted @nogc nothrow {
+ref ComponentStorage getStorage(ref Context self, size_t componentIdVal, size_t elementSize) @trusted {
 	return getStorage(self, componentIdVal, elementSize, null);
 }
-ref ComponentStorage getStorage(ref Context self, size_t componentIdVal, size_t elementSize, ComponentStorage.FinalizeFunction finalizeFunction) @trusted @nogc nothrow {
+ref ComponentStorage getStorage(ref Context self, size_t componentIdVal, size_t elementSize, ComponentStorage.FinalizeFunction finalizeFunction) @trusted {
 	while (fp.dynarray.length(self.storages) <= componentIdVal)
 		fp.dynarray.pushBack(self.storages, ComponentStorage.init);
 	if (self.storages[componentIdVal].elementSize == ComponentStorage.invalid)
@@ -124,7 +104,7 @@ ref ComponentStorage getStorage(ref Context self, size_t componentIdVal, size_t 
 	assert(self.storages[componentIdVal].elementSize != ComponentStorage.invalid);
 	return self.storages[componentIdVal];
 }
-ref const(ComponentStorage) getStorage(const ref Context self, size_t componentIdVal, size_t elementSize) @trusted @nogc nothrow {
+ref const(ComponentStorage) getStorage(const ref Context self, size_t componentIdVal, size_t elementSize) @trusted {
 	assert(fp.dynarray.length(self.storages) > componentIdVal);
 	assert(self.storages[componentIdVal].elementSize != ComponentStorage.invalid);
 	return self.storages[componentIdVal];
@@ -135,11 +115,11 @@ template getStorage(Tcomponent, size_t Unique = 0) {
 	}
 }
 
-size_t entityCount(const ref Context self) @trusted @nogc nothrow {
+size_t entityCount(const ref Context self) @trusted {
 	return fp.dynarray.length(self.entityComponentIndices) - fp.dynarray.length(self.freelist);
 }
 
-EntityId addEntity(ref Context self) @trusted @nogc nothrow {
+EntityId addEntity(ref Context self) @trusted {
 	if (self.freelist !is null && fp.dynarray.length(self.freelist) > 0) {
 		immutable e = *fp.dynarray.back(self.freelist);
 		fp.dynarray.popBack(self.freelist);
@@ -150,7 +130,7 @@ EntityId addEntity(ref Context self) @trusted @nogc nothrow {
 	return out_;
 }
 
-void removeEntity(ref Context self, EntityId e) @trusted @nogc nothrow {
+void removeEntity(ref Context self, EntityId e) @trusted {
 	assert(e < fp.dynarray.length(self.entityComponentIndices));
 	if (self.entityComponentIndices[e] !is null) {
 		auto indices = self.entityComponentIndices[e];
@@ -163,7 +143,7 @@ void removeEntity(ref Context self, EntityId e) @trusted @nogc nothrow {
 	fp.dynarray.pushBack(self.freelist, cast(size_t) e);
 }
 
-bool hasComponent(const ref Context self, EntityId e, size_t componentIdVal) @trusted @nogc nothrow {
+bool hasComponent(const ref Context self, EntityId e, size_t componentIdVal) @trusted {
 	return self.entityComponentIndices !is null
 		&& e < fp.dynarray.length(self.entityComponentIndices)
 		&& self.entityComponentIndices[e] !is null
@@ -179,7 +159,7 @@ template hasComponent(Tcomponent, size_t Unique = 0) {
 /// Type-erased: the new slot is zero-filled rather than constructed,
 /// since there's no compile-time type here to initialize it properly.
 /// Prefer the templated overload below whenever `Tcomponent` is known.
-void* addComponent(ref Context self, EntityId e, size_t componentIdVal, size_t elementSize = ComponentStorage.invalid) @trusted @nogc nothrow {
+void* addComponent(ref Context self, EntityId e, size_t componentIdVal, size_t elementSize = ComponentStorage.invalid) @trusted {
 	assert(!hasComponent(self, e, componentIdVal));
 	immutable sz = elementSize == ComponentStorage.invalid ? lookupComponentSize(componentIdVal) : elementSize;
 	auto storagePtr = &getStorage(self, componentIdVal, sz);
@@ -212,7 +192,7 @@ template addComponent(Tcomponent, size_t Unique = 0) {
 	}
 }
 
-void removeComponent(ref Context self, EntityId e, size_t componentIdVal) @trusted @nogc nothrow {
+void removeComponent(ref Context self, EntityId e, size_t componentIdVal) @trusted {
 	assert(hasComponent(self, e, componentIdVal));
 	immutable sz = lookupComponentSize(componentIdVal);
 	finalizeElement(getStorage(self, componentIdVal, sz), self.entityComponentIndices[e][componentIdVal]);
@@ -228,12 +208,12 @@ template removeComponent(Tcomponent, size_t Unique = 0) {
 	}
 }
 
-void* getComponent(ref Context self, EntityId e, size_t componentIdVal, size_t elementSize = ComponentStorage.invalid) @trusted @nogc nothrow {
+void* getComponent(ref Context self, EntityId e, size_t componentIdVal, size_t elementSize = ComponentStorage.invalid) @trusted {
 	assert(hasComponent(self, e, componentIdVal));
 	immutable sz = elementSize == ComponentStorage.invalid ? lookupComponentSize(componentIdVal) : elementSize;
 	return getStorage(self, componentIdVal, sz).get(self.entityComponentIndices[e][componentIdVal]);
 }
-const(void)* getComponent(const ref Context self, EntityId e, size_t componentIdVal, size_t elementSize = ComponentStorage.invalid) @trusted @nogc nothrow {
+const(void)* getComponent(const ref Context self, EntityId e, size_t componentIdVal, size_t elementSize = ComponentStorage.invalid) @trusted {
 	assert(hasComponent(self, e, componentIdVal));
 	immutable sz = elementSize == ComponentStorage.invalid ? lookupComponentSize(componentIdVal) : elementSize;
 	return getStorage(self, componentIdVal, sz).get(self.entityComponentIndices[e][componentIdVal]);
@@ -247,7 +227,7 @@ template getComponent(Tcomponent, size_t Unique = 0) {
 	}
 }
 
-void* getOrAddComponent(ref Context self, EntityId e, size_t componentIdVal, size_t elementSize = ComponentStorage.invalid) @nogc nothrow {
+void* getOrAddComponent(ref Context self, EntityId e, size_t componentIdVal, size_t elementSize = ComponentStorage.invalid) {
 	if (hasComponent(self, e, componentIdVal)) return getComponent(self, e, componentIdVal, elementSize);
 	return addComponent(self, e, componentIdVal, elementSize);
 }
@@ -258,7 +238,7 @@ template getOrAddComponent(Tcomponent, size_t Unique = 0) {
 	}
 }
 
-void swapEntities(ref Context self, EntityId a, EntityId b = EntityId.max) @trusted @nogc nothrow {
+void swapEntities(ref Context self, EntityId a, EntityId b = EntityId.max) @trusted {
 	immutable resolvedB = b == EntityId.max ? cast(EntityId)(fp.dynarray.length(self.entityComponentIndices) - 1) : b;
 	assert(a < fp.dynarray.length(self.entityComponentIndices));
 	assert(resolvedB < fp.dynarray.length(self.entityComponentIndices));
@@ -284,18 +264,44 @@ template swapEntities(Tcomponents2notify...) {
 	}
 }
 
-void reorderEntities(ref Context self, const(size_t)[] order) @nogc nothrow {
-	static void doSwap(ref Context self, size_t a, size_t b) @nogc nothrow {
-		swapEntities(self, cast(EntityId) a, cast(EntityId) b);
-	}
-	reorderEntitiesCore(self, order, &doSwap);
+void reorderEntities(ref Context self, const(size_t)[] order) {
+	assert(order.length == entityCount(self));
+	applyPermutation(order, (a, b) { swapEntities(self, cast(EntityId) a, cast(EntityId) b); });
 }
+/// Ditto, relabelling the entity ids each of `Tcomponents2notify` holds (via
+/// their `remapEntities` static method) so components that reference entities -
+/// `WithEntity`, a relation - stay correct across the renumbering.
+///
+/// `remapEntities` and not `swapEntities`: `applyPermutation` makes O(n) swaps,
+/// so notifying per swap rescanned every instance of every listed component n
+/// times. Relabelling once is the same permutation - composing the transpositions
+/// over the labels and applying the permutation to them directly agree - and it
+/// turns the notification from O(n * references) into O(references).
 template reorderEntities(Tcomponents2notify...) {
-	void reorderEntities(ref Context self, const(size_t)[] order) @nogc nothrow {
-		static void doSwap(ref Context self, size_t a, size_t b) @nogc nothrow {
-			.swapEntities!Tcomponents2notify(self, cast(EntityId) a, cast(EntityId) b);
+	void reorderEntities(ref Context self, const(size_t)[] order) @nogc nothrow @trusted {
+		assert(order.length == entityCount(self));
+		static foreach (T; Tcomponents2notify)
+			static assert(hasRemapEntities!T,
+				T.stringof ~ " is listed in a reorderEntities() but has no remapEntities() hook"
+				~ " - a swapEntities()-only component would silently keep its old entity ids.");
+
+		auto remap = buildRemap(order);
+		scope(exit) allocFunction(remap, 0);
+		const(EntityId)[] remapSlice = remap[0 .. order.length];
+		static foreach (T; Tcomponents2notify) {
+			{
+				auto storagePtr = &.getStorage!T(self);
+				T* data = (*storagePtr).data!T();
+				foreach (i; 0 .. (*storagePtr).size())
+					T.remapEntities(data[i], self.entityComponentIndices, remapSlice);
+			}
 		}
-		reorderEntitiesCore(self, order, &doSwap);
+
+		// Independent of the relabelling above: this moves component data between
+		// entity slots, which no slot's *contents* depend on.
+		applyPermutation(order, (a, b) {
+			.swapEntities(self, cast(EntityId) a, cast(EntityId) b);
+		});
 	}
 }
 
@@ -312,18 +318,18 @@ template makeMonotonic(Tcomponent, size_t Unique = 0) {
 		ecrs.storage.sortMonotonic!(Tcomponent, Unique)(.getStorage!(Tcomponent, Unique)(self), self.entityComponentIndices);
 	}
 }
-void makeMonotonic(ref Context self, size_t componentIdVal, size_t elementSize = ComponentStorage.invalid) @nogc nothrow {
+void makeMonotonic(ref Context self, size_t componentIdVal, size_t elementSize = ComponentStorage.invalid) {
 	immutable sz = elementSize == ComponentStorage.invalid ? lookupComponentSize(componentIdVal) : elementSize;
 	getStorage(self, componentIdVal, sz).sortMonotonic(componentIdVal, self.entityComponentIndices);
 }
 
-void makeAllMonotonic(ref Context self) @trusted @nogc nothrow {
+void makeAllMonotonic(ref Context self) @trusted {
 	foreach (id; 0 .. fp.dynarray.length(self.storages))
 		if (self.storages[id].elementSize != ComponentStorage.invalid)
 			self.storages[id].sortMonotonic(id, self.entityComponentIndices);
 }
 
-EntityRange entities(const ref Context self) @nogc nothrow { return EntityRange(&self, 0); }
+EntityRange entities(const ref Context self) { return EntityRange(&self, 0); }
 
 
 unittest {
@@ -470,6 +476,16 @@ unittest {
 	assert(ctx.getComponent!Val(2).v == 10); // unchanged
 	assert(ctx.getComponent!Val(3).v == 30); // formerly entity 1's value
 
+	// A 3-cycle, to pin down which way `order` reads: `order[i]` is the entity
+	// that *ends up at* i, not where i goes. The two disagree for any permutation
+	// that is not its own inverse, and the pairwise `order = [0, 3, 2, 1]` above
+	// cannot tell them apart.
+	immutable size_t[4] cycle = [0, 3, 1, 2];
+	ctx.reorderEntities(cycle[]);
+	assert(ctx.getComponent!Val(1).v == 30); // entity 3 held 30 and lands at 1
+	assert(ctx.getComponent!Val(2).v == 20);
+	assert(ctx.getComponent!Val(3).v == 10);
+
 	// makeMonotonic(runtime id) / makeAllMonotonic() re-sort storage by entity id.
 	immutable id = componentId!Val();
 	ctx.makeMonotonic(id);
@@ -515,4 +531,41 @@ unittest {
 	ctx.removeEntity(e2);
 	ref ComponentStorage storage2 = ctx.getStorage!DynRel();
 	assert(ecrs.storage.get!DynRel(storage2, idx2).related is null);
+}
+
+
+unittest {
+	// reorderEntities!(Tcomponents2notify): the renumbering has to reach inside a
+	// component that *references* entities, not just move component data between
+	// slots. A relation pointing at the entity after it stays pointing at it.
+	import ecrs.relation : Relation, dynamicExtent;
+
+	struct Link {
+		Relation!1 relation;
+		alias relation this;
+		static void swapEntities(ref Link self, ref EntityComponentIndices idx, EntityId a, EntityId b) @nogc nothrow {
+			Relation!1.swapEntities(self.relation, idx, a, b);
+		}
+		static void remapEntities(ref Link self, ref EntityComponentIndices idx, const(EntityId)[] remap) @nogc nothrow {
+			Relation!1.remapEntities(self.relation, idx, remap);
+		}
+	}
+
+	auto ctx = create();
+	scope(exit) free(ctx);
+
+	EntityId e1 = ctx.addEntity(); // 1
+	EntityId e2 = ctx.addEntity(); // 2
+	EntityId e3 = ctx.addEntity(); // 3
+	ctx.addComponent!Link(e1).related[0] = e2;
+	ctx.addComponent!Link(e2).related[0] = e3;
+	ctx.addComponent!Link(e3).related[0] = invalidEntity;
+
+	// 1 -> 3, 2 -> 1, 3 -> 2, so the chain becomes 3 -> 1 -> 2 -> invalid.
+	immutable size_t[4] order = [0, 2, 3, 1];
+	ctx.reorderEntities!Link(order[]);
+
+	assert(ctx.getComponent!Link(3).related[0] == 1);
+	assert(ctx.getComponent!Link(1).related[0] == 2);
+	assert(ctx.getComponent!Link(2).related[0] == invalidEntity);
 }

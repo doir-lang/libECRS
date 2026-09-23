@@ -150,9 +150,9 @@ const(char)* lookupComponentName(size_t componentId) @trusted {
 /// checker sees nothing outstanding), not for reuse while old ids are still
 /// in play.
 void freeRegistry() @trusted {
-	if (forwardMap !is null) fp.hashtable.free(forwardMap); // also frees each entry's cloned name (finalizeForwardEntry)
-	if (reverseMap !is null) fp.hashtable.free(reverseMap); // names here just alias the forwardMap ones - nothing to own
-	if (sizeMap !is null) fp.hashtable.free(sizeMap);
+	fp.hashtable.free(forwardMap); // also frees each entry's cloned name (finalizeForwardEntry)
+	fp.hashtable.free(reverseMap); // names here just alias the forwardMap ones - nothing to own
+	fp.hashtable.free(sizeMap);
 	globalComponentId = 0;
 }
 
