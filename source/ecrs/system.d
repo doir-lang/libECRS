@@ -11,6 +11,11 @@ import std.algorithm.searching : all;
 @nogc nothrow:
 
 
+// ============================================================================
+// Per-entity combinators
+// ============================================================================
+
+/// Runs `fn` over every entity in order, stopping at the first one that fails.
 template sequential(alias fn) {
 	bool sequential(ref Context context) {
 		foreach (e; context.entities())
@@ -18,97 +23,7 @@ template sequential(alias fn) {
 				return false;
 		return true;
 	}
-
 }
-
-// ============================================================================
-// Sequential whole-system combinator
-// ============================================================================
-
-/// Whether `S` can be invoked as a whole system: `bool s(ref Context)`. Every
-/// shape this module hands back is one - a `SystemFunction`, `&sequential!fn`,
-/// `parallel!fn(pool)`'s `Bound`, `Sequential` below - as is anything
-/// downstream that follows the same convention.
-private enum isSystem(S) = __traits(compiles, (ref S system, ref Context context) {
-	bool result = system(context);
-});
-
-/// Ditto, for every element of a tuple. Vacuously true for none, so the
-/// combinators below still accept an empty system list.
-private template allSystems(Systems...) {
-	static if (Systems.length == 0)
-		enum allSystems = true;
-	else
-		enum allSystems = isSystem!(Systems[0]) && allSystems!(Systems[1 .. $]);
-}
-
-/// Whether `T` owns the `Context` a system should run against, as a `ctx`
-/// member - the shape a downstream "context plus payload" type takes (DOIR's
-/// `module` is one). Lets a bound schedule be invoked with that type directly
-/// instead of making every call site reach for `.ctx`.
-private enum isContextLike(T) = !is(immutable T == immutable Context)
-	&& __traits(hasMember, T, "ctx")
-	&& is(typeof(T.ctx) == Context);
-
-/// Combines whole systems into one pass that runs them in order, stopping at
-/// the first one that fails.
-///
-/// Note that this is deliberately *not* what the whole-system `parallel`
-/// combinator does: a `parallel` schedule has no first failure to stop at, so
-/// it runs everything and ANDs. Reach for `sequential` when a later system
-/// would be working on what an earlier one failed to produce (a compiler
-/// schedule, say); when the systems are independent, the two are
-/// interchangeable.
-bool sequential(Systems...)(ref Context context, Systems systems) {
-	static foreach (system; systems)
-		if(!system(context))
-			return false;
-	return true;
-}
-
-/// Runs every one of `systems` in order and ANDs their results - `sequential`
-/// without the short circuit.
-///
-/// This is what the whole-system `parallel` combinator degrades to when it
-/// cannot actually run anything concurrently. Using `sequential` there would
-/// make "does a failing system stop the ones behind it" depend on how many
-/// workers the pool happened to have.
-private bool andAll(Systems...)(ref Context context, Systems systems) {
-	bool valid = true;
-	static foreach (system; systems)
-		valid &= system(context);
-	return valid;
-}
-
-/// `sequential(Systems...)` with its systems bound up front: a savable,
-/// copyable callable (`bool opCall(ref Context) @nogc nothrow`), so a composed
-/// schedule is itself a system - storable, nestable inside another combinator,
-/// or simply called as `sequential(a, b)(context)`. A plain struct is used
-/// instead of a closure since capturing the systems in a delegate would need a
-/// GC allocation, which isn't available under `-betterC`. The same trick
-/// `parallel!fn(pool)` uses to bind its pool.
-struct Sequential(Systems...) {
-	private Systems systems;
-
-	@nogc nothrow:
-	this(Systems systems) { this.systems = systems; }
-
-	bool opCall(ref Context context) { return .sequential(context, systems); }
-
-	/// Ditto, for a type that owns its context as a `ctx` member. See
-	/// `isContextLike`.
-	bool opCall(ContextLike)(ref ContextLike contextLike)
-	if (isContextLike!ContextLike) {
-		return .sequential(contextLike.ctx, systems);
-	}
-}
-
-/// Ditto.
-Sequential!Systems sequential(Systems...)(Systems systems)
-if (Systems.length > 0 && allSystems!Systems) {
-	return Sequential!Systems(systems);
-}
-
 
 template parallel(alias fn) {
 	private struct Item {
@@ -189,7 +104,7 @@ template parallel(alias fn) {
 }
 
 // ============================================================================
-// Parallel whole-system combinator
+// Shared traits
 // ============================================================================
 
 /// The shape a whole system takes when it happens to be a plain function
@@ -197,6 +112,99 @@ template parallel(alias fn) {
 /// `isSystem` - but a lift written downstream commonly produces one, so the
 /// alias stays named.
 alias SystemFunction = bool function(ref Context) @nogc nothrow;
+
+/// Whether `S` can be invoked as a whole system: `bool s(ref Context)`. Every
+/// shape this module hands back is one - a `SystemFunction`, `&sequential!fn`,
+/// `parallel!fn(pool)`'s `Bound`, `Sequential` below - as is anything
+/// downstream that follows the same convention.
+private enum isSystem(S) = __traits(compiles, (ref S system, ref Context context) {
+	bool result = system(context);
+});
+
+/// Ditto, for every element of a tuple. Vacuously true for none, so the
+/// combinators below still accept an empty system list.
+private template allSystems(Systems...) {
+	static if (Systems.length == 0)
+		enum allSystems = true;
+	else
+		enum allSystems = isSystem!(Systems[0]) && allSystems!(Systems[1 .. $]);
+}
+
+/// Whether `T` owns the `Context` a system should run against, as a `ctx`
+/// member - the shape a downstream "context plus payload" type takes (DOIR's
+/// `module` is one). Lets a bound schedule be invoked with that type directly
+/// instead of making every call site reach for `.ctx`.
+private enum isContextLike(T) = !is(immutable T == immutable Context)
+	&& __traits(hasMember, T, "ctx")
+	&& is(typeof(T.ctx) == Context);
+
+// ============================================================================
+// Sequential whole-system combinator
+// ============================================================================
+
+/// Combines whole systems into one pass that runs them in order, stopping at
+/// the first one that fails.
+///
+/// Note that this is deliberately *not* what the whole-system `parallel`
+/// combinator does: a `parallel` schedule has no first failure to stop at, so
+/// it runs everything and ANDs. Reach for `sequential` when a later system
+/// would be working on what an earlier one failed to produce (a compiler
+/// schedule, say); when the systems are independent, the two are
+/// interchangeable.
+bool sequential(Systems...)(ref Context context, Systems systems) {
+	static foreach (system; systems)
+		if(!system(context))
+			return false;
+	return true;
+}
+
+/// Runs every one of `systems` in order and ANDs their results - `sequential`
+/// without the short circuit.
+///
+/// This is what the whole-system `parallel` combinator degrades to when it
+/// cannot actually run anything concurrently. Using `sequential` there would
+/// make "does a failing system stop the ones behind it" depend on how many
+/// workers the pool happened to have.
+private bool andAll(Systems...)(ref Context context, Systems systems) {
+	bool valid = true;
+	static foreach (system; systems)
+		valid &= system(context);
+	return valid;
+}
+
+/// `sequential(Systems...)` with its systems bound up front: a savable,
+/// copyable callable (`bool opCall(ref Context) @nogc nothrow`), so a composed
+/// schedule is itself a system - storable, nestable inside another combinator,
+/// or simply called as `sequential(a, b)(context)`. A plain struct is used
+/// instead of a closure since capturing the systems in a delegate would need a
+/// GC allocation, which isn't available under `-betterC`. The same trick
+/// `parallel!fn(pool)` uses to bind its pool.
+struct Sequential(Systems...) {
+	private Systems systems;
+
+	@nogc nothrow:
+	this(Systems systems) { this.systems = systems; }
+
+	bool opCall(ref Context context) { return .sequential(context, systems); }
+
+	/// Ditto, for a type that owns its context as a `ctx` member. See
+	/// `isContextLike`.
+	bool opCall(ContextLike)(ref ContextLike contextLike)
+	if (isContextLike!ContextLike) {
+		return .sequential(contextLike.ctx, systems);
+	}
+}
+
+/// Ditto.
+Sequential!Systems sequential(Systems...)(Systems systems)
+if (Systems.length > 0 && allSystems!Systems) {
+	return Sequential!Systems(systems);
+}
+
+
+// ============================================================================
+// Parallel whole-system combinator
+// ============================================================================
 
 /// One system queued onto the pool.
 ///
@@ -210,7 +218,6 @@ private struct SystemJob {
 	bool function(void*, ref Context) @nogc nothrow invoke;
 	Context* context;
 	bool result;
-
 }
 
 /// The trampoline `SystemJob.invoke` points at; one instantiation per system
@@ -221,7 +228,7 @@ private template invokeSystem(System) {
 	}
 }
 
-private void runSystem(void* arg) @nogc nothrow {
+private void runSystem(void* arg) {
 	auto job = cast(SystemJob*) arg;
 	job.result = job.invoke(job.system, *job.context);
 }
@@ -229,12 +236,11 @@ private void runSystem(void* arg) @nogc nothrow {
 /// Combines whole systems (anything callable as `bool system(ref Context)`:
 /// `&sequential!fn`, `parallel!fn(pool)`, another combinator's result) into one
 /// that runs them concurrently via `pool` - queuing all of them at once and
-/// letting
-/// workers pull the next as they finish, even if there are more systems
-/// than workers - and ANDs their results together. Takes the same systems as
+/// letting workers pull the next as they finish, even if there are more
+/// systems than workers - and ANDs their results together. Takes the same as
 /// `ecrs.system.sequential(Systems...)`, but always runs all of them: see the
 /// note there on the short circuit.
-bool parallel(Systems...)(ref Context context, ThreadPool* pool, Systems systems) @trusted @nogc nothrow {
+bool parallel(Systems...)(ref Context context, ThreadPool* pool, Systems systems) @trusted {
 	static if (Systems.length <= 1)
 		return andAll(context, systems);
 	else {

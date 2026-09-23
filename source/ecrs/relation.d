@@ -43,13 +43,20 @@ struct Relation(size_t N = dynamicExtent, bool canBeTerm = false) {
 		MaybeTerm[N] related;
 
 	static void swapEntities(ref Relation self, ref EntityComponentIndices entityComponentIndices, EntityId a, EntityId b) @nogc nothrow {
-		static if (isDynamic) {
-			foreach (ref e; slice(self.related))
-				swapTermEntity(e, a, b);
-		} else {
-			foreach (ref e; self.related)
-				swapTermEntity(e, a, b);
-		}
+		static if (isDynamic) auto slots = slice(self.related);
+		else auto slots = self.related[];
+		foreach (ref e; slots)
+			swapTermEntity(e, a, b);
+	}
+
+	/// The `reorderEntities` hook: one relabelling of every slot, where
+	/// `swapEntities` would have been called once per transposition and rescanned
+	/// them all each time.
+	static void remapEntities(ref Relation self, ref EntityComponentIndices entityComponentIndices, const(EntityId)[] remap) @nogc nothrow {
+		static if (isDynamic) auto slots = slice(self.related);
+		else auto slots = self.related[];
+		foreach (ref e; slots)
+			remapTermEntity(e, remap);
 	}
 
 	static if (isDynamic)
@@ -67,14 +74,25 @@ private template Ternary(bool canBeTerm) {
 	else alias Ternary = EntityId;
 }
 
-private void swapTermEntity(ref EntityId e, EntityId a, EntityId b) @nogc nothrow {
+private void swapTermEntity(ref EntityId e, EntityId a, EntityId b) {
 	if (e == a) e = b;
 	else if (e == b) e = a;
 }
-private void swapTermEntity(ref Term t, EntityId a, EntityId b) @nogc nothrow {
+private void swapTermEntity(ref Term t, EntityId a, EntityId b) {
 	if (t.isVar) return;
 	if (t.constant == a) t.constant = b;
 	else if (t.constant == b) t.constant = a;
+}
+
+// An id the permutation does not cover keeps its own, which is what the swap
+// form did with it too: `invalidEntity` maps to itself as long as the caller's
+// permutation holds index 0 fixed.
+private void remapTermEntity(ref EntityId e, const(EntityId)[] remap) {
+	if (e < remap.length) e = remap[e];
+}
+private void remapTermEntity(ref Term t, const(EntityId)[] remap) {
+	if (t.isVar) return;
+	if (t.constant < remap.length) t.constant = remap[t.constant];
 }
 
 
@@ -136,6 +154,30 @@ unittest {
 	rel.related[0] = Term(EntityId(7));
 	assert(!rel.related[0].isVar);
 	assert(rel.related[0].constant == 7);
+}
+
+unittest {
+	// remapEntities(): every slot relabelled in one pass, vars left alone, and an
+	// id past the end of the table (here 9) left as it was.
+	import ecrs.storage : hasRemapEntities;
+
+	alias TermRelation = Relation!(4, true);
+	static assert(hasRemapEntities!TermRelation);
+
+	TermRelation rel;
+	rel.related[0] = Term();
+	rel.related[1] = Term(EntityId(1));
+	rel.related[2] = Term(EntityId(3));
+	rel.related[3] = Term(EntityId(9));
+
+	immutable EntityId[4] remap = [0, 3, 1, 2];
+	EntityComponentIndices dummy = null;
+	TermRelation.remapEntities(rel, dummy, remap[]);
+
+	assert(rel.related[0].isVar);
+	assert(rel.related[1].constant == 3);
+	assert(rel.related[2].constant == 2);
+	assert(rel.related[3].constant == 9);
 }
 
 unittest {

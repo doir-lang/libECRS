@@ -7,13 +7,9 @@
     "dflags-ldc": ["-betterC", "-checkaction=C"],
     "dflags-dmd": ["-betterC", "-checkaction=C"],
     "dependencies": {
-        "libfp": {
-            "repository": "git+https://github.com/doir-lang/libfp.git",
-            "version": "674acd77c2b8411144c2e162015145df7edcf1a0"
-        },
         "bc-threads": {
             "repository": "git+https://github.com/doir-lang/bc-threads.git",
-            "version": "f3e45474cb010bcdca84c30b60619b4c61249dc1"
+            "version": "b61e5ec84f3607f9ac443b83a302c7bc41a2c0c8"
         }
     },
     "subConfigurations": {
