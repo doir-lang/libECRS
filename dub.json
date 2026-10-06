@@ -13,7 +13,6 @@
         }
     },
     "subConfigurations": {
-        "libfp": "library",
         "bc-threads": "library"
     },
     "configurations": [
@@ -31,9 +30,39 @@
             "dflags-dmd": ["-betterC", "-checkaction=C"]
         },
         {
+            "name": "datalog-bench",
+            "targetType": "executable",
+            "targetPath": "bin",
+            "targetName": "datalog-bench",
+            "mainSourceFile": "tools/datalog_bench.d",
+            "sourcePaths": ["source"],
+            "sourceFiles": ["tools/datalog_bench.d"],
+            "importPaths": ["source"],
+            "dflags-ldc": ["-betterC", "-checkaction=C"],
+            "dflags-dmd": ["-betterC", "-checkaction=C"]
+        },
+        {
             "name": "simple",
             "targetType": "executable",
             "mainSourceFile": "examples/simple.d",
+            "sourcePaths": ["source", "examples"],
+            "importPaths": ["source", "examples"],
+            "dflags-ldc": ["-betterC", "-checkaction=C"],
+            "dflags-dmd": ["-betterC", "-checkaction=C"]
+        },
+        {
+            "name": "simpsons",
+            "targetType": "executable",
+            "mainSourceFile": "examples/simpsons.d",
+            "sourcePaths": ["source", "examples"],
+            "importPaths": ["source", "examples"],
+            "dflags-ldc": ["-betterC", "-checkaction=C"],
+            "dflags-dmd": ["-betterC", "-checkaction=C"]
+        },
+        {
+            "name": "typeinference",
+            "targetType": "executable",
+            "mainSourceFile": "examples/typeinference.d",
             "sourcePaths": ["source", "examples"],
             "importPaths": ["source", "examples"],
             "dflags-ldc": ["-betterC", "-checkaction=C"],

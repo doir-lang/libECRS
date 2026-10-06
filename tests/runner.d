@@ -10,6 +10,8 @@ private enum modules = [
 	"ecrs.relation",
 	"ecrs.context",
 	"ecrs.system",
+	"ecrs.datalog",
+	"datalog_hammer",
 ];
 
 private int runEveryTest() {

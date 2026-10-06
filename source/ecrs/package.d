@@ -6,3 +6,4 @@ public import ecrs.storage;
 public import ecrs.context;
 public import ecrs.relation;
 public import ecrs.system;
+public import ecrs.datalog;

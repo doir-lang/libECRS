@@ -8,6 +8,7 @@ module ecrs.registry;
 import core.atomic : atomicLoad, atomicOp, atomicStore, MemoryOrder;
 
 static import bc.spinlock;
+static import core.stdc.string;
 static import fp.dynarray;
 static import fp.fnv1a;
 static import fp.hashtable;
@@ -28,11 +29,26 @@ enum EntityId invalidEntity = 0;
 alias RemapFunction = void function(void* element, const(EntityId)[] remap) @nogc nothrow;
 
 /// The callbacks storage runs on one component type's type-erased elements, recorded when the type registers, so storage created from a runtime id still ends lifetimes, and a holder of entity ids is renumbered by every `ecrs.context.reorderEntities` without the caller naming it. A null hook means the type has none.
+/// How `ecrs.datalog` reads a component as a relation: the owning entity, then `columns` entity ids at offset 0 of the element. A fixed relation holds one tuple of them, a dynamic one a dynarray of `columns`-wide tuples; with `columns` 0 the component is a unary predicate, present or not.
+struct RelationShape {
+	size_t columns = 0; /// Entity columns after the owner.
+	bool dynamic = false; /// Whether the ids are a dynarray rather than a fixed array.
+	uint traits = 0; /// `RelationTrait` flags, set with `setRelationTraits`.
+}
+
+/// How queries read a binary relation, one with `columns` 1, leaving its stored facts unchanged. `transitive` reads its closure, `symmetric` every edge both ways, and `reflexive` adds `R(x, x)` for each `x` in the relation's field, the entities occurring in it, so the answer is the same whatever the query binds.
+enum RelationTrait : uint {
+	transitive = 1, /// Reads the closure.
+	symmetric = 2, /// Reads every edge both ways.
+	reflexive = 4, /// Relates each entity in the field to itself.
+}
+
+/// The callbacks storage runs on one component type's type-erased elements, recorded when the type registers, so storage created from a runtime id still ends lifetimes, and a holder of entity ids is renumbered by every `ecrs.context.reorderEntities` without the caller naming it. A null hook means the type has none.
 struct Hooks {
 	fp.lifecycle.FinalizeFunction finalizeFunction = null; /// Ends a component's lifetime, as `fp.lifecycle` defines it, before its slot is discarded.
 	RemapFunction remapFunction = null; /// Run on a component by every entity renumbering.
+	RelationShape shape; /// How `ecrs.datalog` reads the component.
 }
-
 
 /// Whether `T` implements `static void remapEntities(ref T, const(EntityId)[] remap)`, relabelling every entity id an instance holds, `remap[old]` being the id `old` becomes.
 ///
@@ -49,7 +65,24 @@ enum hasRemapEntities(T) = __traits(compiles, {
 
 private void remapThunk(T)(void* p, const(EntityId)[] remap) @trusted { T.remapEntities(*cast(T*) p, remap); }
 
-/// The hooks `T` declares: `fp.lifecycle.finalizeFunction!T`, set unless `T`'s lifetime is its bytes, and `remapEntities`, as `hasRemapEntities` detects it.
+/// The shape of an `ecrs.relation.Relation` whose slots are entities rather than terms, detected structurally because this module cannot import that one. Every other type reads as a unary predicate.
+///
+/// Examples:
+/// ---
+/// static struct Pair { enum bool isDynamic = false, canBeTermValue = false; EntityId[2] related; }
+/// static assert(shapeFor!Pair == RelationShape(2, false));
+/// static assert(shapeFor!int == RelationShape.init);
+/// ---
+template shapeFor(T) {
+	static if (__traits(compiles, T.isDynamic) && __traits(compiles, T.canBeTermValue) && !T.canBeTermValue) {
+		static assert(T.related.offsetof == 0);
+		static if (T.isDynamic) enum shapeFor = RelationShape(1, true);
+		else enum shapeFor = RelationShape(typeof(T.init.related).length, false);
+	} else
+		enum shapeFor = RelationShape.init;
+}
+
+/// The hooks `T` declares: `fp.lifecycle.finalizeFunction!T`, set unless `T`'s lifetime is its bytes, `remapEntities`, as `hasRemapEntities` detects it, and `shapeFor!T`.
 ///
 /// Examples:
 /// ---
@@ -61,6 +94,7 @@ Hooks hooksFor(T)() {
 	Hooks hooks;
 	hooks.finalizeFunction = fp.lifecycle.finalizeFunction!T();
 	static if (hasRemapEntities!T) hooks.remapFunction = &remapThunk!T;
+	hooks.shape = shapeFor!T;
 	return hooks;
 }
 
@@ -79,14 +113,18 @@ private struct SizeEntry {
 	size_t size;
 }
 
+// Marks a `lookupId` key, whose name is the caller's C string: `fp.string.slice` would misread the bytes before one as a fat-pointer header.
+private enum size_t probeId = fp.pointer.notFound;
+
+private const(char)[] nameOf(const(ForwardEntry)* e) @trusted {
+	return e.id == probeId ? e.name[0 .. core.stdc.string.strlen(e.name)] : fp.string.slice(e.name);
+}
+
 private size_t nameHash(inout(ubyte)[] data) @trusted {
-	auto e = cast(const(ForwardEntry)*) data.ptr;
-	return fp.fnv1a.hash(fp.string.slice(cast(char*) e.name));
+	return fp.fnv1a.hash(nameOf(cast(const(ForwardEntry)*) data.ptr));
 }
 private bool nameEqual(inout(ubyte)[] a, inout(ubyte)[] b) @trusted {
-	auto ea = cast(const(ForwardEntry)*) a.ptr;
-	auto eb = cast(const(ForwardEntry)*) b.ptr;
-	return fp.string.equal(cast(char*) ea.name, cast(char*) eb.name);
+	return nameOf(cast(const(ForwardEntry)*) a.ptr) == nameOf(cast(const(ForwardEntry)*) b.ptr);
 }
 
 private size_t idHash(inout(ubyte)[] data) @trusted {
@@ -264,7 +302,7 @@ size_t lookupId(const(char)* name) @trusted {
 	bc.spinlock.readLock(registryLock);
 	scope(exit) bc.spinlock.readUnlock(registryLock);
 	if (forwardMap is null) return fp.pointer.notFound;
-	auto found = fp.hashtable.find(forwardMap, ForwardEntry(cast(char*) name, 0));
+	auto found = fp.hashtable.find(forwardMap, ForwardEntry(cast(char*) name, probeId));
 	return found is null ? fp.pointer.notFound : found.id;
 }
 
@@ -295,6 +333,50 @@ Hooks lookupHooks(size_t componentId) @trusted {
 	scope(exit) bc.spinlock.readUnlock(registryLock);
 	return componentId < fp.dynarray.length(hooksTable) ? hooksTable[componentId] : Hooks.init;
 }
+
+/// The relation shape registered for `componentId`, or `RelationShape.init`, a unary predicate, for an unknown id.
+///
+/// Examples:
+/// ---
+/// static struct Next { enum bool isDynamic = false, canBeTermValue = false; EntityId[1] related; }
+/// assert(lookupRelationShape(componentId!Next()) == RelationShape(1, false));
+/// assert(lookupRelationShape(fp.pointer.notFound) == RelationShape.init);
+/// ---
+RelationShape lookupRelationShape(size_t componentId) {
+	return lookupHooks(componentId).shape;
+}
+
+private shared size_t traitChanges = 0;
+
+/// Replaces the `RelationTrait` flags of the registered binary relation `componentId`, and advances `traitsEpoch`, since every cached answer over it is now stale. It cannot fail.
+///
+/// Examples:
+/// ---
+/// static struct Above { enum bool isDynamic = false, canBeTermValue = false; EntityId[1] related; }
+/// immutable id = componentId!Above();
+/// setRelationTraits(id, RelationTrait.transitive);
+/// assert(lookupRelationShape(id).traits == RelationTrait.transitive);
+/// setRelationTraits(id, 0);
+/// ---
+void setRelationTraits(size_t componentId, uint traits) @trusted {
+	bc.spinlock.writeLock(registryLock);
+	scope(exit) bc.spinlock.writeUnlock(registryLock);
+	assert(componentId < fp.dynarray.length(hooksTable), "ecrs: traits on an unregistered component");
+	assert(traits == 0 || hooksTable[componentId].shape.columns == 1, "ecrs: traits need a binary relation");
+	hooksTable[componentId].shape.traits = traits;
+	atomicOp!"+="(traitChanges, 1);
+}
+
+/// A counter every `setRelationTraits` advances.
+///
+/// Examples:
+/// ---
+/// static struct Near { enum bool isDynamic = false, canBeTermValue = false; EntityId[1] related; }
+/// immutable before = traitsEpoch();
+/// setRelationTraits(componentId!Near(), 0);
+/// assert(traitsEpoch() == before + 1);
+/// ---
+size_t traitsEpoch() { return atomicLoad(traitChanges); }
 
 /// The name registered for `componentId`, which lives until `free`, or null for an unknown id.
 ///
@@ -415,6 +497,13 @@ unittest {
 	assert(lookupId(componentName!Bar.ptr) == barId);
 	assert(lookupId("int") == intId);
 	assert(lookupId("nonexistent") == fp.pointer.notFound);
+	// A C string preceded by bytes that look like a fat-pointer header, as a `malloc` block can be, is still read to its terminator.
+	{
+		ubyte[fp.pointer.Header.sizeof + 4] buffer;
+		*cast(fp.pointer.Header*) buffer.ptr = fp.pointer.Header(fp.pointer.PointerType.heap, 1);
+		buffer[fp.pointer.Header.sizeof .. $] = cast(const(ubyte)[]) "int\0";
+		assert(lookupId(cast(char*) buffer.ptr + fp.pointer.Header.sizeof) == intId);
+	}
 
 	assert(lookupSize(fooId) == Foo.sizeof);
 	assert(lookupSize(barId) == Bar.sizeof);
@@ -438,6 +527,23 @@ unittest {
 	assert(lookupId(componentName!Outer.ptr) == outer);
 	assert(lookupId(componentName!Twin.ptr) == inner);
 	assert(lookupSize(inner) == long.sizeof);
+}
+
+unittest {
+	// Traits ride on the relation's shape, and each change advances the epoch; `Binary` stands in for `ecrs.relation.Relation!1`.
+	static struct Binary {
+		enum bool isDynamic = false, canBeTermValue = false;
+		EntityId[1] related;
+	}
+	immutable id = componentId!Binary();
+	assert(lookupRelationShape(id) == RelationShape(1, false));
+
+	immutable epoch = traitsEpoch();
+	setRelationTraits(id, RelationTrait.transitive | RelationTrait.reflexive);
+	assert(lookupRelationShape(id).traits == (RelationTrait.transitive | RelationTrait.reflexive));
+	assert(traitsEpoch() == epoch + 1);
+	setRelationTraits(id, 0);
+	assert(lookupRelationShape(id).traits == 0);
 }
 
 unittest {

@@ -5,6 +5,7 @@
 /// Components follow `fp.lifecycle`: a type with a `finalize()` or destructor has it run once, when the component is removed or its storage freed. Every slot that holds no component is empty, all zero bytes.
 module ecrs.storage;
 
+import core.atomic : atomicLoad, atomicOp;
 import core.stdc.string : memset;
 
 static import ecrs.registry;
@@ -71,6 +72,7 @@ struct Storage {
 	private size_t* holes = null; // holes to reuse before `elements` grows; it may miss some, which the next reorder reclaims
 	private size_t live = 0;
 	private ecrs.registry.RemapFunction remapFunction = null;
+	private size_t changes = 0; // atomic; see `generation`
 }
 
 
@@ -137,6 +139,29 @@ EntityId owner(const ref Storage self, size_t slot) @trusted {
 	return self.slotOwners[slot];
 }
 
+/// A counter that advances on every change to `self`, and on every mutable access, since its caller may write through the pointer; equal generations mean unchanged contents. Atomic, because parallel systems may write distinct entities at once.
+///
+/// Examples:
+/// ---
+/// Storage storage = create(int.sizeof);
+/// scope(exit) free(storage);
+/// IndexTable indices = null;
+/// assert(fp.dynarray.growToSize(indices, 2) !is null);
+/// indices[1] = null;
+/// immutable before = generation(storage);
+/// assert(add!int(storage, indices, 1) !is null);
+/// assert(generation(storage) > before);
+/// fp.dynarray.free(indices[1]);
+/// fp.dynarray.free(indices);
+/// ---
+size_t generation(const ref Storage self) @trusted {
+	return atomicLoad(*cast(shared(const(size_t))*) &self.changes);
+}
+
+private void touch(ref Storage self) @trusted {
+	atomicOp!"+="(*cast(shared(size_t)*) &self.changes, 1);
+}
+
 /// The component in slot `i`, which must be below `size`; the typed form checks that `T` is the right size.
 ///
 /// Examples:
@@ -151,7 +176,7 @@ EntityId owner(const ref Storage self, size_t slot) @trusted {
 /// fp.dynarray.free(indices[1]);
 /// fp.dynarray.free(indices);
 /// ---
-void* get(ref Storage self, size_t i) { return fp.pagedarray.get(self.elements, i); }
+void* get(ref Storage self, size_t i) { touch(self); return fp.pagedarray.get(self.elements, i); }
 /// Ditto
 const(void)* get(const ref Storage self, size_t i) { return fp.pagedarray.get(self.elements, i); }
 /// Ditto
@@ -311,6 +336,7 @@ bool remove(ref Storage self, size_t componentId, ref IndexTable indexTable, Ent
 	immutable slot = indices[componentId];
 	indices[componentId] = Storage.invalid;
 	--self.live;
+	touch(self);
 	if (slot + 1 == size(self)) {
 		cast(void) fp.dynarray.popBack(self.slotOwners);
 		fp.pagedarray.popBack(self.elements);
@@ -401,6 +427,7 @@ package EntityId* buildRemap(const(size_t)[] order) @trusted {
 // Keeps both owners' index entries naming their components, but leaves `holes` stale for the caller to rebuild.
 private void swapSlots(ref Storage self, size_t componentId, IndexTable indexTable, size_t a, size_t b) @trusted {
 	if (a == b) return;
+	touch(self);
 	fp.pagedarray.swap(self.elements, a, b);
 	immutable ownerA = self.slotOwners[a];
 	self.slotOwners[a] = self.slotOwners[b];
@@ -616,6 +643,7 @@ template sortMonotonic(T, size_t unique = 0) {
 /// fp.dynarray.free(indices);
 /// ---
 package void relabel(ref Storage self, const(EntityId)[] remap) @trusted {
+	touch(self);
 	foreach (slot; 0 .. size(self)) {
 		auto slotOwner = &self.slotOwners[slot];
 		if (*slotOwner == invalidEntity) continue;
@@ -641,6 +669,40 @@ version(unittest) {
 	private bool ownersAre(const ref Storage storage, const(EntityId)[] expected...) {
 		return owners(storage) == expected;
 	}
+}
+
+unittest {
+	// generation: every add, remove, mutable access, sort and relabel advances it; const access does not.
+	immutable id = ecrs.registry.componentId!long();
+	Storage storage = create(long.sizeof);
+	scope(exit) free(storage);
+	auto indices = makeIndices(3);
+	scope(exit) freeIndices(indices);
+
+	auto g = generation(storage);
+	*add!long(storage, indices, 1) = 5;
+	*add!long(storage, indices, 2) = 4;
+	assert(generation(storage) > g);
+
+	g = generation(storage);
+	const(Storage)* constStorage = &storage;
+	assert(get!long(*constStorage, 0) == 5);
+	assert(generation(storage) == g);
+	get!long(storage, 0) = 6;
+	assert(generation(storage) > g);
+
+	g = generation(storage);
+	assert(sortByValue!long(storage, indices));
+	assert(generation(storage) > g);
+
+	g = generation(storage);
+	immutable EntityId[3] remap = [0, 2, 1];
+	relabel(storage, remap[]);
+	assert(generation(storage) > g);
+
+	g = generation(storage);
+	assert(remove(storage, id, indices, 1)); // relabel left the index lists alone, so entity 1 still names slot 1, the last
+	assert(generation(storage) > g);
 }
 
 unittest {

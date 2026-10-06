@@ -234,6 +234,22 @@ template getStorage(T, size_t unique = 0) {
 	}
 }
 
+/// `ecrs.storage.generation` of component `componentId`'s storage, or 0 if no entity has had the component.
+///
+/// Examples:
+/// ---
+/// Context ctx = create();
+/// scope(exit) free(ctx);
+/// immutable id = ecrs.registry.componentId!int();
+/// assert(generation(ctx, id) == 0);
+/// assert(addComponent(ctx, addEntity(ctx), id) !is null);
+/// assert(generation(ctx, id) > 0);
+/// ---
+size_t generation(const ref Context self, size_t componentId) {
+	auto storage = getStorage(self, componentId);
+	return storage is null ? 0 : ecrs.storage.generation(*storage);
+}
+
 
 /// The number of live entities, the reserved entity 0 included.
 ///
@@ -407,6 +423,29 @@ void removeComponent(ref Context self, EntityId e, size_t componentId) {
 template removeComponent(T, size_t unique = 0) {
 	void removeComponent(ref Context self, EntityId e) {
 		.removeComponent(self, e, ecrs.registry.componentId!(T, unique)());
+	}
+}
+/// Removes component `componentId` from every entity that has it, ending each one's lifetime. It cannot fail.
+///
+/// Examples:
+/// ---
+/// Context ctx = create();
+/// scope(exit) free(ctx);
+/// EntityId e = addEntity(ctx);
+/// immutable id = ecrs.registry.componentId!int();
+/// assert(addComponent(ctx, e, id) !is null);
+/// clearComponent(ctx, id);
+/// assert(!hasComponent(ctx, e, id));
+/// ---
+void clearComponent(ref Context self, size_t componentId) @trusted {
+	assert(!inParallel(self), structuralChange);
+	if (!hasStorage(self, componentId)) return;
+	auto storage = &self.storages[componentId];
+	// Descending, so popping the last slot never skips an owner.
+	foreach_reverse (slot; 0 .. ecrs.storage.size(*storage)) {
+		immutable slotOwner = ecrs.storage.owner(*storage, slot);
+		if (slotOwner != invalidEntity)
+			cast(void) ecrs.storage.remove(*storage, componentId, self.indexTable, slotOwner);
 	}
 }
 
@@ -817,6 +856,24 @@ unittest {
 	const(Context)* constCtx = &ctx;
 	assert(getStorage(*constCtx, id, Flag.sizeof) !is null);
 	assert(getStorage(*constCtx, ecrs.registry.componentId!(Flag, 1)()) is null);
+
+	// clearComponent empties one storage, past a hole, and leaves other components alone; generation advances.
+	struct Other { int v; }
+	immutable other = ecrs.registry.componentId!Other();
+	assert(generation(ctx, other) == 0);
+	clearComponent(ctx, other); // no storage yet: nothing to clear
+	EntityId[4] marked;
+	foreach (ref m; marked) {
+		m = addEntity(ctx);
+		assert(addComponent(ctx, m, id) !is null && addComponent!Other(ctx, m) !is null);
+	}
+	removeComponent(ctx, marked[1], id);
+	immutable g = generation(ctx, id);
+	clearComponent(ctx, id);
+	assert(generation(ctx, id) > g);
+	assert(ecrs.storage.empty(*getStorage(*constCtx, id)));
+	foreach (m; marked)
+		assert(!hasComponent(ctx, m, id) && hasComponent!Other(ctx, m));
 }
 
 unittest {
