@@ -37,6 +37,10 @@ private int runEveryTest() {
         }
     }}
 
+    // Releases the registry's process-lifetime tables, so a leak checker run
+    // over the tests sees nothing outstanding.
+    imported!"ecrs.registry".freeRegistry();
+
     printf("libecrs: all %d tests passed.\n", cast(int) total);
     return 0;
 }

@@ -9,10 +9,12 @@
 /// `EntityId` where relevant) explicitly to every free function below.
 module ecrs.context;
 
-import fp.dynarray;
-import fp.pointer : allocFunction, notFound;
+import core.atomic : atomicLoad, atomicOp;
 
-import ecrs.registry : componentId, lookupComponentSize;
+static import fp.dynarray;
+import fp.pointer : allocFunction;
+
+import ecrs.registry : componentId, lookupComponentSize, lookupComponentHooks;
 import ecrs.storage;
 
 @nogc nothrow:
@@ -49,6 +51,17 @@ struct EntityRange {
 }
 
 
+/// A holder of entity ids that lives outside the store - a query memo table,
+/// a comptime heap of `std.meta.entity` values - rewritten by every
+/// renumbering alongside the components. `remap[old]` is the id `old` becomes.
+alias RemapHookFunction = void function(void* userData, const(EntityId)[] remap) @nogc nothrow;
+
+private struct RemapHook {
+	RemapHookFunction fn;
+	void* userData;
+}
+
+
 /// The entity/component database: owns one `ComponentStorage` per
 /// registered component id, plus the per-entity index tables mapping entity
 /// -> component slot.
@@ -59,10 +72,44 @@ struct EntityRange {
 /// what a `Context` owns. Unlike the C++ version (which needed a separate
 /// `fp::auto_free<context>` wrapper for RAII), a genuine D `scope(exit)
 /// free(ctx);` at the point of creation covers the same ground.
+///
+/// Concurrency: any number of threads may read at once, and may write
+/// existing components of distinct entities. Structural changes - adding or
+/// removing entities, components, storages or remap hooks, renumbering,
+/// sorting - need exclusive access. Inside an `ecrs.system` parallel
+/// combinator they fail an assert rather than race, whatever the pool size.
 struct Context {
 	private ComponentStorage* storages = null;
 	EntityComponentIndices entityComponentIndices = null;
 	size_t* freelist = null;
+	private RemapHook* remapHooks = null;
+	private size_t parallelDepth = 0; // atomic; nonzero while a parallel system runs
+}
+
+/// True while an `ecrs.system` parallel combinator is running on `self`.
+bool inParallel(const ref Context self) @trusted {
+	return atomicLoad(*cast(shared(const(size_t))*) &self.parallelDepth) != 0;
+}
+package void enterParallel(ref Context self) @trusted {
+	atomicOp!"+="(*cast(shared(size_t)*) &self.parallelDepth, 1);
+}
+package void exitParallel(ref Context self) @trusted {
+	atomicOp!"-="(*cast(shared(size_t)*) &self.parallelDepth, 1);
+}
+
+private enum string structuralChange = "ecrs: structural change inside a parallel system; make it after the pass";
+
+/// The storage for `componentIdVal`, which must already exist. Unlike
+/// `getStorage` it needs no element size, so it never consults the registry.
+private ref ComponentStorage existingStorage(ref Context self, size_t componentIdVal) @trusted {
+	assert(fp.dynarray.length(self.storages) > componentIdVal);
+	assert(self.storages[componentIdVal].elementSize != ComponentStorage.invalid);
+	return self.storages[componentIdVal];
+}
+private ref const(ComponentStorage) existingStorage(const ref Context self, size_t componentIdVal) @trusted {
+	assert(fp.dynarray.length(self.storages) > componentIdVal);
+	assert(self.storages[componentIdVal].elementSize != ComponentStorage.invalid);
+	return self.storages[componentIdVal];
 }
 
 /// Constructs a context with the permanently-reserved invalid entity (id 0)
@@ -74,44 +121,36 @@ Context create() {
 }
 
 void free(ref Context self) @trusted {
-	if (self.storages !is null) {
-		foreach (i; 0 .. fp.dynarray.length(self.storages))
+	foreach (i; 0 .. fp.dynarray.length(self.storages))
+		if (self.storages[i].elementSize != ComponentStorage.invalid)
 			ecrs.storage.free(self.storages[i]);
-		fp.dynarray.free(self.storages);
-	}
-	if (self.entityComponentIndices !is null) {
-		foreach (i; 0 .. fp.dynarray.length(self.entityComponentIndices))
-			if (self.entityComponentIndices[i] !is null)
-				fp.dynarray.free(self.entityComponentIndices[i]);
-		fp.dynarray.free(self.entityComponentIndices);
-	}
-	if (self.freelist !is null) fp.dynarray.free(self.freelist);
+	fp.dynarray.free(self.storages);
+	foreach (i; 0 .. fp.dynarray.length(self.entityComponentIndices))
+		fp.dynarray.free(self.entityComponentIndices[i]);
+	fp.dynarray.free(self.entityComponentIndices);
+	fp.dynarray.free(self.freelist);
+	fp.dynarray.free(self.remapHooks);
 }
 
-// NOTE: the finalizer-accepting overload below deliberately isn't just a
-// third defaulted parameter on this one - DMD treats a 2-arg call against
-// a "fill in the default" match and the const overload's "convert self to
-// const" match as equally good, which makes the 2-arg call ambiguous.
-// Keeping the 2-arg and 3-arg mutable overloads exact-arity-only avoids that.
+/// The storage for `componentIdVal`, created on first use with the hooks its
+/// type registered (`ecrs.registry.ComponentHooks`).
 ref ComponentStorage getStorage(ref Context self, size_t componentIdVal, size_t elementSize) @trusted {
-	return getStorage(self, componentIdVal, elementSize, null);
-}
-ref ComponentStorage getStorage(ref Context self, size_t componentIdVal, size_t elementSize, ComponentStorage.FinalizeFunction finalizeFunction) @trusted {
+	if (fp.dynarray.length(self.storages) <= componentIdVal || self.storages[componentIdVal].elementSize == ComponentStorage.invalid)
+		assert(!inParallel(self), structuralChange);
 	while (fp.dynarray.length(self.storages) <= componentIdVal)
 		fp.dynarray.pushBack(self.storages, ComponentStorage.init);
-	if (self.storages[componentIdVal].elementSize == ComponentStorage.invalid)
-		self.storages[componentIdVal] = ecrs.storage.create(elementSize, ComponentStorage.defaultReservedElementCount, finalizeFunction);
-	assert(self.storages[componentIdVal].elementSize != ComponentStorage.invalid);
+	if (self.storages[componentIdVal].elementSize == ComponentStorage.invalid) {
+		immutable hooks = lookupComponentHooks(componentIdVal);
+		self.storages[componentIdVal] = ecrs.storage.create(elementSize, hooks.finalize, hooks.remap);
+	}
 	return self.storages[componentIdVal];
 }
 ref const(ComponentStorage) getStorage(const ref Context self, size_t componentIdVal, size_t elementSize) @trusted {
-	assert(fp.dynarray.length(self.storages) > componentIdVal);
-	assert(self.storages[componentIdVal].elementSize != ComponentStorage.invalid);
-	return self.storages[componentIdVal];
+	return existingStorage(self, componentIdVal);
 }
 template getStorage(Tcomponent, size_t Unique = 0) {
 	ref ComponentStorage getStorage(ref Context self) @nogc nothrow {
-		return .getStorage(self, componentId!(Tcomponent, Unique)(), Tcomponent.sizeof, finalizerFor!Tcomponent());
+		return .getStorage(self, componentId!(Tcomponent, Unique)(), Tcomponent.sizeof);
 	}
 }
 
@@ -120,7 +159,8 @@ size_t entityCount(const ref Context self) @trusted {
 }
 
 EntityId addEntity(ref Context self) @trusted {
-	if (self.freelist !is null && fp.dynarray.length(self.freelist) > 0) {
+	assert(!inParallel(self), structuralChange);
+	if (fp.dynarray.length(self.freelist) > 0) {
 		immutable e = *fp.dynarray.back(self.freelist);
 		fp.dynarray.popBack(self.freelist);
 		return cast(EntityId) e;
@@ -131,15 +171,13 @@ EntityId addEntity(ref Context self) @trusted {
 }
 
 void removeEntity(ref Context self, EntityId e) @trusted {
+	assert(!inParallel(self), structuralChange);
 	assert(e < fp.dynarray.length(self.entityComponentIndices));
-	if (self.entityComponentIndices[e] !is null) {
-		auto indices = self.entityComponentIndices[e];
-		foreach (componentIdVal; 0 .. fp.dynarray.length(indices))
-			if (indices[componentIdVal] != ComponentStorage.invalid)
-				finalizeElement(self.storages[componentIdVal], indices[componentIdVal]);
-		fp.dynarray.free(self.entityComponentIndices[e]);
-		self.entityComponentIndices[e] = null;
-	}
+	auto indices = self.entityComponentIndices[e];
+	foreach (componentIdVal; 0 .. fp.dynarray.length(indices))
+		if (indices[componentIdVal] != ComponentStorage.invalid)
+			ecrs.storage.remove(self.storages[componentIdVal], componentIdVal, self.entityComponentIndices, e);
+	fp.dynarray.free(self.entityComponentIndices[e]);
 	fp.dynarray.pushBack(self.freelist, cast(size_t) e);
 }
 
@@ -159,48 +197,35 @@ template hasComponent(Tcomponent, size_t Unique = 0) {
 /// Type-erased: the new slot is zero-filled rather than constructed,
 /// since there's no compile-time type here to initialize it properly.
 /// Prefer the templated overload below whenever `Tcomponent` is known.
+///
+/// The component's address is stable until it is removed or a reorder/sort
+/// (`reorderEntities`, `makeMonotonic`, ...) moves it; adding other
+/// components, of any type, never does.
 void* addComponent(ref Context self, EntityId e, size_t componentIdVal, size_t elementSize = ComponentStorage.invalid) @trusted {
+	assert(!inParallel(self), structuralChange);
 	assert(!hasComponent(self, e, componentIdVal));
 	immutable sz = elementSize == ComponentStorage.invalid ? lookupComponentSize(componentIdVal) : elementSize;
-	auto storagePtr = &getStorage(self, componentIdVal, sz);
-	ensureIndexSlot(self.entityComponentIndices[e], componentIdVal);
-	immutable idx = (*storagePtr).size();
-	self.entityComponentIndices[e][componentIdVal] = idx;
-	(*storagePtr).allocate(1);
-	return (*storagePtr).get(idx);
+	return ecrs.storage.add(getStorage(self, componentIdVal, sz), componentIdVal, self.entityComponentIndices, e);
 }
 template addComponent(Tcomponent, size_t Unique = 0) {
 	ref Tcomponent addComponent(ref Context self, EntityId e) @trusted @nogc nothrow {
+		assert(!inParallel(self), structuralChange);
 		assert(!.hasComponent!(Tcomponent, Unique)(self, e));
-		immutable id = componentId!(Tcomponent, Unique)();
-		auto storagePtr = &.getStorage!(Tcomponent, Unique)(self);
-		ensureIndexSlot(self.entityComponentIndices[e], id);
-		immutable idx = (*storagePtr).size();
-		self.entityComponentIndices[e][id] = idx;
 		// NOTE: explicit module qualification (rather than UFCS/plain calls)
 		// is required here - calling a name that has both a plain and a
 		// template overload with an *explicit* template argument, across a
 		// module boundary (this is ecrs.context calling into ecrs.storage),
-		// fails to resolve under DMD otherwise ("no overload matches"),
+		// fails to resolve in the D frontend otherwise ("no overload matches"),
 		// apparently a limitation in how such mixed overload sets are looked
 		// up across modules. Confirmed with a minimal repro during porting.
-		ecrs.storage.allocate!Tcomponent(*storagePtr, 1);
-		auto outPtr = &ecrs.storage.get!Tcomponent(*storagePtr, idx);
-		static if (isWithEntity!Tcomponent)
-			outPtr.entity = e;
-		return *outPtr;
+		return ecrs.storage.add!(Tcomponent, Unique)(.getStorage!(Tcomponent, Unique)(self), self.entityComponentIndices, e);
 	}
 }
 
 void removeComponent(ref Context self, EntityId e, size_t componentIdVal) @trusted {
+	assert(!inParallel(self), structuralChange);
 	assert(hasComponent(self, e, componentIdVal));
-	immutable sz = lookupComponentSize(componentIdVal);
-	finalizeElement(getStorage(self, componentIdVal, sz), self.entityComponentIndices[e][componentIdVal]);
-	self.entityComponentIndices[e][componentIdVal] = ComponentStorage.invalid;
-	// NOTE: as in the C++ version, this leaves the slot in the backing
-	// ComponentStorage occupied - it does not compact storage. The
-	// component's own resources (if any) were just released above via
-	// finalizeElement(), so the orphaned slot itself is inert.
+	ecrs.storage.remove(existingStorage(self, componentIdVal), componentIdVal, self.entityComponentIndices, e);
 }
 template removeComponent(Tcomponent, size_t Unique = 0) {
 	void removeComponent(ref Context self, EntityId e) @nogc nothrow {
@@ -208,15 +233,18 @@ template removeComponent(Tcomponent, size_t Unique = 0) {
 	}
 }
 
+/// `elementSize`, if given, is only checked against the storage's.
 void* getComponent(ref Context self, EntityId e, size_t componentIdVal, size_t elementSize = ComponentStorage.invalid) @trusted {
 	assert(hasComponent(self, e, componentIdVal));
-	immutable sz = elementSize == ComponentStorage.invalid ? lookupComponentSize(componentIdVal) : elementSize;
-	return getStorage(self, componentIdVal, sz).get(self.entityComponentIndices[e][componentIdVal]);
+	auto storage = &existingStorage(self, componentIdVal);
+	assert(elementSize == ComponentStorage.invalid || elementSize == storage.elementSize);
+	return (*storage).get(self.entityComponentIndices[e][componentIdVal]);
 }
 const(void)* getComponent(const ref Context self, EntityId e, size_t componentIdVal, size_t elementSize = ComponentStorage.invalid) @trusted {
 	assert(hasComponent(self, e, componentIdVal));
-	immutable sz = elementSize == ComponentStorage.invalid ? lookupComponentSize(componentIdVal) : elementSize;
-	return getStorage(self, componentIdVal, sz).get(self.entityComponentIndices[e][componentIdVal]);
+	auto storage = &existingStorage(self, componentIdVal);
+	assert(elementSize == ComponentStorage.invalid || elementSize == storage.elementSize);
+	return (*storage).get(self.entityComponentIndices[e][componentIdVal]);
 }
 template getComponent(Tcomponent, size_t Unique = 0) {
 	ref Tcomponent getComponent(ref Context self, EntityId e) @trusted @nogc nothrow {
@@ -238,75 +266,109 @@ template getOrAddComponent(Tcomponent, size_t Unique = 0) {
 	}
 }
 
+
+/// Registers a holder of entity ids outside the store, so every renumbering
+/// rewrites it too (`E-Remap`). `userData` is passed back unchanged.
+void addRemapHook(ref Context self, RemapHookFunction fn, void* userData) @trusted {
+	assert(!inParallel(self), structuralChange);
+	fp.dynarray.pushBack(self.remapHooks, RemapHook(fn, userData));
+}
+/// Returns false if no hook was registered with exactly this pair.
+bool removeRemapHook(ref Context self, RemapHookFunction fn, void* userData) @trusted {
+	assert(!inParallel(self), structuralChange);
+	foreach (i; 0 .. fp.dynarray.length(self.remapHooks))
+		if (self.remapHooks[i].fn is fn && self.remapHooks[i].userData is userData) {
+			fp.dynarray.removeAt(self.remapHooks, i);
+			return true;
+		}
+	return false;
+}
+
+/// One renumbering step over every holder at once: storage owners, each
+/// component whose type registered a remap hook, the freelist, external
+/// hooks, and the index lists themselves.
+private void renumber(ref Context self, const(size_t)[] order, const(EntityId)[] remap) @trusted {
+	assert(!inParallel(self), structuralChange);
+	foreach (id; 0 .. fp.dynarray.length(self.storages))
+		if (self.storages[id].elementSize != ComponentStorage.invalid)
+			relabel(self.storages[id], remap);
+	foreach (i; 0 .. fp.dynarray.length(self.freelist))
+		self.freelist[i] = remap[self.freelist[i]];
+	foreach (i; 0 .. fp.dynarray.length(self.remapHooks))
+		self.remapHooks[i].fn(self.remapHooks[i].userData, remap);
+
+	auto table = self.entityComponentIndices;
+	applyPermutation(order, (a, b) {
+		auto tmp = table[a];
+		table[a] = table[b];
+		table[b] = tmp;
+	});
+}
+
+/// Renumbers entities: `order[i]` is the entity that becomes `i`, over the
+/// whole entity table, freed ids included. Entity 0 must stay put, so that
+/// `invalidEntity` keeps its meaning. Every holder of an entity id is
+/// rewritten in the same step (`E-Remap`), with nothing for the caller to
+/// list. Moves no component data, so component addresses survive.
+void reorderEntities(ref Context self, const(size_t)[] order) @trusted {
+	assert(order.length == fp.dynarray.length(self.entityComponentIndices));
+	assert(order.length == 0 || order[0] == invalidEntity);
+	auto remap = buildRemap(order);
+	scope(exit) allocFunction(remap, 0);
+	renumber(self, order, remap[0 .. order.length]);
+}
+
+/// Exchanges two entities' ids. `b` defaults to the last entity slot.
 void swapEntities(ref Context self, EntityId a, EntityId b = EntityId.max) @trusted {
-	immutable resolvedB = b == EntityId.max ? cast(EntityId)(fp.dynarray.length(self.entityComponentIndices) - 1) : b;
-	assert(a < fp.dynarray.length(self.entityComponentIndices));
-	assert(resolvedB < fp.dynarray.length(self.entityComponentIndices));
-	auto tmp = self.entityComponentIndices[a];
-	self.entityComponentIndices[a] = self.entityComponentIndices[resolvedB];
-	self.entityComponentIndices[resolvedB] = tmp;
-}
-/// Also notifies each of `Tcomponents2notify` (via their `swapEntities`
-/// static method) before the low-level index swap, so components that
-/// cache their owning entity id (e.g. `WithEntity`, a relation) stay correct.
-template swapEntities(Tcomponents2notify...) {
-	void swapEntities(ref Context self, EntityId a, EntityId b = EntityId.max) @trusted @nogc nothrow {
-		immutable resolvedB = b == EntityId.max ? cast(EntityId)(fp.dynarray.length(self.entityComponentIndices) - 1) : b;
-		static foreach (T; Tcomponents2notify) {
-			{
-				auto storagePtr = &.getStorage!T(self);
-				T* data = (*storagePtr).data!T();
-				foreach_reverse (i; 0 .. (*storagePtr).size())
-					T.swapEntities(data[i], self.entityComponentIndices, a, resolvedB);
-			}
-		}
-		.swapEntities(self, a, resolvedB);
-	}
+	immutable n = fp.dynarray.length(self.entityComponentIndices);
+	immutable resolvedB = b == EntityId.max ? cast(EntityId)(n - 1) : b;
+	assert(a < n && resolvedB < n);
+	auto order = cast(size_t*) allocFunction(null, n * size_t.sizeof);
+	scope(exit) allocFunction(order, 0);
+	foreach (i; 0 .. n) order[i] = i;
+	order[a] = resolvedB;
+	order[resolvedB] = a;
+	reorderEntities(self, order[0 .. n]);
 }
 
-void reorderEntities(ref Context self, const(size_t)[] order) {
-	assert(order.length == entityCount(self));
-	applyPermutation(order, (a, b) { swapEntities(self, cast(EntityId) a, cast(EntityId) b); });
-}
-/// Ditto, relabelling the entity ids each of `Tcomponents2notify` holds (via
-/// their `remapEntities` static method) so components that reference entities -
-/// `WithEntity`, a relation - stay correct across the renumbering.
-///
-/// `remapEntities` and not `swapEntities`: `applyPermutation` makes O(n) swaps,
-/// so notifying per swap rescanned every instance of every listed component n
-/// times. Relabelling once is the same permutation - composing the transpositions
-/// over the labels and applying the permutation to them directly agree - and it
-/// turns the notification from O(n * references) into O(references).
-template reorderEntities(Tcomponents2notify...) {
-	void reorderEntities(ref Context self, const(size_t)[] order) @nogc nothrow @trusted {
-		assert(order.length == entityCount(self));
-		static foreach (T; Tcomponents2notify)
-			static assert(hasRemapEntities!T,
-				T.stringof ~ " is listed in a reorderEntities() but has no remapEntities() hook"
-				~ " - a swapEntities()-only component would silently keep its old entity ids.");
+/// Renumbers the live entities to `0 .. entityCount` in their current order
+/// and drops the freed ids from the table, leaving the freelist empty. Any
+/// reference still naming a freed entity becomes `invalidEntity` rather than
+/// an id a later `addEntity` hands out again.
+void compact(ref Context self) @trusted {
+	immutable n = fp.dynarray.length(self.entityComponentIndices);
+	immutable freedCount = fp.dynarray.length(self.freelist);
+	if (freedCount == 0) return;
 
-		auto remap = buildRemap(order);
-		scope(exit) allocFunction(remap, 0);
-		const(EntityId)[] remapSlice = remap[0 .. order.length];
-		static foreach (T; Tcomponents2notify) {
-			{
-				auto storagePtr = &.getStorage!T(self);
-				T* data = (*storagePtr).data!T();
-				foreach (i; 0 .. (*storagePtr).size())
-					T.remapEntities(data[i], self.entityComponentIndices, remapSlice);
-			}
-		}
+	auto freed = cast(bool*) allocFunction(null, n * bool.sizeof);
+	scope(exit) allocFunction(freed, 0);
+	foreach (e; 0 .. n) freed[e] = false;
+	foreach (i; 0 .. freedCount) freed[self.freelist[i]] = true;
 
-		// Independent of the relabelling above: this moves component data between
-		// entity slots, which no slot's *contents* depend on.
-		applyPermutation(order, (a, b) {
-			.swapEntities(self, cast(EntityId) a, cast(EntityId) b);
-		});
-	}
+	auto order = cast(size_t*) allocFunction(null, n * size_t.sizeof);
+	scope(exit) allocFunction(order, 0);
+	size_t live = 0, dead = n - freedCount;
+	foreach (e; 0 .. n)
+		order[freed[e] ? dead++ : live++] = e;
+	assert(order[0] == invalidEntity);
+
+	auto remap = buildRemap(order[0 .. n]);
+	scope(exit) allocFunction(remap, 0);
+	foreach (e; 0 .. n)
+		if (freed[e]) remap[e] = invalidEntity;
+
+	renumber(self, order[0 .. n], remap[0 .. n]);
+	// The tail now holds the freed ids, whose index lists removeEntity released.
+	fp.dynarray.popBackCount(self.entityComponentIndices, freedCount);
+	fp.dynarray.clear(self.freelist);
 }
 
+
+/// Sorts the listed components' storage into entity order. Moves component
+/// data, so it invalidates pointers into those storages.
 template makeMonotonic(Tcomponents...) if (Tcomponents.length != 1 || !is(typeof(Tcomponents[0]) : size_t)) {
 	void makeMonotonic(ref Context self) @nogc nothrow {
+		assert(!inParallel(self), structuralChange);
 		// See the NOTE in addComponent(Tcomponent, Unique) above: explicit
 		// module qualification is required for the cross-module `!T` call.
 		static foreach (T; Tcomponents)
@@ -315,15 +377,21 @@ template makeMonotonic(Tcomponents...) if (Tcomponents.length != 1 || !is(typeof
 }
 template makeMonotonic(Tcomponent, size_t Unique = 0) {
 	void makeMonotonic(ref Context self) @nogc nothrow {
+		assert(!inParallel(self), structuralChange);
 		ecrs.storage.sortMonotonic!(Tcomponent, Unique)(.getStorage!(Tcomponent, Unique)(self), self.entityComponentIndices);
 	}
 }
-void makeMonotonic(ref Context self, size_t componentIdVal, size_t elementSize = ComponentStorage.invalid) {
-	immutable sz = elementSize == ComponentStorage.invalid ? lookupComponentSize(componentIdVal) : elementSize;
-	getStorage(self, componentIdVal, sz).sortMonotonic(componentIdVal, self.entityComponentIndices);
+/// Ditto, by id. A component no entity ever had has nothing to sort.
+void makeMonotonic(ref Context self, size_t componentIdVal, size_t elementSize = ComponentStorage.invalid) @trusted {
+	assert(!inParallel(self), structuralChange);
+	if (fp.dynarray.length(self.storages) <= componentIdVal || self.storages[componentIdVal].elementSize == ComponentStorage.invalid)
+		return;
+	assert(elementSize == ComponentStorage.invalid || elementSize == self.storages[componentIdVal].elementSize);
+	self.storages[componentIdVal].sortMonotonic(componentIdVal, self.entityComponentIndices);
 }
 
 void makeAllMonotonic(ref Context self) @trusted {
+	assert(!inParallel(self), structuralChange);
 	foreach (id; 0 .. fp.dynarray.length(self.storages))
 		if (self.storages[id].elementSize != ComponentStorage.invalid)
 			self.storages[id].sortMonotonic(id, self.entityComponentIndices);
@@ -439,8 +507,8 @@ unittest {
 
 unittest {
 	// const(Context) component access (the getComponent/getStorage const
-	// overloads), swapEntities/reorderEntities (runtime, non-template
-	// forms), and makeMonotonic/makeAllMonotonic (runtime componentId form).
+	// overloads), swapEntities/reorderEntities, and
+	// makeMonotonic/makeAllMonotonic (runtime componentId form).
 	struct Val { int v; }
 
 	auto ctx = create();
@@ -486,68 +554,65 @@ unittest {
 	assert(ctx.getComponent!Val(2).v == 20);
 	assert(ctx.getComponent!Val(3).v == 10);
 
+	assert((*cctx).getStorage(componentId!Val(), Val.sizeof).liveCount() == 3);
+
 	// makeMonotonic(runtime id) / makeAllMonotonic() re-sort storage by entity id.
+	// An id no entity ever had has no storage, so nothing to sort.
+	struct NeverAdded { int v; }
+	ctx.makeMonotonic(componentId!NeverAdded());
 	immutable id = componentId!Val();
 	ctx.makeMonotonic(id);
 	ctx.makeAllMonotonic();
-	assert(getEntity(ctx.entityComponentIndices, 0, id) == 1);
-	assert(getEntity(ctx.entityComponentIndices, 1, id) == 2);
-	assert(getEntity(ctx.entityComponentIndices, 2, id) == 3);
+	auto storage = &ctx.getStorage!Val();
+	assert((*storage).getEntity(0) == 1);
+	assert((*storage).getEntity(1) == 2);
+	assert((*storage).getEntity(2) == 3);
 }
 
 unittest {
-	// removeComponent()/removeEntity() finalize a component that owns
-	// resources of its own (here, a dynamic Relation's backing array)
-	// instead of leaking them - ComponentStorage is flat POD bytes with no
-	// destructor support, so this hook (ecrs.storage.hasFinalize /
-	// Relation.finalize) is the only place that cleanup can happen. Verified
-	// for real (LeakSanitizer, not just this in-process check) via a
-	// standalone repro during development.
-	import ecrs.relation : Relation, dynamicExtent;
-	alias DynRel = Relation!(dynamicExtent, false);
+	// Finalizers run once per component, whichever way it goes: removeComponent,
+	// removeEntity, or free(ctx) for what is left. A dynamic Relation owns a
+	// dynarray this way; leaking it is what the hook exists to prevent.
+	static struct Owned {
+		int value;
+		__gshared int finalized;
+		static void finalize(ref Owned) @nogc nothrow { ++finalized; }
+	}
+	Owned.finalized = 0;
+	{
+		auto ctx = create();
+		scope(exit) free(ctx);
 
-	auto ctx = create();
-	scope(exit) free(ctx);
+		EntityId e1 = ctx.addEntity();
+		EntityId e2 = ctx.addEntity();
+		EntityId e3 = ctx.addEntity();
+		ctx.addComponent!Owned(e1);
+		ctx.addComponent!Owned(e2);
+		ctx.addComponent!Owned(e3);
 
-	immutable id = componentId!DynRel();
-
-	// removeComponent(): the entity survives, only the component goes away.
-	EntityId e1 = ctx.addEntity();
-	auto c1 = &ctx.addComponent!DynRel(e1);
-	fp.dynarray.pushBack(c1.related, EntityId(1));
-	fp.dynarray.pushBack(c1.related, EntityId(2));
-	immutable idx1 = ctx.entityComponentIndices[e1][id];
-	ctx.removeComponent!DynRel(e1);
-	// The slot is still physically present (removeComponent doesn't compact
-	// storage) but finalize() must have run and released/nulled `related`.
-	ref ComponentStorage storage1 = ctx.getStorage!DynRel();
-	assert(ecrs.storage.get!DynRel(storage1, idx1).related is null);
-
-	// removeEntity(): the component is still attached when the entity goes.
-	EntityId e2 = ctx.addEntity();
-	auto c2 = &ctx.addComponent!DynRel(e2);
-	fp.dynarray.pushBack(c2.related, EntityId(3));
-	immutable idx2 = ctx.entityComponentIndices[e2][id];
-	ctx.removeEntity(e2);
-	ref ComponentStorage storage2 = ctx.getStorage!DynRel();
-	assert(ecrs.storage.get!DynRel(storage2, idx2).related is null);
+		ctx.removeComponent!Owned(e1);
+		assert(Owned.finalized == 1);
+		ctx.removeEntity(e2);
+		assert(Owned.finalized == 2);
+	}
+	assert(Owned.finalized == 3);
 }
 
-
 unittest {
-	// reorderEntities!(Tcomponents2notify): the renumbering has to reach inside a
-	// component that *references* entities, not just move component data between
-	// slots. A relation pointing at the entity after it stays pointing at it.
-	import ecrs.relation : Relation, dynamicExtent;
+	// The renumbering reaches every holder without the caller naming any:
+	// relation components (fixed, dynamic, term-valued), storage owners, the
+	// freelist, and an external hook. A freed entity in the table no longer
+	// stops it.
+	import ecrs.relation : Relation, Term, dynamicExtent;
+	alias Next = Relation!1;
+	alias Many = Relation!(dynamicExtent);
+	alias Typed = Relation!(1, true);
 
-	struct Link {
-		Relation!1 relation;
-		alias relation this;
-		static void swapEntities(ref Link self, ref EntityComponentIndices idx, EntityId a, EntityId b) @nogc nothrow {
-			Relation!1.swapEntities(self.relation, idx, a, b);
-		}
-		static void remapEntities(ref Link self, ref EntityComponentIndices idx, const(EntityId)[] remap) @nogc nothrow {
-			Relation!1.remapEntities(self.relation, idx, remap);
+	static struct Memo {
+		EntityId cached;
+		static void remap(void* self, const(EntityId)[] remap) @nogc nothrow {
+			auto memo = cast(Memo*) self;
+			memo.cached = remap[memo.cached];
 		}
 	}
 
@@ -557,15 +622,94 @@ unittest {
 	EntityId e1 = ctx.addEntity(); // 1
 	EntityId e2 = ctx.addEntity(); // 2
 	EntityId e3 = ctx.addEntity(); // 3
-	ctx.addComponent!Link(e1).related[0] = e2;
-	ctx.addComponent!Link(e2).related[0] = e3;
-	ctx.addComponent!Link(e3).related[0] = invalidEntity;
+	EntityId gone = ctx.addEntity(); // 4
+	ctx.removeEntity(gone);
 
-	// 1 -> 3, 2 -> 1, 3 -> 2, so the chain becomes 3 -> 1 -> 2 -> invalid.
-	immutable size_t[4] order = [0, 2, 3, 1];
-	ctx.reorderEntities!Link(order[]);
+	ctx.addComponent!Next(e1).related[0] = e2;
+	ctx.addComponent!Next(e2).related[0] = e3;
+	ctx.addComponent!Next(e3).related[0] = invalidEntity;
+	fp.dynarray.pushBack(ctx.addComponent!Many(e1).related, e3);
+	ctx.addComponent!Typed(e2).related[0] = Term(e1);
 
-	assert(ctx.getComponent!Link(3).related[0] == 1);
-	assert(ctx.getComponent!Link(1).related[0] == 2);
-	assert(ctx.getComponent!Link(2).related[0] == invalidEntity);
+	Memo memo = Memo(e3);
+	ctx.addRemapHook(&Memo.remap, &memo);
+
+	// 1 -> 3, 2 -> 1, 3 -> 2; the freed 4 stays where it is.
+	immutable size_t[5] order = [0, 2, 3, 1, 4];
+	ctx.reorderEntities(order[]);
+
+	assert(ctx.getComponent!Next(3).related[0] == 1);
+	assert(ctx.getComponent!Next(1).related[0] == 2);
+	assert(ctx.getComponent!Next(2).related[0] == invalidEntity);
+	assert(ctx.getComponent!Many(3).related[0] == 2);
+	assert(ctx.getComponent!Typed(1).related[0].constant == 3);
+	assert(ctx.getStorage!Next().getEntity(ctx.entityComponentIndices[3][componentId!Next()]) == 3);
+	assert(memo.cached == 2);
+	assert(ctx.freelist[0] == 4);
+
+	assert(ctx.removeRemapHook(&Memo.remap, &memo));
+	assert(!ctx.removeRemapHook(&Memo.remap, &memo));
+	ctx.swapEntities(1, 2);
+	assert(memo.cached == 2); // no longer hooked
+	assert(ctx.getComponent!Next(3).related[0] == 2); // ... but components still are
+}
+
+unittest {
+	// compact(): live entities renumbered densely in order, the table shrunk,
+	// the freelist emptied, and references to a freed entity made invalid.
+	import ecrs.relation : Relation;
+	alias Next = Relation!1;
+	struct Val { int v; }
+
+	auto ctx = create();
+	scope(exit) free(ctx);
+
+	foreach (i; 1 .. 6) {
+		EntityId e = ctx.addEntity();
+		ctx.addComponent!Val(e).v = i * 10;
+	}
+	ctx.addComponent!Next(5).related[0] = 3;
+	ctx.addComponent!Next(1).related[0] = 4;
+	ctx.removeEntity(2);
+	ctx.removeEntity(4);
+
+	ctx.compact();
+	assert(fp.dynarray.length(ctx.entityComponentIndices) == 4);
+	assert(fp.dynarray.length(ctx.freelist) == 0);
+	assert(ctx.entityCount() == 4);
+	assert(ctx.getComponent!Val(1).v == 10);
+	assert(ctx.getComponent!Val(2).v == 30);
+	assert(ctx.getComponent!Val(3).v == 50);
+	assert(ctx.getComponent!Next(3).related[0] == 2);
+	assert(ctx.getComponent!Next(1).related[0] == invalidEntity);
+	assert(ctx.addEntity() == 4);
+
+	ctx.compact(); // nothing freed: a no-op
+	assert(fp.dynarray.length(ctx.entityComponentIndices) == 5);
+}
+
+unittest {
+	// A component's address survives everything a nested query might do:
+	// adding more of the same type, registering new component types (which
+	// relocates the storage table), and removing other components.
+	struct Payload { int value; }
+	struct LateA { int x; }
+	struct LateB { long y; }
+
+	auto ctx = create();
+	scope(exit) free(ctx);
+
+	EntityId first = ctx.addEntity();
+	Payload* held = &ctx.addComponent!Payload(first);
+	held.value = 7;
+
+	foreach (i; 0 .. 3000) {
+		EntityId e = ctx.addEntity();
+		ctx.addComponent!Payload(e).value = i;
+		if (i == 1000) ctx.addComponent!LateA(e);
+		if (i == 2000) ctx.addComponent!LateB(e);
+		if (i % 3 == 0) ctx.removeComponent!Payload(e);
+	}
+	assert(&ctx.getComponent!Payload(first) is held);
+	assert(held.value == 7);
 }

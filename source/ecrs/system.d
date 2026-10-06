@@ -1,6 +1,7 @@
 module ecrs.system;
 
 import ecrs.context;
+import ecrs.context : enterParallel, exitParallel;
 import ecrs.storage : EntityId;
 import bc.threadpool;
 
@@ -48,6 +49,10 @@ template parallel(alias fn) {
 	}
 
 	private bool dispatch(ref Context context, ThreadPool* pool) @trusted @nogc nothrow {
+		// Marked even when it runs inline, so a structural change fails here
+		// the same way whatever the pool size. See `ecrs.context.Context`.
+		enterParallel(context);
+		scope(exit) exitParallel(context);
 		if (pool.workerCount() <= 1)
 			return andAllEntities(context);
 
@@ -241,6 +246,8 @@ private void runSystem(void* arg) {
 /// `ecrs.system.sequential(Systems...)`, but always runs all of them: see the
 /// note there on the short circuit.
 bool parallel(Systems...)(ref Context context, ThreadPool* pool, Systems systems) @trusted {
+	enterParallel(context);
+	scope(exit) exitParallel(context);
 	static if (Systems.length <= 1)
 		return andAll(context, systems);
 	else {
@@ -700,4 +707,44 @@ unittest {
 
 	assert(parallel!bumpA(pool)(wrapper));
 	assert(ctx.getComponent!A(e).value == 6);
+}
+
+unittest {
+	// Both parallel combinators mark the context for as long as they run -
+	// with one worker, or with fewer than two systems, too - so structural
+	// changes made from inside one fail an assert instead of racing.
+	import core.atomic : atomicOp, atomicStore;
+	static shared int sawParallel;
+
+	static bool observe(ref Context ctx, EntityId) @nogc nothrow {
+		if (ctx.inParallel()) sawParallel.atomicOp!"+="(1);
+		return true;
+	}
+	static bool observeWhole(ref Context ctx) @nogc nothrow {
+		if (ctx.inParallel()) sawParallel.atomicOp!"+="(1);
+		return true;
+	}
+
+	auto ctx = ecrs.context.create();
+	scope(exit) ecrs.context.free(ctx);
+	foreach (i; 0 .. 4) ctx.addEntity();
+
+	foreach (workers; [1, 4]) {
+		auto pool = bc.threadpool.create(workers);
+		scope(exit) bc.threadpool.free(pool);
+
+		sawParallel.atomicStore(0);
+		assert(parallel!observe(ctx, pool));
+		assert(sawParallel == ctx.entityCount());
+		assert(!ctx.inParallel());
+
+		sawParallel.atomicStore(0);
+		assert(parallel(ctx, pool, &observeWhole));
+		assert(parallel(ctx, pool, &observeWhole, &observeWhole));
+		assert(sawParallel == 3);
+		assert(!ctx.inParallel());
+	}
+
+	assert(sequential!observe(ctx)); // sequential is not parallel
+	assert(!ctx.inParallel());
 }

@@ -17,7 +17,9 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 compiler="${DC:-ldc2}"
 out="bin/coverage"
 
-# LDC and DMD spell the version flag differently.
+# LDC and DMD spell the version flag differently. DMD gets no further than
+# libfp's `static assert` (in fp.pointer), but it has to get as far as
+# reading the sources for that to be the error it reports.
 case "$compiler" in
 	*dmd*) versionFlag="-version=" ;;
 	*)     versionFlag="-d-version=" ;;

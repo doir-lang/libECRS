@@ -5,14 +5,14 @@ module ecrs.relation;
 
 import fp.dynarray;
 
-import ecrs.storage : EntityId, invalidEntity, EntityComponentIndices;
+import ecrs.storage : EntityId, invalidEntity;
 
 @nogc nothrow:
 
 
 /// Marker base for relation components (kept for symmetry with the C++
-/// version's `relation_base`; D doesn't need it for dispatch, since
-/// `hasSwapEntities`/component registration work structurally).
+/// version's `relation_base`; D doesn't need it for dispatch, since the
+/// registry detects the hooks below structurally).
 struct RelationBase {}
 
 /// One relation slot: either a concrete entity, or (when the relation type
@@ -42,17 +42,9 @@ struct Relation(size_t N = dynamicExtent, bool canBeTerm = false) {
 	else
 		MaybeTerm[N] related;
 
-	static void swapEntities(ref Relation self, ref EntityComponentIndices entityComponentIndices, EntityId a, EntityId b) @nogc nothrow {
-		static if (isDynamic) auto slots = slice(self.related);
-		else auto slots = self.related[];
-		foreach (ref e; slots)
-			swapTermEntity(e, a, b);
-	}
-
-	/// The `reorderEntities` hook: one relabelling of every slot, where
-	/// `swapEntities` would have been called once per transposition and rescanned
-	/// them all each time.
-	static void remapEntities(ref Relation self, ref EntityComponentIndices entityComponentIndices, const(EntityId)[] remap) @nogc nothrow {
+	/// The renumbering hook (`ecrs.registry.hasRemapEntities`): relabels every
+	/// slot, `remap[old]` being the id `old` becomes.
+	static void remapEntities(ref Relation self, const(EntityId)[] remap) @nogc nothrow {
 		static if (isDynamic) auto slots = slice(self.related);
 		else auto slots = self.related[];
 		foreach (ref e; slots)
@@ -74,19 +66,8 @@ private template Ternary(bool canBeTerm) {
 	else alias Ternary = EntityId;
 }
 
-private void swapTermEntity(ref EntityId e, EntityId a, EntityId b) {
-	if (e == a) e = b;
-	else if (e == b) e = a;
-}
-private void swapTermEntity(ref Term t, EntityId a, EntityId b) {
-	if (t.isVar) return;
-	if (t.constant == a) t.constant = b;
-	else if (t.constant == b) t.constant = a;
-}
-
-// An id the permutation does not cover keeps its own, which is what the swap
-// form did with it too: `invalidEntity` maps to itself as long as the caller's
-// permutation holds index 0 fixed.
+// An id the permutation does not cover keeps its own: `invalidEntity` maps to
+// itself as long as the caller's permutation holds index 0 fixed.
 private void remapTermEntity(ref EntityId e, const(EntityId)[] remap) {
 	if (e < remap.length) e = remap[e];
 }
@@ -97,16 +78,15 @@ private void remapTermEntity(ref Term t, const(EntityId)[] remap) {
 
 
 unittest {
-	import ecrs.storage : hasSwapEntities;
+	import ecrs.registry : hasRemapEntities;
 
-	struct Parent { }
 	alias ParentRelation = Relation!3;
-	static assert(hasSwapEntities!ParentRelation);
+	static assert(hasRemapEntities!ParentRelation);
 
 	ParentRelation rel;
 	rel.related = [1, 2, 3];
-	EntityComponentIndices dummy = null;
-	ParentRelation.swapEntities(rel, dummy, 1, 5);
+	immutable EntityId[6] remap = [0, 5, 2, 3, 4, 1];
+	ParentRelation.remapEntities(rel, remap[]);
 	assert(rel.related == [5, 2, 3]);
 }
 
@@ -119,19 +99,19 @@ unittest {
 	fp.dynarray.pushBack(rel.related, EntityId(2));
 	scope(exit) fp.dynarray.free(rel.related);
 
-	EntityComponentIndices dummy = null;
-	DynRelation.swapEntities(rel, dummy, 2, 9);
+	immutable EntityId[3] remap = [0, 1, 9];
+	DynRelation.remapEntities(rel, remap[]);
 	assert(rel.related[0] == 1);
 	assert(rel.related[1] == 9);
 }
 
 unittest {
-	// A dynamic relation opts into the storage.d `hasFinalize` contract so
+	// A dynamic relation opts into the registry's `hasFinalize` contract so
 	// `Context.removeComponent`/`removeEntity`/`free` can release `related`
 	// instead of leaking it (ComponentStorage is flat POD bytes with no
 	// destructor support - see the note on it in storage.d). A fixed-size
 	// relation owns no heap memory, so it doesn't need (and doesn't get) one.
-	import ecrs.storage : hasFinalize;
+	import ecrs.registry : hasFinalize;
 
 	alias DynRelation = Relation!(dynamicExtent, false);
 	alias FixedRelation = Relation!3;
@@ -159,7 +139,7 @@ unittest {
 unittest {
 	// remapEntities(): every slot relabelled in one pass, vars left alone, and an
 	// id past the end of the table (here 9) left as it was.
-	import ecrs.storage : hasRemapEntities;
+	import ecrs.registry : hasRemapEntities;
 
 	alias TermRelation = Relation!(4, true);
 	static assert(hasRemapEntities!TermRelation);
@@ -171,28 +151,10 @@ unittest {
 	rel.related[3] = Term(EntityId(9));
 
 	immutable EntityId[4] remap = [0, 3, 1, 2];
-	EntityComponentIndices dummy = null;
-	TermRelation.remapEntities(rel, dummy, remap[]);
+	TermRelation.remapEntities(rel, remap[]);
 
 	assert(rel.related[0].isVar);
 	assert(rel.related[1].constant == 3);
 	assert(rel.related[2].constant == 2);
 	assert(rel.related[3].constant == 9);
-}
-
-unittest {
-	// swapEntities() on a canBeTerm relation: unbound vars are left alone, and
-	// constants matching either `a` or `b` are swapped.
-	alias TermRelation = Relation!(3, true);
-	TermRelation rel;
-	rel.related[0] = Term(); // isVar == true -> early-return branch
-	rel.related[1] = Term(EntityId(1)); // constant == a
-	rel.related[2] = Term(EntityId(2)); // constant == b
-
-	EntityComponentIndices dummy = null;
-	TermRelation.swapEntities(rel, dummy, EntityId(1), EntityId(2));
-
-	assert(rel.related[0].isVar);
-	assert(!rel.related[1].isVar && rel.related[1].constant == 2);
-	assert(!rel.related[2].isVar && rel.related[2].constant == 1);
 }

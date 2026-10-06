@@ -1,6 +1,13 @@
-/// Per-component-type contiguous storage (`ComponentStorage`), plus the
-/// small compile-time trait helpers (`WithEntity`, `Tag`) components can opt
-/// into. Ported from storage.hpp.
+/// Per-component-type storage (`ComponentStorage`), plus the small
+/// compile-time trait helpers (`Tag`) components can opt into. Ported from
+/// storage.hpp.
+///
+/// Element bytes live in an `fp.pagedarray`, so a component's address never
+/// changes while it exists: a query may hold a `ref` to one while nested
+/// queries add more. Each slot also records its owning entity, so slot ->
+/// entity is O(1). Removal leaves a hole for the next add to reuse rather than
+/// moving another component into the gap; only `reorder` and the sorts move
+/// components, and they also trim trailing holes.
 ///
 /// Styled after `fp.dynarray`/`bc.mutex`: `ComponentStorage` is plain data
 /// with no methods of its own, and every operation on it is a free function
@@ -10,16 +17,15 @@ module ecrs.storage;
 
 import core.stdc.string : memset;
 
-import fp.pointer : allocFunction, notFound;
-import fp.dynarray;
+import fp.pointer : allocFunction;
+static import fp.dynarray;
+static import fp.pagedarray;
 
+public import ecrs.registry : EntityId, invalidEntity, FinalizeFunction, RemapFunction, hasFinalize, hasRemapEntities;
 import ecrs.registry : componentId;
 
 @nogc nothrow:
 
-
-alias EntityId = uint;
-enum EntityId invalidEntity = 0;
 
 /// `entityComponentIndices[e]` is a dynarray of size_t, one slot per
 /// registered component id; `entityComponentIndices[e][id]` is either
@@ -36,95 +42,6 @@ void ensureIndexSlot(ref ComponentIndexList indices, size_t componentIdVal) @tru
 		fp.dynarray.growToSize(indices, componentIdVal + 1);
 		foreach (i; oldLen .. componentIdVal + 1)
 			indices[i] = ComponentStorage.invalid;
-	}
-}
-
-/// Finds which entity (if any) has its `componentId`-th slot pointing at `index`.
-EntityId getEntity(inout EntityComponentIndices entityComponentIndices, size_t index, size_t componentIdVal) @trusted {
-	if (entityComponentIndices is null) return invalidEntity;
-	immutable n = fp.dynarray.length(cast(EntityComponentIndices) entityComponentIndices);
-	foreach (e; 0 .. n) {
-		auto indices = (cast(EntityComponentIndices) entityComponentIndices)[e];
-		if (fp.dynarray.length(indices) > componentIdVal && indices[componentIdVal] == index)
-			return cast(EntityId) e;
-	}
-	return invalidEntity;
-}
-template getEntity(Tcomponent, size_t Unique = 0) {
-	EntityId getEntity(inout EntityComponentIndices entityComponentIndices, size_t index) @nogc nothrow {
-		return .getEntity(entityComponentIndices, index, componentId!(Tcomponent, Unique)());
-	}
-}
-
-
-/// Wraps a component value together with the id of the entity that owns it
-/// (useful once a component has been reordered/sorted out of entity order).
-struct WithEntity(T) {
-	T value;
-	EntityId entity = invalidEntity;
-
-	alias value this;
-
-	static void swapEntities(ref WithEntity self, ref EntityComponentIndices entityComponentIndices, EntityId a, EntityId b) @nogc nothrow {
-		if (self.entity == a) self.entity = b;
-		else if (self.entity == b) self.entity = a;
-	}
-
-	static void remapEntities(ref WithEntity self, ref EntityComponentIndices entityComponentIndices, const(EntityId)[] remap) @nogc nothrow {
-		if (self.entity < remap.length) self.entity = remap[self.entity];
-	}
-}
-
-template isWithEntity(T) { enum isWithEntity = false; }
-template isWithEntity(T : WithEntity!U, U) { enum isWithEntity = true; }
-
-template RemoveWithEntity(T) { alias RemoveWithEntity = T; }
-template RemoveWithEntity(T : WithEntity!U, U) { alias RemoveWithEntity = RemoveWithEntity!U; }
-
-/// True if `T` implements the `static void swapEntities(ref T, ref EntityComponentIndices, EntityId, EntityId)` contract.
-enum hasSwapEntities(T) = __traits(compiles, {
-	T t = T.init;
-	EntityComponentIndices idx;
-	T.swapEntities(t, idx, EntityId.init, EntityId.init);
-});
-
-/// True if `T` implements the
-/// `static void remapEntities(ref T, ref EntityComponentIndices, const(EntityId)[])`
-/// contract: the whole-permutation form of `swapEntities`, relabelling every
-/// entity id the component holds in one pass (`remap[old]` is the id `old`
-/// becomes). `reorderEntities` requires it because notifying a component of
-/// each transposition instead means rescanning the component once per swap.
-enum hasRemapEntities(T) = __traits(compiles, {
-	T t = T.init;
-	EntityComponentIndices idx;
-	const(EntityId)[] remap;
-	T.remapEntities(t, idx, remap);
-});
-
-/// True if `T` implements the `static void finalize(ref T)` contract: a hook
-/// for releasing resources a component instance owns itself (e.g. a dynamic
-/// `Relation`'s backing dynarray) before its storage slot is discarded or the
-/// whole `ComponentStorage` is freed. Storage is otherwise flat, relocatable
-/// bytes with no destructor support (see the note on `ComponentStorage`
-/// below), so this is the only place such cleanup can hook in.
-enum hasFinalize(T) = __traits(compiles, {
-	T t = T.init;
-	T.finalize(t);
-});
-
-private template finalizeThunk(T) {
-	void finalizeThunk(void* p) @trusted @nogc nothrow {
-		T.finalize(*cast(T*) p);
-	}
-}
-
-/// Returns the `ComponentStorage.FinalizeFunction` for `T` if it implements the
-/// `finalize` contract above, or `null` otherwise (the common case - most
-/// components are plain data and own nothing that needs releasing).
-template finalizerFor(T) {
-	ComponentStorage.FinalizeFunction finalizerFor() @nogc nothrow {
-		static if (hasFinalize!T) return &finalizeThunk!T;
-		else return null;
 	}
 }
 
@@ -160,163 +77,132 @@ private bool monotonicLess(const(void)* a, EntityId ea, const(void)* b, EntityId
 }
 
 
-
-/// Contiguous, type-erased backing storage for one component type: a
-/// malloc-backed byte dynarray sliced into `elementSize`-sized chunks.
+/// Type-erased backing storage for one component type.
 ///
 /// Deliberately plain data (no constructor, no methods, no disabled postblit,
 /// no destructor): `Context` keeps these inside an `fp.dynarray`, which
 /// relocates elements via raw `memcpy` on growth rather than via D copy/move
-/// semantics, so a C++-style non-copyable/RAII discipline wouldn't actually
-/// hold here. Ownership is managed explicitly instead - `free(Context)` is
-/// the only code that should ever call `free()` on one of these.
+/// semantics. Relocating this struct never moves the components themselves,
+/// which sit in pages it points to. `free(Context)` is the only code that
+/// should ever call `free()` on one of these.
 struct ComponentStorage {
 	enum size_t invalid = size_t.max;
-	enum size_t defaultReservedElementCount = 64;
-
-	alias FinalizeFunction = void function(void* element) @nogc nothrow;
 
 	size_t elementSize = invalid;
-	private ubyte* raw = null;
+	private fp.pagedarray.PagedArray elements;
+	private EntityId* slotOwners = null; // parallel to `elements`; invalidEntity marks a hole
+	private size_t* holes = null; // hole slots, reused before `elements` grows
 	private FinalizeFunction finalizeFunction = null;
+	private RemapFunction remapFunction = null;
 }
 
-ComponentStorage create(size_t elementSize, size_t reservedElementCount = ComponentStorage.defaultReservedElementCount, ComponentStorage.FinalizeFunction finalizeFunction = null) @trusted {
+ComponentStorage create(size_t elementSize, FinalizeFunction finalizeFunction = null, RemapFunction remapFunction = null) {
 	ComponentStorage self;
 	self.elementSize = elementSize;
+	self.elements = fp.pagedarray.create(elementSize);
 	self.finalizeFunction = finalizeFunction;
-	fp.dynarray.reserve(self.raw, reservedElementCount * elementSize);
+	self.remapFunction = remapFunction;
 	return self;
 }
 
-size_t size(const ref ComponentStorage self) @trusted {
-	return self.raw is null || self.elementSize == ComponentStorage.invalid || self.elementSize == 0
-		? 0 : fp.dynarray.length(cast(ubyte*) self.raw) / self.elementSize;
-}
-bool empty(const ref ComponentStorage self) { return size(self) == 0; }
-
-/// Runs `self`'s finalizer (if any) on element `i`, then zero-fills its
-/// bytes. The zero-fill matters: it makes a later, redundant finalization of
-/// the same slot (e.g. `free()` revisiting a slot already finalized by
-/// `remove()`/`removeComponent(Context)`) a safe no-op rather than a
-/// double-free, since a zeroed `Relation.related` reads back null.
-void finalizeElement(ref ComponentStorage self, size_t i) @trusted {
-	if (self.finalizeFunction is null) return;
-	void* p = get(self, i);
-	self.finalizeFunction(p);
-	memset(p, 0, self.elementSize);
-}
-
 void free(ref ComponentStorage self) @trusted {
-	if (self.raw !is null) {
-		if (self.finalizeFunction !is null)
-			foreach (i; 0 .. size(self))
-				finalizeElement(self, i);
-		fp.dynarray.free(self.raw);
-	}
+	foreach (slot; 0 .. size(self))
+		if (self.slotOwners[slot] != invalidEntity)
+			finalizeElement(self, slot);
+	fp.pagedarray.free(self.elements);
+	fp.dynarray.free(self.slotOwners);
+	fp.dynarray.free(self.holes);
 	self.elementSize = ComponentStorage.invalid;
 }
 
-T* data(T)(ref ComponentStorage self) @trusted {
+/// Slots in use, holes included; valid indices are `0 .. size`.
+size_t size(const ref ComponentStorage self) @trusted {
+	return fp.dynarray.length(cast(EntityId*) self.slotOwners);
+}
+/// Slots holding a component.
+size_t liveCount(const ref ComponentStorage self) @trusted {
+	return size(self) - fp.dynarray.length(cast(size_t*) self.holes);
+}
+bool empty(const ref ComponentStorage self) { return liveCount(self) == 0; }
+
+/// Each slot's owner, `invalidEntity` for a hole: the dense list of entities
+/// that have this component.
+const(EntityId)[] owners(const ref ComponentStorage self) @trusted {
+	return self.slotOwners[0 .. size(self)];
+}
+EntityId getEntity(const ref ComponentStorage self, size_t slot) @trusted {
+	assert(slot < size(self));
+	return self.slotOwners[slot];
+}
+
+void* get(ref ComponentStorage self, size_t i) { return fp.pagedarray.get(self.elements, i); }
+const(void)* get(const ref ComponentStorage self, size_t i) { return fp.pagedarray.get(self.elements, i); }
+ref T get(T)(ref ComponentStorage self, size_t i) @trusted {
 	assert(T.sizeof == self.elementSize);
-	return cast(T*) self.raw;
+	return *cast(T*) get(self, i);
 }
-const(T)* data(T)(const ref ComponentStorage self) @trusted {
+ref const(T) get(T)(const ref ComponentStorage self, size_t i) @trusted {
 	assert(T.sizeof == self.elementSize);
-	return cast(const(T)*) self.raw;
+	return *cast(const(T)*) get(self, i);
 }
 
-void* get(ref ComponentStorage self, size_t i) @trusted { assert(i < size(self)); return self.raw + i * self.elementSize; }
-const(void)* get(const ref ComponentStorage self, size_t i) @trusted { assert(i < size(self)); return self.raw + i * self.elementSize; }
-ref T get(T)(ref ComponentStorage self, size_t i) @trusted { assert(i < size(self)); return data!T(self)[i]; }
-ref const(T) get(T)(const ref ComponentStorage self, size_t i) @trusted { assert(i < size(self)); return data!T(self)[i]; }
-
-/// Grows storage by `count` zero-filled, type-erased elements.
-void allocate(ref ComponentStorage self, size_t count = 1) @trusted {
-	immutable oldBytes = self.raw is null ? 0 : fp.dynarray.length(self.raw);
-	fp.dynarray.grow(self.raw, self.elementSize * count);
-	memset(self.raw + oldBytes, 0, self.elementSize * count);
-}
-/// Grows storage by `count` elements, each set to `T.init` (D's equivalent
-/// of the C++ version's placement-new default construction).
-void allocate(T)(ref ComponentStorage self, size_t count = 1) @trusted {
-	assert(T.sizeof == self.elementSize);
-	immutable oldCount = size(self);
-	fp.dynarray.grow(self.raw, self.elementSize * count);
-	T* d = data!T(self);
-	foreach (i; 0 .. count)
-		d[oldCount + i] = T.init;
+/// Runs `self`'s finalizer (if any) on slot `i`, then zero-fills it, so a
+/// hole never holds a stale value that looks live.
+private void finalizeElement(ref ComponentStorage self, size_t i) @trusted {
+	void* p = get(self, i);
+	if (self.finalizeFunction !is null) self.finalizeFunction(p);
+	memset(p, 0, self.elementSize);
 }
 
-void* getOrAllocate(ref ComponentStorage self, size_t e) @trusted {
-	immutable sz = size(self);
-	if (sz <= e) allocate(self, e - sz + 1);
-	return get(self, e);
-}
-ref T getOrAllocate(T)(ref ComponentStorage self, size_t e) @trusted {
-	immutable sz = size(self);
-	if (sz <= e) allocate!T(self, e - sz + 1);
-	return get!T(self, e);
-}
-
-private void swapBytes(ref ComponentStorage self, size_t a, size_t b) @trusted {
-	assert(a < size(self));
-	assert(b < size(self));
-	fp.dynarray.swapRange!ubyte(self.raw, a * self.elementSize, b * self.elementSize, self.elementSize);
-}
-
-/// Swaps two component slots and keeps `entityComponentIndices` in sync.
-/// If `swapIfOneElementless`, one side may be an untracked slot (no owning
-/// entity) - used when moving the last element into a freshly freed gap.
-bool swap(ref ComponentStorage self, size_t componentIdVal, ref EntityComponentIndices entityComponentIndices, size_t a, size_t b, bool swapIfOneElementless = false) @trusted {
-	immutable eA = getEntity(entityComponentIndices, a, componentIdVal);
-	immutable eB = getEntity(entityComponentIndices, b, componentIdVal);
-	if (swapIfOneElementless) {
-		if (eA == invalidEntity && eB == invalidEntity) return false;
-	} else if (eA == invalidEntity || eB == invalidEntity) return false;
-
-	swapBytes(self, a, b);
-
-	if (swapIfOneElementless && eA == invalidEntity) {
-		ensureIndexSlot(entityComponentIndices[eB], componentIdVal);
-		entityComponentIndices[eB][componentIdVal] = a;
-	} else if (swapIfOneElementless && eB == invalidEntity) {
-		ensureIndexSlot(entityComponentIndices[eA], componentIdVal);
-		entityComponentIndices[eA][componentIdVal] = b;
+/// Gives entity `e` a zero-filled slot, reusing a hole if there is one, and
+/// records it in `e`'s index list. `e` must not already have this component.
+void* add(ref ComponentStorage self, size_t componentIdVal, ref EntityComponentIndices entityComponentIndices, EntityId e) @trusted {
+	assert(e != invalidEntity);
+	size_t slot;
+	if (fp.dynarray.length(self.holes) > 0) {
+		slot = *fp.dynarray.back(self.holes);
+		fp.dynarray.popBack(self.holes);
 	} else {
-		immutable tmp = entityComponentIndices[eA][componentIdVal];
-		entityComponentIndices[eA][componentIdVal] = entityComponentIndices[eB][componentIdVal];
-		entityComponentIndices[eB][componentIdVal] = tmp;
+		slot = size(self);
+		fp.pagedarray.grow(self.elements, 1);
+		fp.dynarray.pushBack(self.slotOwners, invalidEntity);
 	}
-	return true;
+	self.slotOwners[slot] = e;
+	ensureIndexSlot(entityComponentIndices[e], componentIdVal);
+	assert(entityComponentIndices[e][componentIdVal] == ComponentStorage.invalid);
+	entityComponentIndices[e][componentIdVal] = slot;
+
+	void* p = get(self, slot);
+	memset(p, 0, self.elementSize);
+	return p;
 }
-template swap(Tcomponent, size_t Unique = 0) {
-	bool swap(ref ComponentStorage self, ref EntityComponentIndices entityComponentIndices, size_t a, size_t b, bool swapIfOneElementless = false) @nogc nothrow {
-		return .swap(self, componentId!(Tcomponent, Unique)(), entityComponentIndices, a, b, swapIfOneElementless);
+/// Ditto, with the slot set to `Tcomponent.init`.
+template add(Tcomponent, size_t Unique = 0) {
+	ref Tcomponent add(ref ComponentStorage self, ref EntityComponentIndices entityComponentIndices, EntityId e) @trusted @nogc nothrow {
+		auto p = cast(Tcomponent*) .add(self, componentId!(Tcomponent, Unique)(), entityComponentIndices, e);
+		*p = Tcomponent.init;
+		return *p;
 	}
 }
 
-/// Removes entity `e`'s component by swapping the last element into its
-/// place and popping the back (does not preserve storage order).
+/// Finalizes and releases entity `e`'s component. No other component moves:
+/// the last slot is popped, any other becomes a hole.
 bool remove(ref ComponentStorage self, size_t componentIdVal, ref EntityComponentIndices entityComponentIndices, EntityId e) @trusted {
-	immutable sz = size(self);
-	if (sz == 0 || entityComponentIndices is null || e >= fp.dynarray.length(entityComponentIndices))
-		return false;
-
+	if (entityComponentIndices is null || e >= fp.dynarray.length(entityComponentIndices)) return false;
 	auto indices = entityComponentIndices[e];
-	if (fp.dynarray.length(indices) <= componentIdVal) return false;
-
-	// Move the element to the back, index table included. `swap` reports
-	// false when either slot has no owning entity, which is the same
-	// "nothing to remove" answer this used to scan for by hand.
-	if (!swap(self, componentIdVal, entityComponentIndices, indices[componentIdVal], sz - 1))
+	if (fp.dynarray.length(indices) <= componentIdVal || indices[componentIdVal] == ComponentStorage.invalid)
 		return false;
 
-	// Slot `sz - 1` (about to be popped) now holds the removed element's
-	// original bytes - finalize it before it's gone.
-	finalizeElement(self, sz - 1);
-	fp.dynarray.popBackCount(self.raw, self.elementSize);
+	immutable slot = indices[componentIdVal];
+	finalizeElement(self, slot);
 	indices[componentIdVal] = ComponentStorage.invalid;
+	if (slot + 1 == size(self)) {
+		fp.dynarray.popBack(self.slotOwners);
+		fp.pagedarray.popBack(self.elements);
+	} else {
+		self.slotOwners[slot] = invalidEntity;
+		fp.dynarray.pushBack(self.holes, slot);
+	}
 	return true;
 }
 template remove(Tcomponent, size_t Unique = 0) {
@@ -325,20 +211,35 @@ template remove(Tcomponent, size_t Unique = 0) {
 	}
 }
 
+/// Swaps two slots' contents and owners, keeping both owners' index entries
+/// pointing at their components. Leaves `holes` stale; callers rebuild it.
+private void swapSlots(ref ComponentStorage self, size_t componentIdVal, EntityComponentIndices entityComponentIndices, size_t a, size_t b) @trusted {
+	if (a == b) return;
+	fp.pagedarray.swap(self.elements, a, b);
+	immutable ownerA = self.slotOwners[a];
+	self.slotOwners[a] = self.slotOwners[b];
+	self.slotOwners[b] = ownerA;
+	if (self.slotOwners[a] != invalidEntity) entityComponentIndices[self.slotOwners[a]][componentIdVal] = a;
+	if (self.slotOwners[b] != invalidEntity) entityComponentIndices[self.slotOwners[b]][componentIdVal] = b;
+}
+
+/// Drops trailing holes and rebuilds the hole list from `slotOwners`.
+private void settleHoles(ref ComponentStorage self) @trusted {
+	while (size(self) > 0 && *fp.dynarray.back(self.slotOwners) == invalidEntity) {
+		fp.dynarray.popBack(self.slotOwners);
+		fp.pagedarray.popBack(self.elements);
+	}
+	fp.dynarray.clear(self.holes);
+	foreach (slot; 0 .. size(self))
+		if (self.slotOwners[slot] == invalidEntity)
+			fp.dynarray.pushBack(self.holes, slot);
+}
+
 /// Walks the cycles of the permutation `order` (`order[i]` is the index of
 /// whatever ends up *at* `i`, not where `i` goes - see `buildRemap`), handing
 /// each transposition it needs to `swapPair`. Shared with
 /// `ecrs.context.reorderEntities`, which permutes the entity table with the
 /// same algorithm over a different swap.
-/// Inverts `order` into the relabelling `applyPermutation(order, ...)` performs:
-/// `remap[old]` is the index `old` ends up at. Release it with
-/// `allocFunction(remap, 0)`.
-package EntityId* buildRemap(const(size_t)[] order) @trusted {
-	auto remap = cast(EntityId*) allocFunction(null, order.length * EntityId.sizeof);
-	foreach (i; 0 .. order.length) remap[order[i]] = cast(EntityId) i;
-	return remap;
-}
-
 package void applyPermutation(const(size_t)[] order, scope void delegate(size_t, size_t) @nogc nothrow swapPair) @trusted {
 	immutable n = order.length;
 	if (n <= 1) return;
@@ -354,13 +255,24 @@ package void applyPermutation(const(size_t)[] order, scope void delegate(size_t,
 		}
 }
 
-/// Applies a permutation: `order[i]` is the index of the element that ends up
-/// at `i`.
+/// Inverts `order` into the relabelling `applyPermutation(order, ...)` performs:
+/// `remap[old]` is the index `old` ends up at. Release it with
+/// `allocFunction(remap, 0)`.
+package EntityId* buildRemap(const(size_t)[] order) @trusted {
+	auto remap = cast(EntityId*) allocFunction(null, order.length * EntityId.sizeof);
+	foreach (i; 0 .. order.length) remap[order[i]] = cast(EntityId) i;
+	return remap;
+}
+
+/// Applies a permutation of slots: `order[i]` is the slot whose component ends
+/// up at `i`. Moves components, so it invalidates pointers into this storage.
 void reorder(ref ComponentStorage self, size_t componentIdVal, ref EntityComponentIndices entityComponentIndices, const(size_t)[] order) @trusted {
 	assert(order.length == size(self));
+	auto indices = entityComponentIndices;
 	applyPermutation(order, (a, b) {
-		swap(self, componentIdVal, entityComponentIndices, a, b, false);
+		swapSlots(self, componentIdVal, indices, a, b);
 	});
+	settleHoles(self);
 }
 template reorder(Tcomponent, size_t Unique = 0) {
 	void reorder(ref ComponentStorage self, ref EntityComponentIndices entityComponentIndices, const(size_t)[] order) @nogc nothrow {
@@ -368,38 +280,33 @@ template reorder(Tcomponent, size_t Unique = 0) {
 	}
 }
 
-/// Sorts by `less(elementPtr(a), elementPtr(b))`, ignoring entity identity.
-void sort(ref ComponentStorage self, size_t componentIdVal, ref EntityComponentIndices entityComponentIndices, LessFunction less) @trusted {
+private void sortSlots(ref ComponentStorage self, size_t componentIdVal, ref EntityComponentIndices entityComponentIndices,
+		scope bool delegate(size_t, size_t) @nogc nothrow liveLess) @trusted {
 	import std.algorithm.sorting : stdSort = sort;
 
 	immutable n = size(self);
-	if (n <= 1) return;
 	size_t* order = cast(size_t*) allocFunction(null, n * size_t.sizeof);
 	scope(exit) allocFunction(order, 0);
 	foreach (i; 0 .. n) order[i] = i;
 
-	bool cmp(size_t a, size_t b) @trusted @nogc nothrow { return less(get(self, a), get(self, b)); }
+	// Holes sort last, so `settleHoles` trims every one of them.
+	bool cmp(size_t a, size_t b) @nogc nothrow {
+		immutable holeA = self.slotOwners[a] == invalidEntity, holeB = self.slotOwners[b] == invalidEntity;
+		if (holeA || holeB) return !holeA && holeB;
+		return liveLess(a, b);
+	}
 	stdSort!cmp(order[0 .. n]);
 	reorder(self, componentIdVal, entityComponentIndices, order[0 .. n]);
 }
+
+/// Sorts by `less(elementPtr(a), elementPtr(b))`, ignoring entity identity.
+void sort(ref ComponentStorage self, size_t componentIdVal, ref EntityComponentIndices entityComponentIndices, LessFunction less) @trusted {
+	sortSlots(self, componentIdVal, entityComponentIndices, (a, b) => less(get(self, a), get(self, b)));
+}
 /// Sorts by `less(elementPtr(a), entityOf(a), elementPtr(b), entityOf(b))`.
 void sort(ref ComponentStorage self, size_t componentIdVal, ref EntityComponentIndices entityComponentIndices, LessWithEntityFunction less) @trusted {
-	import std.algorithm.sorting : stdSort = sort;
-
-	immutable n = size(self);
-	if (n <= 1) return;
-	size_t* order = cast(size_t*) allocFunction(null, n * size_t.sizeof);
-	scope(exit) allocFunction(order, 0);
-	EntityId* entities = cast(EntityId*) allocFunction(null, n * EntityId.sizeof);
-	scope(exit) allocFunction(entities, 0);
-	foreach (i; 0 .. n) {
-		order[i] = i;
-		entities[i] = getEntity(entityComponentIndices, i, componentIdVal);
-	}
-
-	bool cmp(size_t a, size_t b) @trusted @nogc nothrow { return less(get(self, a), entities[a], get(self, b), entities[b]); }
-	stdSort!cmp(order[0 .. n]);
-	reorder(self, componentIdVal, entityComponentIndices, order[0 .. n]);
+	sortSlots(self, componentIdVal, entityComponentIndices,
+		(a, b) => less(get(self, a), self.slotOwners[a], get(self, b), self.slotOwners[b]));
 }
 template sortByValue(Tcomponent, size_t Unique = 0) {
 	void sortByValue(ref ComponentStorage self, ref EntityComponentIndices entityComponentIndices) @nogc nothrow {
@@ -415,219 +322,209 @@ template sortMonotonic(Tcomponent, size_t Unique = 0) {
 	}
 }
 
+/// The storage half of an entity renumbering: relabels every slot's owner and
+/// every entity id the components hold. Only `ecrs.context.reorderEntities`
+/// calls this, because it alone also moves the index lists to match.
+package void relabel(ref ComponentStorage self, const(EntityId)[] remap) @trusted {
+	foreach (slot; 0 .. size(self)) {
+		auto owner = &self.slotOwners[slot];
+		if (*owner == invalidEntity) continue;
+		if (*owner < remap.length) *owner = remap[*owner];
+		if (self.remapFunction !is null) self.remapFunction(get(self, slot), remap);
+	}
+}
+
+
+version(unittest) {
+	/// An index table for entities `0 .. n`, each with an empty index list.
+	private EntityComponentIndices makeIndices(size_t n) @trusted {
+		EntityComponentIndices indices = null;
+		fp.dynarray.growToSize(indices, n);
+		foreach (e; 0 .. n) indices[e] = null;
+		return indices;
+	}
+	private void freeIndices(ref EntityComponentIndices indices) @trusted {
+		foreach (e; 0 .. fp.dynarray.length(indices))
+			fp.dynarray.free(indices[e]);
+		fp.dynarray.free(indices);
+	}
+	private bool ownersAre(const ref ComponentStorage storage, const(EntityId)[] expected...) {
+		return storage.owners() == expected;
+	}
+}
 
 unittest {
+	// add/remove: owners are O(1) to read back, the last slot pops, any other
+	// becomes a hole, and the next add fills the hole before growing.
 	struct Vec2 { float x = 0, y = 0; }
-
-	// NOTE: componentId!Vec2() is a process-wide id assigned on first use, not
-	// necessarily 0 - other modules' unittests may have already registered
-	// other types, so the index lists below are sized/filled via
-	// ensureIndexSlot() rather than assuming a fixed slot count.
 	immutable id = componentId!Vec2();
 
 	ComponentStorage storage = create(Vec2.sizeof);
 	scope(exit) free(storage);
+	auto indices = makeIndices(5);
+	scope(exit) freeIndices(indices);
 
 	assert(storage.empty());
-	storage.allocate!Vec2(3);
-	assert(storage.size() == 3);
-
-	storage.get!Vec2(0) = Vec2(1, 1);
-	storage.get!Vec2(1) = Vec2(2, 2);
-	storage.get!Vec2(2) = Vec2(3, 3);
-
-	// Entity id 0 is reserved as `invalidEntity`, so real entities start at 1
-	// - `indices[0]` is left as an empty (unused) placeholder.
-	EntityComponentIndices indices = null;
-	fp.dynarray.growToSize(indices, 4);
-	indices[0] = null;
-	foreach (e; 1 .. 4) {
-		ComponentIndexList list = null;
-		ensureIndexSlot(list, id);
-		list[id] = e - 1;
-		indices[e] = list;
-	}
-	scope(exit) {
-		foreach (e; 1 .. fp.dynarray.length(indices))
-			fp.dynarray.free(indices[e]);
-		fp.dynarray.free(indices);
-	}
-
-	assert(getEntity(indices, 1, id) == 2);
-
-	storage.remove(id, indices, 2);
-	assert(storage.size() == 2);
-	// Entity 3's component slid into slot 1.
-	assert(getEntity(indices, 1, id) == 3);
-	assert(storage.get!Vec2(1) == Vec2(3, 3));
-}
-
-unittest {
-	// See the note in the previous unittest: componentId!int() is a
-	// process-wide id, not necessarily 0.
-	immutable id = componentId!int();
-
-	ComponentStorage storage = create(int.sizeof);
-	scope(exit) free(storage);
-
-	storage.allocate!int(4);
-	storage.get!int(0) = 3;
-	storage.get!int(1) = 1;
-	storage.get!int(2) = 4;
-	storage.get!int(3) = 2;
-
-	// Entity id 0 is reserved as `invalidEntity`, so real entities start at 1
-	// - `indices[0]` is left as an empty (unused) placeholder.
-	EntityComponentIndices indices = null;
-	fp.dynarray.growToSize(indices, 5);
-	indices[0] = null;
-	foreach (e; 1 .. 5) {
-		ComponentIndexList list = null;
-		ensureIndexSlot(list, id);
-		list[id] = e - 1;
-		indices[e] = list;
-	}
-	scope(exit) {
-		foreach (e; 1 .. fp.dynarray.length(indices))
-			fp.dynarray.free(indices[e]);
-		fp.dynarray.free(indices);
-	}
-
-	// entity 1..4 originally owned values 3, 1, 4, 2 respectively (slots e - 1).
-	int[5] originalValueOfEntity = [0, 3, 1, 4, 2];
-
-	storage.sortByValue!int(indices);
-	assert(storage.get!int(0) == 1);
-	assert(storage.get!int(1) == 2);
-	assert(storage.get!int(2) == 3);
-	assert(storage.get!int(3) == 4);
-	// Values moved; the index table must still point each entity at its own
-	// (unchanged) value, just at a new slot.
 	foreach (e; 1 .. 5)
-		assert(*cast(int*) storage.get(indices[e][id]) == originalValueOfEntity[e]);
-}
+		storage.add!Vec2(indices, cast(EntityId) e) = Vec2(e, e);
+	assert(storage.size() == 4 && storage.liveCount() == 4);
+	assert(storage.getEntity(1) == 2);
+	assert(ownersAre(storage, 1, 2, 3, 4));
 
-unittest {
-	// getEntity(): the not-found path (no entity's index list points at the
-	// queried slot).
-	EntityComponentIndices emptyIndices = null;
-	assert(getEntity(emptyIndices, 0, 0) == invalidEntity);
+	assert(storage.remove(id, indices, 4)); // last slot: popped
+	assert(storage.size() == 3);
+	assert(storage.remove(id, indices, 2)); // middle slot: a hole
+	assert(storage.size() == 3 && storage.liveCount() == 2);
+	assert(ownersAre(storage, 1, invalidEntity, 3));
+	assert(*cast(const(Vec2)*) storage.get(1) == Vec2(0, 0)); // holes are zeroed
+	assert(!storage.remove(id, indices, 2)); // already gone
+	assert(!storage.remove(id, indices, 99)); // no such entity
 
-	immutable id = componentId!float();
-
-	EntityComponentIndices indices = null;
-	fp.dynarray.growToSize(indices, 2);
-	indices[0] = null;
-	ComponentIndexList list = null;
-	ensureIndexSlot(list, id);
-	list[id] = 0;
-	indices[1] = list;
-	scope(exit) {
-		fp.dynarray.free(indices[1]);
-		fp.dynarray.free(indices);
-	}
-	assert(getEntity(indices, 99, id) == invalidEntity); // nothing points at slot 99
-}
-
-unittest {
-	// The type-erased (non-template) get/allocate/getOrAllocate overloads,
-	// plus the const get() overload.
-	immutable id = componentId!double();
-
-	ComponentStorage storage = create(double.sizeof);
-	scope(exit) free(storage);
-
-	// remove() on still-empty storage: size() == 0 short-circuits to false.
-	EntityComponentIndices noIndices = null;
-	assert(!storage.remove(id, noIndices, 0));
-
-	storage.allocate(2); // zero-filled, type-erased
-	assert(storage.size() == 2);
-	assert(*cast(const(double)*) storage.get(0) == 0);
-
-	auto slot = storage.getOrAllocate(3); // grows past the current size
-	assert(storage.size() == 4);
-	assert(slot !is null);
+	storage.add!Vec2(indices, 4) = Vec2(9, 9);
+	assert(indices[4][id] == 1); // reused the hole
+	assert(storage.size() == 3 && storage.liveCount() == 3);
+	assert(storage.get!Vec2(indices[3][id]) == Vec2(3, 3));
 
 	const(ComponentStorage)* constStorage = &storage;
-	assert((*constStorage).get(0) !is null); // free-function get() needs an explicit deref through the pointer - it doesn't UFCS off a pointer receiver
+	assert((*constStorage).get!Vec2(indices[4][id]) == Vec2(9, 9));
 }
 
 unittest {
-	// swap() with swapIfOneElementless: both untracked -> false; one side
-	// untracked on either side -> succeeds and claims the untracked slot.
-	immutable id = componentId!short();
-
-	ComponentStorage storage = create(short.sizeof);
+	// The point of paging: neither growth nor removal of other components moves
+	// a live one.
+	immutable id = componentId!int();
+	ComponentStorage storage = create(int.sizeof);
 	scope(exit) free(storage);
-	storage.allocate!short(4);
+	auto indices = makeIndices(5001);
+	scope(exit) freeIndices(indices);
 
-	EntityComponentIndices indices = null;
-	fp.dynarray.growToSize(indices, 3);
-	foreach (i; 0 .. 3) indices[i] = null;
-	scope(exit) {
-		foreach (i; 0 .. fp.dynarray.length(indices))
-			if (indices[i] !is null) fp.dynarray.free(indices[i]);
-		fp.dynarray.free(indices);
-	}
-
-	// Entity 1 tracks slot 0; entity 2 tracks slot 1. Slots 2 and 3 are
-	// untracked (no entity's index list points at them).
-	ComponentIndexList l1 = null;
-	ensureIndexSlot(l1, id);
-	l1[id] = 0;
-	indices[1] = l1;
-	ComponentIndexList l2 = null;
-	ensureIndexSlot(l2, id);
-	l2[id] = 1;
-	indices[2] = l2;
-
-	assert(!storage.swap(id, indices, 2, 3, true)); // both untracked
-
-	assert(storage.swap(id, indices, 0, 2, true)); // a tracked (entity 1), b untracked
-	assert(indices[1][id] == 2);
-
-	assert(storage.swap(id, indices, 3, 1, true)); // a untracked, b tracked (entity 2)
-	assert(indices[2][id] == 3);
+	int* first = &storage.add!int(indices, 1);
+	*first = 42;
+	foreach (e; 2 .. 5001)
+		storage.add!int(indices, cast(EntityId) e) = e;
+	foreach (e; 2 .. 2500)
+		storage.remove(id, indices, cast(EntityId) e);
+	assert(&storage.get!int(indices[1][id]) is first);
+	assert(*first == 42);
+	assert(storage.get!int(indices[4000][id]) == 4000);
 }
 
 unittest {
-	// sortMonotonic() (runtime componentId overload) exercises the
-	// LessWithEntityFunction overload of sort() and the private monotonicLess().
-	immutable id = componentId!short();
+	// Sorting moves holes to the end and trims them, and leaves every entity's
+	// index pointing at its own value.
+	immutable id = componentId!int();
+	ComponentStorage storage = create(int.sizeof);
+	scope(exit) free(storage);
+	auto indices = makeIndices(6);
+	scope(exit) freeIndices(indices);
 
+	immutable int[6] value = [0, 30, 10, 40, 20, 50];
+	foreach (e; 1 .. 6)
+		storage.add!int(indices, cast(EntityId) e) = value[e];
+	storage.remove(id, indices, 3);
+	storage.remove(id, indices, 1);
+	assert(storage.liveCount() == 3);
+
+	storage.sortByValue!int(indices);
+	assert(storage.size() == 3); // holes trimmed
+	assert(storage.get!int(0) == 10 && storage.get!int(1) == 20 && storage.get!int(2) == 50);
+	assert(ownersAre(storage, 2, 4, 5));
+	assert(storage.get!int(indices[4][id]) == 20);
+
+	storage.add!int(indices, 1) = 1; // no holes left, so it appends
+	assert(indices[1][id] == 3);
+}
+
+unittest {
+	// sortMonotonic after a removal. This used to leave storage unsorted: the
+	// removed slot had no owner, swap refused to move it, and the permutation's
+	// bookkeeping carried on as though it had.
+	immutable id = componentId!short();
 	ComponentStorage storage = create(short.sizeof);
 	scope(exit) free(storage);
+	auto indices = makeIndices(6);
+	scope(exit) freeIndices(indices);
 
-	storage.allocate!short(3);
-	storage.get!short(0) = 30;
-	storage.get!short(1) = 10;
-	storage.get!short(2) = 20;
-
-	EntityComponentIndices indices = null;
-	fp.dynarray.growToSize(indices, 4);
-	indices[0] = null;
-	// Entities 3, 1, 2 own slots 0, 1, 2 respectively - deliberately out of
-	// entity-id order, so sortMonotonic() has visible work to do.
-	immutable size_t[3] owningEntity = [3, 1, 2];
-	foreach (slot; 0 .. 3) {
-		ComponentIndexList list = null;
-		ensureIndexSlot(list, id);
-		list[id] = slot;
-		indices[owningEntity[slot]] = list;
-	}
-	scope(exit) {
-		foreach (e; 1 .. fp.dynarray.length(indices))
-			fp.dynarray.free(indices[e]);
-		fp.dynarray.free(indices);
-	}
+	foreach_reverse (e; 1 .. 6)
+		storage.add!short(indices, cast(EntityId) e) = cast(short)(e * 10);
+	storage.remove(id, indices, 3);
 
 	storage.sortMonotonic(id, indices);
+	assert(ownersAre(storage, 1, 2, 4, 5));
+	assert(storage.get!short(indices[1][id]) == 10);
+	assert(storage.get!short(indices[5][id]) == 50);
+}
 
-	assert(getEntity(indices, 0, id) == 1);
-	assert(getEntity(indices, 1, id) == 2);
-	assert(getEntity(indices, 2, id) == 3);
-	assert(storage.get!short(0) == 10); // entity 1's value
-	assert(storage.get!short(1) == 20); // entity 2's value
-	assert(storage.get!short(2) == 30); // entity 3's value
+unittest {
+	// reorder() with a hole that ends up in the middle: the hole list is
+	// rebuilt, so the next add lands in it.
+	immutable id = componentId!int();
+	ComponentStorage storage = create(int.sizeof);
+	scope(exit) free(storage);
+	auto indices = makeIndices(4);
+	scope(exit) freeIndices(indices);
+
+	foreach (e; 1 .. 4)
+		storage.add!int(indices, cast(EntityId) e) = e;
+	storage.remove(id, indices, 1); // slot 0 is a hole
+
+	immutable size_t[3] order = [1, 0, 2]; // the hole moves to slot 1
+	storage.reorder!int(indices, order[]);
+	assert(ownersAre(storage, 2, invalidEntity, 3));
+	assert(indices[2][id] == 0 && indices[3][id] == 2);
+
+	storage.add!int(indices, 1) = 7;
+	assert(indices[1][id] == 1);
+}
+
+unittest {
+	// Finalizers run exactly once per component: on removal, or at free() for
+	// whatever is still live - never again on a hole.
+	import ecrs.registry : lookupComponentHooks;
+	static struct Owned {
+		int value;
+		__gshared int finalized;
+		static void finalize(ref Owned self) @nogc nothrow { ++finalized; }
+	}
+	immutable id = componentId!Owned();
+	Owned.finalized = 0;
+
+	auto indices = makeIndices(4);
+	scope(exit) freeIndices(indices);
+	ComponentStorage storage = create(Owned.sizeof, lookupComponentHooks(id).finalize);
+
+	foreach (e; 1 .. 4)
+		storage.add!Owned(indices, cast(EntityId) e).value = e;
+	storage.remove(id, indices, 1);
+	assert(Owned.finalized == 1);
+	free(storage);
+	assert(Owned.finalized == 3);
+}
+
+unittest {
+	// relabel(): owners and the ids components hold, through the remap hook;
+	// holes untouched.
+	import ecrs.registry : lookupComponentHooks;
+	static struct Link {
+		EntityId target;
+		static void remapEntities(ref Link self, const(EntityId)[] remap) @nogc nothrow {
+			if (self.target < remap.length) self.target = remap[self.target];
+		}
+	}
+	immutable id = componentId!Link();
+	auto indices = makeIndices(4);
+	scope(exit) freeIndices(indices);
+	ComponentStorage storage = create(Link.sizeof, null, lookupComponentHooks(id).remap);
+	scope(exit) free(storage);
+
+	storage.add!Link(indices, 1).target = 2;
+	storage.add!Link(indices, 2).target = 3;
+	storage.add!Link(indices, 3).target = 1;
+	storage.remove(id, indices, 2);
+
+	immutable EntityId[4] remap = [0, 3, 1, 2];
+	relabel(storage, remap[]);
+	assert(ownersAre(storage, 3, invalidEntity, 2));
+	assert(storage.get!Link(0).target == 1);
+	assert(storage.get!Link(2).target == 3);
 }
