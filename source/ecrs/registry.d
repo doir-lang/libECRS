@@ -1,92 +1,78 @@
-/// Runtime component-type registry: assigns every component type a stable
-/// numeric id (per (T, Unique) pair, computed once and cached) and keeps
-/// name <-> id <-> size <-> hooks lookup tables for callers that only have a
-/// runtime id or name (e.g. scripting/serialization) rather than a
-/// compile-time type.
+/// The runtime component-type registry: gives every component type a stable numeric id, and keeps name, size and hook tables for callers that only have an id or a name, such as scripting or serialization.
 ///
-/// Thread-safe: lookups share a reader-writer spinlock that registration
-/// takes exclusively, and `componentId!T` publishes its cached id with
-/// release/acquire ordering, so racing first uses of a type agree on a single
-/// id. `freeRegistry` is the exception.
+/// Thread-safe: lookups share a reader-writer spinlock that registration takes exclusively, and `componentId` publishes its cached id with release/acquire ordering, so racing first uses of a type agree on one id. `free` is the exception.
 ///
-/// `EntityId` lives here rather than in `ecrs.storage` because the hook
-/// signatures need it and storage imports this module: a cycle would trip
-/// druntime's module-constructor check in the `-cov` build.
+/// `EntityId` lives here rather than in `ecrs.storage` because the hook signatures need it and storage imports this module; a cycle would trip druntime's module-constructor check in the `-cov` build.
 module ecrs.registry;
 
 import core.atomic : atomicLoad, atomicOp, atomicStore, MemoryOrder;
-import core.stdc.string : memcpy;
 
-import fp.pointer : notFound;
-import fp.dynarray : growToSize, dynLength = length, dynFreeChar = free;
-import fp.fnv1a : fnv1aHash = hash;
-import fp.string : stringEqual = equal, stringSlice = slice, makeDynamicSlice;
-import fp.hashtable;
-
-import bc.spinlock : SpinLock, readLock, readUnlock, writeLock, writeUnlock;
+static import bc.spinlock;
+static import fp.dynarray;
+static import fp.fnv1a;
+static import fp.hashtable;
+static import fp.lifecycle;
+static import fp.pointer;
+static import fp.string;
 
 @nogc nothrow:
 
 
+/// An entity's id: its index in a `Context`'s entity table.
 alias EntityId = uint;
+
+/// The id no entity ever has: every `Context` reserves it as entity 0, and a reference to a freed entity becomes it when the context is compacted.
 enum EntityId invalidEntity = 0;
 
-alias FinalizeFunction = void function(void* element) @nogc nothrow;
+/// Relabels every entity id a type-erased component holds, `remap[old]` being the id `old` becomes.
 alias RemapFunction = void function(void* element, const(EntityId)[] remap) @nogc nothrow;
 
-/// Per-type callbacks the store runs on type-erased elements. Recorded at
-/// registration, so a component that holds entity ids is renumbered by every
-/// `ecrs.context.reorderEntities` without the caller having to name it
-/// (`E-Remap`); a holder a caller forgets is the bug this replaces.
-struct ComponentHooks {
-	FinalizeFunction finalize = null;
-	RemapFunction remap = null;
+/// The callbacks storage runs on one component type's type-erased elements, recorded when the type registers, so storage created from a runtime id still ends lifetimes, and a holder of entity ids is renumbered by every `ecrs.context.reorderEntities` without the caller naming it. A null hook means the type has none.
+struct Hooks {
+	fp.lifecycle.FinalizeFunction finalizeFunction = null; /// Ends a component's lifetime, as `fp.lifecycle` defines it, before its slot is discarded.
+	RemapFunction remapFunction = null; /// Run on a component by every entity renumbering.
 }
 
-/// True if `T` implements `static void finalize(ref T)`: releases resources
-/// an instance owns (e.g. a dynamic `Relation`'s dynarray) before its slot is
-/// discarded. Storage is flat relocatable bytes with no destructor support,
-/// so this is the only place such cleanup can hook in.
-enum hasFinalize(T) = __traits(compiles, {
-	T t = T.init;
-	T.finalize(t);
-});
 
-/// True if `T` implements `static void remapEntities(ref T, const(EntityId)[] remap)`:
-/// relabels every entity id the value holds, `remap[old]` being the id `old`
-/// becomes.
+/// Whether `T` implements `static void remapEntities(ref T, const(EntityId)[] remap)`, relabelling every entity id an instance holds, `remap[old]` being the id `old` becomes.
+///
+/// Examples:
+/// ---
+/// static struct Link { EntityId target; static void remapEntities(ref Link self, const(EntityId)[] remap) @nogc nothrow { self.target = remap[self.target]; } }
+/// static assert(hasRemapEntities!Link && !hasRemapEntities!int);
+/// ---
 enum hasRemapEntities(T) = __traits(compiles, {
 	T t = T.init;
 	const(EntityId)[] remap;
 	T.remapEntities(t, remap);
 });
 
-private template finalizeThunk(T) {
-	void finalizeThunk(void* p) @trusted @nogc nothrow { T.finalize(*cast(T*) p); }
-}
-private template remapThunk(T) {
-	void remapThunk(void* p, const(EntityId)[] remap) @trusted @nogc nothrow { T.remapEntities(*cast(T*) p, remap); }
+private void remapThunk(T)(void* p, const(EntityId)[] remap) @trusted { T.remapEntities(*cast(T*) p, remap); }
+
+/// The hooks `T` declares: `fp.lifecycle.finalizeFunction!T`, set unless `T`'s lifetime is its bytes, and `remapEntities`, as `hasRemapEntities` detects it.
+///
+/// Examples:
+/// ---
+/// static struct Owner { int* data; void finalize() @nogc nothrow { data = null; } }
+/// assert(hooksFor!Owner().finalizeFunction !is null);
+/// assert(hooksFor!int() == Hooks.init);
+/// ---
+Hooks hooksFor(T)() {
+	Hooks hooks;
+	hooks.finalizeFunction = fp.lifecycle.finalizeFunction!T();
+	static if (hasRemapEntities!T) hooks.remapFunction = &remapThunk!T;
+	return hooks;
 }
 
-template hooksFor(T) {
-	ComponentHooks hooksFor() @nogc nothrow {
-		ComponentHooks hooks;
-		static if (hasFinalize!T) hooks.finalize = &finalizeThunk!T;
-		static if (hasRemapEntities!T) hooks.remap = &remapThunk!T;
-		return hooks;
-	}
-}
 
-
-/// The name is stored as the first field so the custom hash/equal functions
-/// below (which only look at the key) can reinterpret the raw entry bytes.
+// The name comes first, so the hash and equality functions, which see only the key, can read it from the raw entry bytes.
 private struct ForwardEntry {
-	char* name; // owning: allocated once by registerType, never freed
+	char* name; // owning: freed when the entry is removed or the table freed
 	size_t id;
 }
 private struct ReverseEntry {
 	size_t id;
-	char* name; // non-owning: aliases the same buffer as the matching ForwardEntry
+	char* name; // the matching ForwardEntry's buffer
 }
 private struct SizeEntry {
 	size_t id;
@@ -95,97 +81,112 @@ private struct SizeEntry {
 
 private size_t nameHash(inout(ubyte)[] data) @trusted {
 	auto e = cast(const(ForwardEntry)*) data.ptr;
-	return fnv1aHash(stringSlice(cast(char*) e.name));
+	return fp.fnv1a.hash(fp.string.slice(cast(char*) e.name));
 }
 private bool nameEqual(inout(ubyte)[] a, inout(ubyte)[] b) @trusted {
 	auto ea = cast(const(ForwardEntry)*) a.ptr;
 	auto eb = cast(const(ForwardEntry)*) b.ptr;
-	return stringEqual(cast(char*) ea.name, cast(char*) eb.name);
+	return fp.string.equal(cast(char*) ea.name, cast(char*) eb.name);
 }
 
 private size_t idHash(inout(ubyte)[] data) @trusted {
-	return fnv1aHash(data[0 .. size_t.sizeof]);
+	return fp.fnv1a.hash(data[0 .. size_t.sizeof]);
 }
 private bool idEqual(inout(ubyte)[] a, inout(ubyte)[] b) @trusted {
 	return a[0 .. size_t.sizeof] == b[0 .. size_t.sizeof];
 }
 
+private void finalizeForwardEntry(inout(ubyte)[] data) @trusted {
+	auto e = cast(ForwardEntry*) data.ptr;
+	if (e.name !is null) fp.string.free(e.name);
+}
 
-private shared size_t globalComponentId = 0;
-// A spinlock rather than `bc.mutex`: that one is heap-allocated by `create`,
-// which would itself need a race-free lazy initialization, and registration
-// is rare and brief enough that spinning costs nothing.
-private __gshared SpinLock registryLock;
+
+private shared size_t idCounter = 0;
+// Bumped by `free` so every id `componentId` cached is registered afresh; starting at 1 means a fresh cache never matches.
+private shared size_t epoch = 1;
+// A spinlock rather than `bc.mutex`, which `create` allocates and so would itself need a race-free lazy initialization.
+private __gshared bc.spinlock.SpinLock registryLock;
+// fp.hashtable's inserts may reallocate a table, so these globals, never local copies, must be what every insert is handed.
 private __gshared ForwardEntry* forwardMap = null;
 private __gshared ReverseEntry* reverseMap = null;
 private __gshared SizeEntry* sizeMap = null;
-private __gshared ComponentHooks* hooksTable = null; // dynarray indexed by component id
+private __gshared Hooks* hooksTable = null; // dynarray indexed by component id
 
-/// Frees the name buffer an occupied `ForwardEntry` owns - the callback
-/// `fp.hashtable.free` invokes per live entry before releasing the table.
-private void finalizeForwardEntry(inout(ubyte)[] data) @trusted {
-	auto e = cast(ForwardEntry*) data.ptr;
-	if (e.name !is null) dynFreeChar(e.name);
-}
-
-// NOTE: lazily initialized on first registration, mirroring the C++
-// magic-static pattern; callers hold the registry lock exclusively. Lookups,
-// which only read, treat a table that does not exist yet as empty.
-//
-// These operate on the __gshared globals *by reference*, on purpose:
-// fp.hashtable's insert functions take `ref T* table` and may reallocate
-// and reassign it on growth, so the global itself (not a local copy of it)
-// must be passed through every insert/ensure call or the module would be
-// left holding a dangling pointer after the first table growth.
-private void ensureForwardMap() @trusted {
+// Lookups treat a table that does not exist yet as empty, so the tables are created on first registration.
+private bool ensureTables() @trusted {
 	if (forwardMap is null) {
-		Config config = Config(&nameHash, &nameEqual);
+		fp.hashtable.Config config = fp.hashtable.Config(&nameHash, &nameEqual);
 		config.finalizeFunction = &finalizeForwardEntry;
 		forwardMap = fp.hashtable.create!ForwardEntry(config);
 	}
-}
-private void ensureReverseMap() @trusted {
 	if (reverseMap is null)
-		reverseMap = fp.hashtable.create!ReverseEntry(Config(&idHash, &idEqual));
-}
-private void ensureSizeMap() @trusted {
+		reverseMap = fp.hashtable.create!ReverseEntry(fp.hashtable.Config(&idHash, &idEqual));
 	if (sizeMap is null)
-		sizeMap = fp.hashtable.create!SizeEntry(Config(&idHash, &idEqual));
+		sizeMap = fp.hashtable.create!SizeEntry(fp.hashtable.Config(&idHash, &idEqual));
+	return forwardMap !is null && reverseMap !is null && sizeMap !is null;
 }
 
-size_t nextComponentId() {
-	return atomicOp!"+="(globalComponentId, 1) - 1;
+private bool reserveHooks(size_t componentId) @trusted {
+	immutable oldLength = fp.dynarray.length(hooksTable);
+	if (oldLength > componentId) return true;
+	if (fp.dynarray.growToSize(hooksTable, componentId + 1) is null) return false;
+	foreach (i; oldLength .. componentId + 1) hooksTable[i] = Hooks.init;
+	return true;
 }
 
-/// Registers `name` under `componentId`. A name may be registered once; a
-/// second registration is a collision and fails an assert.
-size_t registerType(const(char)[] name, size_t componentId, size_t typeSize, ComponentHooks hooks = ComponentHooks.init) @trusted {
-	writeLock(registryLock);
-	scope(exit) writeUnlock(registryLock);
-	return registerTypeLocked(name, componentId, typeSize, hooks);
+
+/// Reserves a fresh component id for `registerType`. Ids are handed out in order from 0, and `free` starts them again.
+///
+/// Examples:
+/// ---
+/// immutable a = nextId();
+/// assert(nextId() == a + 1);
+/// ---
+size_t nextId() {
+	return atomicOp!"+="(idCounter, 1) - 1;
 }
 
-private size_t registerTypeLocked(const(char)[] name, size_t componentId, size_t typeSize, ComponentHooks hooks) @trusted {
-	char* owned = makeDynamicSlice(name);
+private size_t registerTypeLocked(const(char)[] name, size_t componentId, size_t typeSize, Hooks hooks) @trusted {
+	assert(name.length > 0);
+	if (!ensureTables() || !reserveHooks(componentId)) return fp.pointer.notFound;
+	char* owned = fp.string.makeDynamic(name);
+	if (owned is null) return fp.pointer.notFound;
 
-	ensureForwardMap();
 	assert(fp.hashtable.find(forwardMap, ForwardEntry(owned, 0)) is null, "ecrs: component name registered twice");
-	fp.hashtable.insertAssumeUnique(forwardMap, ForwardEntry(owned, componentId));
-
-	ensureReverseMap();
-	fp.hashtable.insertAssumeUnique(reverseMap, ReverseEntry(componentId, owned));
-
-	ensureSizeMap();
-	fp.hashtable.insertAssumeUnique(sizeMap, SizeEntry(componentId, typeSize));
-
-	immutable oldLength = dynLength(hooksTable);
-	if (oldLength <= componentId) {
-		growToSize(hooksTable, componentId + 1);
-		foreach (i; oldLength .. componentId + 1) hooksTable[i] = ComponentHooks.init;
+	if (fp.hashtable.insertAssumeUnique(forwardMap, ForwardEntry(owned, componentId)) is null) {
+		fp.string.free(owned);
+		return fp.pointer.notFound;
+	}
+	// From here on, removing the forward entry frees `owned` too.
+	if (fp.hashtable.insertAssumeUnique(reverseMap, ReverseEntry(componentId, owned)) is null) {
+		fp.hashtable.remove(forwardMap, ForwardEntry(owned, 0));
+		return fp.pointer.notFound;
+	}
+	if (fp.hashtable.insertAssumeUnique(sizeMap, SizeEntry(componentId, typeSize)) is null) {
+		fp.hashtable.remove(reverseMap, ReverseEntry(componentId, null));
+		fp.hashtable.remove(forwardMap, ForwardEntry(owned, 0));
+		return fp.pointer.notFound;
 	}
 	hooksTable[componentId] = hooks;
-
 	return componentId;
+}
+
+/// Registers the non-empty `name` under `componentId`, usually from `nextId`, as a component of `typeSize` bytes with `hooks`. A name may be registered once; registering it again fails an assert.
+///
+/// Returns `componentId`, or `fp.pointer.notFound` if allocation fails, leaving every lookup as it was.
+///
+/// Examples:
+/// ---
+/// immutable id = registerType("RegisterTypeExample", nextId(), 8);
+/// assert(id != fp.pointer.notFound);
+/// assert(lookupId("RegisterTypeExample") == id);
+/// assert(lookupSize(id) == 8);
+/// ---
+size_t registerType(const(char)[] name, size_t componentId, size_t typeSize, Hooks hooks = Hooks.init) @trusted {
+	bc.spinlock.writeLock(registryLock);
+	scope(exit) bc.spinlock.writeUnlock(registryLock);
+	return registerTypeLocked(name, componentId, typeSize, hooks);
 }
 
 private template decimal(size_t v) {
@@ -193,146 +194,255 @@ private template decimal(size_t v) {
 	else enum decimal = decimal!(v / 10) ~ decimal!(v % 10);
 }
 
-/// The registered name of component `(T, Unique)`: `T`'s fully qualified
-/// name, so two modules' `Flags` stay distinct, with `#Unique` appended for
-/// every `Unique` but 0. Stands in for the C++ version's
-/// `abi::__cxa_demangle`; D exposes it at compile time, no RTTI needed:
-/// the builtin trait, not `std.traits.fullyQualifiedName`, which does not
-/// build under `-betterC`.
-template componentName(T, size_t Unique = 0) {
-	static if (Unique == 0) enum componentName = __traits(fullyQualifiedName, T);
-	else enum componentName = __traits(fullyQualifiedName, T) ~ "#" ~ decimal!Unique;
+/// The registered name of component `(T, unique)`: `T`'s fully qualified name, so two modules' `Flags` stay distinct, with `#unique` appended for every `unique` but 0. It uses the builtin trait because `std.traits.fullyQualifiedName` does not build under `-betterC`.
+///
+/// Examples:
+/// ---
+/// static assert(componentName!int == "int");
+/// static assert(componentName!(int, 12) == "int#12");
+/// ---
+template componentName(T, size_t unique = 0) {
+	static if (unique == 0) enum componentName = __traits(fullyQualifiedName, T);
+	else enum componentName = __traits(fullyQualifiedName, T) ~ "#" ~ decimal!unique;
 }
 
-template componentId(T, size_t Unique = 0) {
-	size_t componentId() @trusted {
-		static shared size_t id = notFound;
-		immutable cached = atomicLoad!(MemoryOrder.acq)(id);
-		if (cached != notFound) return cached;
-
-		writeLock(registryLock);
-		scope(exit) writeUnlock(registryLock);
-		if (atomicLoad!(MemoryOrder.raw)(id) == notFound)
-			atomicStore!(MemoryOrder.rel)(id, registerTypeLocked(componentName!(T, Unique), nextComponentId(), T.sizeof, hooksFor!T()));
+/// The id of component `(T, unique)`, registering it under `componentName!(T, unique)` with `T`'s size and hooks on first use. A nonzero `unique` registers the same type as another, distinct component.
+///
+/// Returns `fp.pointer.notFound` if registration fails; the next call tries again.
+///
+/// Examples:
+/// ---
+/// static struct Position { float x, y; }
+/// immutable id = componentId!Position();
+/// assert(id != fp.pointer.notFound);
+/// assert(componentId!Position() == id);
+/// assert(componentId!(Position, 1)() != id);
+/// ---
+size_t componentId(T, size_t unique = 0)() @trusted {
+	static shared size_t id = fp.pointer.notFound;
+	static shared size_t cachedEpoch = 0;
+	if (atomicLoad!(MemoryOrder.acq)(cachedEpoch) == atomicLoad!(MemoryOrder.acq)(epoch))
 		return atomicLoad!(MemoryOrder.raw)(id);
+
+	bc.spinlock.writeLock(registryLock);
+	scope(exit) bc.spinlock.writeUnlock(registryLock);
+	immutable current = atomicLoad!(MemoryOrder.raw)(epoch);
+	if (atomicLoad!(MemoryOrder.raw)(cachedEpoch) != current) {
+		immutable registered = registerTypeLocked(componentName!(T, unique), nextId(), T.sizeof, hooksFor!T());
+		if (registered == fp.pointer.notFound) return fp.pointer.notFound;
+		atomicStore!(MemoryOrder.raw)(id, registered);
+		atomicStore!(MemoryOrder.rel)(cachedEpoch, current);
 	}
+	return atomicLoad!(MemoryOrder.raw)(id);
 }
 
-template registerComponents(Ts...) {
-	void registerComponents() {
-		static foreach (T; Ts)
-			cast(void) componentId!T();
-	}
+/// Registers each of `Ts`, as `componentId` would on first use. Returns false if any registration fails; the rest are still attempted.
+///
+/// Examples:
+/// ---
+/// static struct Health { int points; }
+/// assert(register!(Health, float)());
+/// assert(lookupId(componentName!Health.ptr) == componentId!Health());
+/// ---
+bool register(Ts...)() {
+	bool registered = true;
+	static foreach (T; Ts)
+		registered &= componentId!T() != fp.pointer.notFound;
+	return registered;
 }
 
-size_t lookupComponentId(const(char)* name) @trusted {
-	readLock(registryLock);
-	scope(exit) readUnlock(registryLock);
-	if (forwardMap is null) return notFound;
+
+/// The id registered under `name`, or `fp.pointer.notFound` if there is none.
+///
+/// Examples:
+/// ---
+/// immutable id = componentId!long();
+/// assert(lookupId("long") == id);
+/// assert(lookupId("LookupComponentIdMissing") == fp.pointer.notFound);
+/// ---
+size_t lookupId(const(char)* name) @trusted {
+	bc.spinlock.readLock(registryLock);
+	scope(exit) bc.spinlock.readUnlock(registryLock);
+	if (forwardMap is null) return fp.pointer.notFound;
 	auto found = fp.hashtable.find(forwardMap, ForwardEntry(cast(char*) name, 0));
-	return found is null ? notFound : found.id;
+	return found is null ? fp.pointer.notFound : found.id;
 }
 
-size_t lookupComponentSize(size_t componentId) @trusted {
-	readLock(registryLock);
-	scope(exit) readUnlock(registryLock);
-	if (sizeMap is null) return notFound;
+/// The size in bytes registered for `componentId`, or `fp.pointer.notFound` for an unknown id.
+///
+/// Examples:
+/// ---
+/// assert(lookupSize(componentId!short()) == short.sizeof);
+/// assert(lookupSize(fp.pointer.notFound) == fp.pointer.notFound);
+/// ---
+size_t lookupSize(size_t componentId) @trusted {
+	bc.spinlock.readLock(registryLock);
+	scope(exit) bc.spinlock.readUnlock(registryLock);
+	if (sizeMap is null) return fp.pointer.notFound;
 	auto found = fp.hashtable.find(sizeMap, SizeEntry(componentId, 0));
-	return found is null ? notFound : found.size;
+	return found is null ? fp.pointer.notFound : found.size;
 }
 
-/// `ComponentHooks.init` (no hooks) for an unknown id.
-ComponentHooks lookupComponentHooks(size_t componentId) @trusted {
-	readLock(registryLock);
-	scope(exit) readUnlock(registryLock);
-	return componentId < dynLength(hooksTable) ? hooksTable[componentId] : ComponentHooks.init;
+/// The hooks registered for `componentId`, or `Hooks.init`, no hooks, for an unknown id.
+///
+/// Examples:
+/// ---
+/// assert(lookupHooks(componentId!ubyte()) == Hooks.init);
+/// assert(lookupHooks(fp.pointer.notFound) == Hooks.init);
+/// ---
+Hooks lookupHooks(size_t componentId) @trusted {
+	bc.spinlock.readLock(registryLock);
+	scope(exit) bc.spinlock.readUnlock(registryLock);
+	return componentId < fp.dynarray.length(hooksTable) ? hooksTable[componentId] : Hooks.init;
 }
 
-/// The returned name lives until `freeRegistry`.
-const(char)* lookupComponentName(size_t componentId) @trusted {
-	readLock(registryLock);
-	scope(exit) readUnlock(registryLock);
+/// The name registered for `componentId`, which lives until `free`, or null for an unknown id.
+///
+/// Examples:
+/// ---
+/// assert(fp.string.equal(lookupName(componentId!byte()), "byte"));
+/// assert(lookupName(fp.pointer.notFound) is null);
+/// ---
+const(char)* lookupName(size_t componentId) @trusted {
+	bc.spinlock.readLock(registryLock);
+	scope(exit) bc.spinlock.readUnlock(registryLock);
 	if (reverseMap is null) return null;
 	auto found = fp.hashtable.find(reverseMap, ReverseEntry(componentId, null));
 	return found is null ? null : found.name;
 }
 
-/// Frees every table and cloned name owned by the registry and resets it to
-/// its just-loaded state (as if no type had ever been registered).
+
+/// Frees every table and name the registry owns and resets it as though no type had registered, so a leak checker run at exit sees nothing outstanding. Every id handed out before is forgotten: `componentId` registers its type afresh on next use, so free every `Context` first, since their storages are indexed by the old ids. It is not safe to call while another thread uses the registry.
 ///
-/// NOTE: `componentId!T()` caches each type's id in its own `__gshared`
-/// outside these tables, so previously-obtained ids are left dangling by
-/// this reset - it's meant for end-of-process cleanup (e.g. so a leak
-/// checker sees nothing outstanding), not for reuse while old ids are still
-/// in play. Nor is it safe to call while another thread uses the registry.
-void freeRegistry() @trusted {
-	writeLock(registryLock);
-	scope(exit) writeUnlock(registryLock);
-	fp.hashtable.free(forwardMap); // also frees each entry's cloned name (finalizeForwardEntry)
-	fp.hashtable.free(reverseMap); // names here just alias the forwardMap ones - nothing to own
+/// Examples:
+/// ---
+/// immutable before = componentId!dchar();
+/// free();
+/// assert(lookupSize(before) == fp.pointer.notFound);
+/// assert(componentId!dchar() == 0);
+/// ---
+void free() @trusted {
+	bc.spinlock.writeLock(registryLock);
+	scope(exit) bc.spinlock.writeUnlock(registryLock);
+	fp.hashtable.free(forwardMap); // frees the names, which reverseMap only aliases
+	fp.hashtable.free(reverseMap);
 	fp.hashtable.free(sizeMap);
-	dynFreeChar(hooksTable);
-	atomicStore(globalComponentId, 0);
+	fp.dynarray.free(hooksTable);
+	atomicStore(idCounter, 0);
+	atomicOp!"+="(epoch, 1);
 }
 
 
+version(unittest) {
+	private struct Twin { int x; }
+
+	private fp.pointer.AllocFunction underlyingAlloc = null;
+	private size_t allocationsLeft;
+
+	private void* failingAlloc(void* p, size_t size) {
+		if (size != 0) {
+			if (allocationsLeft == 0) return null;
+			--allocationsLeft;
+		}
+		return underlyingAlloc(p, size);
+	}
+
+	// Makes the calling thread's libfp allocations fail once `n` more have succeeded, until `restoreAllocations`; freeing still works.
+	package void failAllocationsAfter(size_t n) @trusted {
+		if (underlyingAlloc is null) {
+			underlyingAlloc = fp.pointer.allocFunction;
+			fp.pointer.allocFunction = &failingAlloc;
+		}
+		allocationsLeft = n;
+	}
+
+	// Undoes `failAllocationsAfter`.
+	package void restoreAllocations() @trusted {
+		if (underlyingAlloc is null) return;
+		fp.pointer.allocFunction = underlyingAlloc;
+		underlyingAlloc = null;
+	}
+}
+
 unittest {
+	// componentId records each type's hooks; plain data gets none.
+	static struct Owns {
+		int* p;
+		void finalize() @nogc nothrow { p = null; }
+	}
+	static struct Refers {
+		EntityId target;
+		static void remapEntities(ref Refers self, const(EntityId)[] remap) @nogc nothrow {
+			if (self.target < remap.length) self.target = remap[self.target];
+		}
+	}
+	static struct Plain { int x; }
+
+	immutable owns = lookupHooks(componentId!Owns());
+	assert(owns.finalizeFunction !is null && owns.remapFunction is null);
+	Owns o = Owns(cast(int*) 1);
+	owns.finalizeFunction(cast(inout(ubyte)[]) (cast(ubyte*) &o)[0 .. Owns.sizeof]);
+	assert(o.p is null);
+
+	immutable refers = lookupHooks(componentId!Refers());
+	assert(refers.finalizeFunction is null && refers.remapFunction !is null);
+	Refers r = Refers(1);
+	immutable EntityId[2] remap = [0, 5];
+	refers.remapFunction(&r, remap[]);
+	assert(r.target == 5);
+
+	immutable plain = lookupHooks(componentId!Plain());
+	assert(plain.finalizeFunction is null && plain.remapFunction is null);
+
+	assert(lookupHooks(fp.pointer.notFound) == Hooks.init);
+}
+
+unittest {
+	// Registration and lookup by name, size and id.
 	struct Foo { int x; }
 	struct Bar { float y; }
 
-	registerComponents!(Foo, Bar, int)();
+	assert(register!(Foo, Bar, int)());
 
 	immutable fooId = componentId!Foo();
 	immutable barId = componentId!Bar();
 	immutable intId = componentId!int();
 	assert(fooId != barId);
 	assert(barId != intId);
-
-	// Repeated calls for the same type must be stable.
 	assert(componentId!Foo() == fooId);
 
-	assert(lookupComponentId(componentName!Foo.ptr) == fooId);
-	assert(lookupComponentId(componentName!Bar.ptr) == barId);
-	assert(lookupComponentId("int") == intId);
-	assert(lookupComponentId("nonexistent") == notFound);
+	assert(lookupId(componentName!Foo.ptr) == fooId);
+	assert(lookupId(componentName!Bar.ptr) == barId);
+	assert(lookupId("int") == intId);
+	assert(lookupId("nonexistent") == fp.pointer.notFound);
 
-	assert(lookupComponentSize(fooId) == Foo.sizeof);
-	assert(lookupComponentSize(barId) == Bar.sizeof);
-	assert(lookupComponentSize(notFound) == notFound);
+	assert(lookupSize(fooId) == Foo.sizeof);
+	assert(lookupSize(barId) == Bar.sizeof);
+	assert(lookupSize(fp.pointer.notFound) == fp.pointer.notFound);
 
-	assert(stringEqual(cast(char*) lookupComponentName(fooId), cast(char*) componentName!Foo.ptr));
+	assert(fp.string.equal(cast(char*) lookupName(fooId), cast(char*) componentName!Foo.ptr));
 
-	// Unique lets the same type be registered as multiple distinct components,
-	// each under a name of its own.
 	immutable fooId2 = componentId!(Foo, 1)();
 	assert(fooId2 != fooId);
-	assert(lookupComponentId((componentName!Foo ~ "#1").ptr) == fooId2);
+	assert(lookupId((componentName!Foo ~ "#1").ptr) == fooId2);
 	static assert(componentName!(Foo, 12) == componentName!Foo ~ "#12");
-}
 
-private struct Twin { int x; }
-
-unittest {
-	// Names are fully qualified, so two types sharing a short name register as
-	// two components. Under `T.stringof` both were "Twin".
+	// Names are fully qualified, so two types sharing a short name register as two components.
 	struct Twin { long y; }
 	alias Outer = .Twin;
 	static assert(componentName!Outer == "ecrs.registry.Twin");
 	static assert(componentName!Twin != componentName!Outer);
-
 	immutable outer = componentId!Outer();
 	immutable inner = componentId!Twin();
 	assert(outer != inner);
-	assert(lookupComponentId(componentName!Outer.ptr) == outer);
-	assert(lookupComponentId(componentName!Twin.ptr) == inner);
-	assert(lookupComponentSize(inner) == long.sizeof);
+	assert(lookupId(componentName!Outer.ptr) == outer);
+	assert(lookupId(componentName!Twin.ptr) == inner);
+	assert(lookupSize(inner) == long.sizeof);
 }
 
 unittest {
-	// Racing first uses of one type agree on a single id, and racing first
-	// uses of distinct types get distinct ones.
-	import bc.threadpool : create, free, run, Job;
-
+	// Racing first uses of one type agree on a single id, and racing first uses of distinct types get distinct ones.
+	static import bc.threadpool;
 	static struct Racer { int x; }
 	static struct Result { size_t same, distinct; }
 	static size_t distinctId(size_t i)() @nogc nothrow {
@@ -345,15 +455,16 @@ unittest {
 	}
 	enum jobs = 16;
 
-	auto pool = create(8);
-	scope(exit) free(pool);
+	auto pool = bc.threadpool.create(8);
+	assert(pool !is null);
+	scope(exit) bc.threadpool.free(pool);
 	Result[jobs] results;
-	Job[jobs] work;
-	foreach (i; 0 .. jobs) work[i] = Job(&race, &results[i]);
-	run(pool, work[]);
+	bc.threadpool.Job[jobs] work;
+	foreach (i; 0 .. jobs) work[i] = bc.threadpool.Job(&race, &results[i]);
+	assert(bc.threadpool.run(pool, work[]));
 	foreach (ref r; results)
 		assert(r.same == results[0].same);
-	assert(lookupComponentId(componentName!Racer.ptr) == results[0].same);
+	assert(lookupId(componentName!Racer.ptr) == results[0].same);
 
 	static void raceDistinct(void* arg) @nogc nothrow {
 		auto r = cast(Result*) arg;
@@ -362,65 +473,74 @@ unittest {
 	}
 	foreach (i; 0 .. jobs) {
 		results[i].distinct = i;
-		work[i] = Job(&raceDistinct, &results[i]);
+		work[i] = bc.threadpool.Job(&raceDistinct, &results[i]);
 	}
-	run(pool, work[]);
+	assert(bc.threadpool.run(pool, work[]));
 	foreach (i; 0 .. jobs)
 		foreach (j; i + 1 .. jobs)
 			assert(results[i].distinct != results[j].distinct);
 }
 
 unittest {
-	// componentId!T records T's hooks; plain data gets none.
-	struct Owns {
-		int* p;
-		static void finalize(ref Owns) @nogc nothrow {}
-	}
-	struct Refers {
-		EntityId target;
-		static void remapEntities(ref Refers self, const(EntityId)[] remap) @nogc nothrow {
-			if (self.target < remap.length) self.target = remap[self.target];
-		}
-	}
-	struct Plain { int x; }
+	// free tears every table down and restarts ids, and cached ids register afresh.
+	static struct Cached { int x; }
+	immutable cached = componentId!Cached();
+	immutable id = registerType("FreeRegistryTest", nextId(), 8);
+	assert(lookupId("FreeRegistryTest") == id);
+	assert(lookupSize(id) == 8);
 
-	immutable owns = lookupComponentHooks(componentId!Owns());
-	assert(owns.finalize !is null && owns.remap is null);
+	free();
 
-	immutable refers = lookupComponentHooks(componentId!Refers());
-	assert(refers.finalize is null && refers.remap !is null);
-	Refers r = Refers(1);
-	immutable EntityId[2] remap = [0, 5];
-	refers.remap(&r, remap[]);
-	assert(r.target == 5);
+	assert(lookupId("FreeRegistryTest") == fp.pointer.notFound);
+	assert(lookupSize(id) == fp.pointer.notFound);
+	assert(lookupName(id) is null);
+	assert(lookupName(cached) is null);
 
-	immutable plain = lookupComponentHooks(componentId!Plain());
-	assert(plain.finalize is null && plain.remap is null);
-
-	assert(lookupComponentHooks(notFound) == ComponentHooks.init);
-}
-
-unittest {
-	// freeRegistry() tears every table down and resets id assignment - drive
-	// it through registerType()/lookup*() directly (rather than
-	// componentId!T()) so this doesn't leave other unittests' cached
-	// componentId!T() ids dangling.
-	immutable id = registerType("FreeRegistryTest", nextComponentId(), 8);
-	assert(lookupComponentId("FreeRegistryTest") == id);
-	assert(lookupComponentSize(id) == 8);
-	assert(stringEqual(cast(char*) lookupComponentName(id), cast(char*) "FreeRegistryTest".ptr));
-
-	freeRegistry();
-
-	assert(lookupComponentId("FreeRegistryTest") == notFound);
-	assert(lookupComponentSize(id) == notFound);
-	assert(lookupComponentName(id) is null);
-
-	// The registry must still be usable afterwards, starting fresh from id 0.
-	immutable id2 = registerType("FreeRegistryTest", nextComponentId(), 4);
+	immutable id2 = registerType("FreeRegistryTest", nextId(), 4);
 	assert(id2 == 0);
-	assert(lookupComponentId("FreeRegistryTest") == id2);
-	assert(lookupComponentSize(id2) == 4);
+	assert(lookupId("FreeRegistryTest") == id2);
+	assert(lookupSize(id2) == 4);
+	immutable recached = componentId!Cached();
+	assert(recached == 1);
+	assert(lookupId(componentName!Cached.ptr) == recached);
 
-	freeRegistry();
+	// With the tables gone, every allocation registration makes can fail; each failure leaves no trace.
+	free();
+	static struct Fragile { int x; }
+	bool registered = false;
+	foreach (n; 0 .. 64) {
+		failAllocationsAfter(n);
+		immutable fragile = componentId!Fragile();
+		restoreAllocations();
+		if (fragile == fp.pointer.notFound) {
+			assert(lookupId(componentName!Fragile.ptr) == fp.pointer.notFound);
+			continue;
+		}
+		assert(lookupId(componentName!Fragile.ptr) == fragile);
+		assert(lookupSize(fragile) == Fragile.sizeof);
+		registered = true;
+		break;
+	}
+	assert(registered);
+
+	// Registering enough names grows the tables, so the sweep also fails each insert in turn, which must roll back the earlier ones.
+	static foreach (k; 0 .. 32) {{
+		enum name = "Fragile" ~ decimal!k;
+		bool grown = false;
+		foreach (n; 0 .. 64) {
+			failAllocationsAfter(n);
+			immutable grownId = registerType(name, nextId(), 4);
+			restoreAllocations();
+			if (grownId == fp.pointer.notFound) {
+				assert(lookupId(name.ptr) == fp.pointer.notFound);
+				continue;
+			}
+			assert(lookupId(name.ptr) == grownId && lookupSize(grownId) == 4);
+			assert(fp.string.equal(lookupName(grownId), name));
+			grown = true;
+			break;
+		}
+		assert(grown);
+	}}
+	free();
 }

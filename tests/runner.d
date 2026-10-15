@@ -1,67 +1,47 @@
-/**
-* `-betterC` has no built-in unittest runner, so this walks every module's
-* tests with `__traits(getUnitTests)` and calls them.
-*
-* Progress goes to `stderr`, which is unbuffered, so a test that hangs or
-* aborts still leaves a record of how far the run got.
-*/
+/// Runs every module's unittests, which `-betterC` has no built-in runner for, by walking them with `__traits(getUnitTests)`. Progress goes to the unbuffered `stderr`, so a test that hangs or aborts still shows how far the run got.
 module runner;
 
 import core.stdc.stdio : fprintf, printf, stderr;
 
-/*
-* `ecrs.package` is only public imports, so it has no tests of its own and
-* is left out; naming it here would run nothing and report a module with
-* zero tests.
-*/
+// `ecrs.package` only re-exports, so it has no tests of its own.
 private enum modules = [
-    "ecrs.registry",
-    "ecrs.storage",
-    "ecrs.context",
-    "ecrs.relation",
-    "ecrs.system",
+	"ecrs.registry",
+	"ecrs.storage",
+	"ecrs.relation",
+	"ecrs.context",
+	"ecrs.system",
 ];
 
 private int runEveryTest() {
-    size_t total = 0;
+	size_t total = 0;
 
-    static foreach (name; modules) {{
-        alias mod = mixin("imported!\"" ~ name ~ "\"");
-        alias tests = __traits(getUnitTests, mod);
-        fprintf(stderr, "%s (%d tests)\n", name.ptr, cast(int) tests.length);
-        static foreach (i, test; tests) {
-            fprintf(stderr, "  [%d] ", cast(int) i);
-            test();
-            fprintf(stderr, "ok\n");
-            ++total;
-        }
-    }}
+	static foreach (name; modules) {{
+		alias mod = mixin("imported!\"" ~ name ~ "\"");
+		alias tests = __traits(getUnitTests, mod);
+		cast(void) fprintf(stderr, "%s (%d tests)\n", name.ptr, cast(int) tests.length);
+		static foreach (i, test; tests) {
+			cast(void) fprintf(stderr, "  [%d] ", cast(int) i);
+			test();
+			cast(void) fprintf(stderr, "ok\n");
+			++total;
+		}
+	}}
 
-    // Releases the registry's process-lifetime tables, so a leak checker run
-    // over the tests sees nothing outstanding.
-    imported!"ecrs.registry".freeRegistry();
+	// Releases the registry's process-lifetime tables, so a leak checker sees nothing outstanding.
+	imported!"ecrs.registry".free();
 
-    printf("libecrs: all %d tests passed.\n", cast(int) total);
-    return 0;
+	cast(void) printf("libecrs: all %d tests passed.\n", cast(int) total);
+	return 0;
 }
 
-/**
-* `tools/coverage.sh` builds this as ordinary D rather than `-betterC`,
-* because `-cov` registers its counters through druntime. That build needs
-* druntime's own `main` so the registration actually runs.
-*/
+// `tools/coverage.py` builds this as ordinary D, since `-cov` registers its counters through druntime, which needs druntime's own `main`.
 version(EcrsCoverage) {
-    /*
-    * druntime would otherwise run every `unittest` itself on the way to
-    * `main`, and `runEveryTest` then runs the same tests a second time.
-    * Replacing the tester with one that runs nothing (but still asks for
-    * `main`) leaves this build doing exactly what the `-betterC` one does.
-    */
-    shared static this() {
-        import core.runtime : Runtime, UnitTestResult;
-        Runtime.extendedModuleUnitTester = () => UnitTestResult(0, 0, true, false);
-    }
+	// Stops druntime running every unittest itself before `main` runs them again.
+	shared static this() {
+		import core.runtime : Runtime, UnitTestResult;
+		Runtime.extendedModuleUnitTester = () => UnitTestResult(0, 0, true, false);
+	}
 
-    int main() { return runEveryTest(); }
+	int main() { return runEveryTest(); }
 } else
-    extern(C) int main() { return runEveryTest(); }
+	extern(C) int main() { return runEveryTest(); }

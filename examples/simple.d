@@ -1,38 +1,43 @@
-/// D port of hello.cpp - a minimal smoke test exercising the public API:
-/// component registration, entity/component CRUD, and the entities() range.
+/// A minimal tour of the public API: component registration, entities and components, and iterating entities.
 module examples.simple;
 
 import core.stdc.stdio : printf;
-import ecrs;
+static import ecrs.context;
+static import ecrs.registry;
+static import ecrs.storage;
 
 struct Vec2 { float x, y; }
 
-extern (C) void main() {
-	registerComponents!(Vec2, int, float)();
-	scope(exit) freeRegistry();
+extern(C) int main() {
+	if (!ecrs.registry.register!(Vec2, int, float)()) return 1;
+	scope(exit) ecrs.registry.free();
 
-	printf("int component id: %zu\n", lookupComponentId("int"));
-	printf("int component size: %zu\n", lookupComponentSize(componentId!int()));
+	cast(void) printf("int component id: %zu\n", ecrs.registry.lookupId("int"));
+	cast(void) printf("int component size: %zu\n", ecrs.registry.lookupSize(ecrs.registry.componentId!int()));
 
 	auto ctx = ecrs.context.create();
 	scope(exit) ecrs.context.free(ctx);
 
-	EntityId e1 = ctx.addEntity();
-	ctx.addComponent!Vec2(e1) = Vec2(1, 2);
-	EntityId e2 = ctx.addEntity();
-	ctx.addComponent!Vec2(e2) = Vec2(3, 4);
-	EntityId e3 = ctx.addEntity();
-	ctx.addComponent!Vec2(e3) = Vec2(5, 6);
+	// Each step can fail only by running out of memory, which a real program would handle.
+	immutable Vec2[3] positions = [Vec2(1, 2), Vec2(3, 4), Vec2(5, 6)];
+	ecrs.registry.EntityId[3] entities;
+	foreach (i, position; positions) {
+		entities[i] = ecrs.context.addEntity(ctx);
+		if (entities[i] == ecrs.registry.invalidEntity) return 1;
+		auto component = ecrs.context.addComponent!Vec2(ctx, entities[i]);
+		if (component is null) return 1;
+		*component = position;
+	}
+	if (!ecrs.context.removeEntity(ctx, entities[1])) return 1;
 
-	ctx.removeEntity(e2);
-
-	foreach (e; ctx.entities()) {
-		if (!ctx.hasComponent!Vec2(e)) continue; // skips the reserved invalid entity 0
-		auto comp = ctx.getComponent!Vec2(e);
-		printf("%u: %f, %f\n", cast(uint) e, cast(double) comp.x, cast(double) comp.y);
+	foreach (e; ecrs.context.entities(ctx)) {
+		if (!ecrs.context.hasComponent!Vec2(ctx, e)) continue; // the reserved entity 0 has none
+		auto component = ecrs.context.getComponent!Vec2(ctx, e);
+		cast(void) printf("%u: %f, %f\n", cast(uint) e, cast(double) component.x, cast(double) component.y);
 	}
 
 	// The same entities, read from the storage's owner list instead.
-	foreach (e; ctx.getStorage!Vec2().owners())
-		if (e != invalidEntity) printf("owns a Vec2: %u\n", cast(uint) e);
+	foreach (e; ecrs.storage.owners(*ecrs.context.getStorage!Vec2(ctx)))
+		if (e != ecrs.registry.invalidEntity) cast(void) printf("owns a Vec2: %u\n", cast(uint) e);
+	return 0;
 }
