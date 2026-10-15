@@ -234,6 +234,20 @@ template getStorage(T, size_t unique = 0) {
 	}
 }
 
+/// One past the highest component id `self` has room for, so `getStorage` over `0 .. storageCount` visits every storage it has.
+///
+/// Examples:
+/// ---
+/// Context ctx = create();
+/// scope(exit) free(ctx);
+/// immutable id = ecrs.registry.componentId!int();
+/// assert(getStorage(ctx, id, int.sizeof) !is null);
+/// assert(storageCount(ctx) > id);
+/// ---
+size_t storageCount(const ref Context self) @trusted {
+	return fp.dynarray.length(self.storages);
+}
+
 /// `ecrs.storage.generation` of component `componentId`'s storage, or 0 if no entity has had the component.
 ///
 /// Examples:

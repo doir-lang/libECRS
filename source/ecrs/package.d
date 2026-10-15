@@ -7,3 +7,4 @@ public import ecrs.context;
 public import ecrs.relation;
 public import ecrs.system;
 public import ecrs.datalog;
+public import ecrs.serialization;
