@@ -31,6 +31,16 @@ dub build --config=datalog-bench --compiler=ldc2 --build=release
 
 `-betterC` has no unittest runner, so `tests/runner.d` walks each module's tests itself; a new module has to be added to its list.
 
+## WebAssembly
+
+```sh
+python3 tools/wasi.py --serve                    # build the unittests for wasm32-wasi with threads and serve a page that runs them in a browser
+python3 tools/wasi.py --node                     # build and run the same tests headlessly under Node
+python3 tools/wasi.py --node --single-threaded   # the same without threads, where bc-threads pools run jobs inline
+```
+
+The script, and the page and worker scripts in `tests/wasi`, follow bc-threads' own; its README explains the setup. It downloads [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) into `bin/wasi-sdk` on first use (or set `WASI_SYSROOT` and `WASI_BUILTINS`), compiles bc-threads and libfp in from the paths `dub describe` reports, and installs [@tybys/wasm-util](https://github.com/toyobayashi/wasm-util) and [@emnapi/wasi-threads](https://github.com/toyobayashi/emnapi/tree/main/packages/wasi-threads) into `bin/wasi`. Threads need an LDC newer than 1.43, which until [ldc-developers/ldc#5268](https://github.com/ldc-developers/ldc/pull/5268) compiled D's thread-locals on wasm as ordinary globals; set `DC` to an LDC master build (CI uses `ldc-master`), or pass `--single-threaded`.
+
 ## Documentation and coverage
 
 ```sh

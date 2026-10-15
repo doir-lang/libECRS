@@ -421,7 +421,7 @@ private ulong[] radixSort(ulong[] keys, ulong[] buffer, size_t bits) {
 	if (bits == 0) return keys;
 	immutable passes = (bits + radixDigitBits - 1) / radixDigitBits;
 	immutable digit = (bits + passes - 1) / passes;
-	immutable ulong mask = (1UL << digit) - 1;
+	immutable size_t mask = (size_t(1) << digit) - 1;
 	size_t[1 << radixDigitBits] counts;
 	auto from = keys, to = buffer;
 	foreach (pass; 0 .. passes) {
