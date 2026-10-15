@@ -12,6 +12,7 @@ An entity-component-relation-system library for `-betterC` D. Entities are ids, 
 - `ecrs.relation`: fixed- or dynamic-arity relation components, `Relation!n`.
 - `ecrs.system`: systems, and combinators that run them over a `Context` in sequence or concurrently on a `bc.threadpool`.
 - `ecrs.datalog`: stratified, semi-naive Datalog whose relations are components.
+- `ecrs.serialization`: saves a `Context` by copying out its components, or through encoding hooks for those holding pointers such as dynamic relations, and loads it back with every entity id intact.
 
 Types are plain data operated on by free functions taking them by `ref`, and every function that can fail says in its documentation how it reports it. `AGENTS.md` sets out the conventions in full.
 

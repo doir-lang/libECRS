@@ -1,6 +1,8 @@
 /// Fixed- or dynamic-arity relation components, `Relation!n`, and the `Term` a relation's slots hold when they may be unbound logic variables rather than entities.
 module ecrs.relation;
 
+import core.stdc.string : memcpy;
+
 static import ecrs.registry;
 static import fp.dynarray;
 static import fp.lifecycle;
@@ -37,7 +39,7 @@ private void remapTermEntity(ref Term t, const(ecrs.registry.EntityId)[] remap) 
 	if (t.constant < remap.length) t.constant = remap[t.constant];
 }
 
-/// A component listing `n` related entities, or terms if `canBeTerm`. With `n` as `dynamicExtent`, `related` is a growable dynarray the component owns, and its lifetime follows `fp.lifecycle`: removing the component frees the dynarray, and copying it with `fp.lifecycle.copyInto` copies the dynarray.
+/// A component listing `n` related entities, or terms if `canBeTerm`. With `n` as `dynamicExtent`, `related` is a growable dynarray the component owns, and its lifetime follows `fp.lifecycle`: removing the component frees the dynarray, and copying it with `fp.lifecycle.copyInto` copies the dynarray. It also encodes itself, so `ecrs.serialization` saves it despite the pointer.
 ///
 /// Examples:
 /// ---
@@ -109,6 +111,51 @@ struct Relation(size_t n = dynamicExtent, bool canBeTerm = false) {
 		void copyTo(ref Relation dest) @nogc nothrow {
 			dest.related = fp.dynarray.clone(related);
 		}
+
+		/// The encoding hooks `ecrs.registry.hasSerialize` detects: the slot count, then the slots' bytes. Returns false if allocation fails.
+		///
+		/// Examples:
+		/// ---
+		/// Relation!dynamicExtent many, copy;
+		/// assert(fp.dynarray.pushBack(many.related, ecrs.registry.EntityId(7)));
+		/// ubyte* bytes = null;
+		/// assert(Relation!dynamicExtent.serialize(many, bytes));
+		/// const(ubyte)[] data = fp.dynarray.slice(bytes);
+		/// assert(Relation!dynamicExtent.deserialize(copy, data) && data.length == 0);
+		/// assert(copy.related[0] == 7);
+		/// fp.dynarray.free(bytes);
+		/// copy.finalize();
+		/// many.finalize();
+		/// ---
+		static bool serialize(const ref Relation self, ref ubyte* out_) @trusted {
+			immutable ulong count = fp.dynarray.length(self.related);
+			return fp.dynarray.concatenate(out_, (cast(const(ubyte)*) &count)[0 .. count.sizeof])
+				&& fp.dynarray.concatenate(out_, (cast(const(ubyte)*) self.related)[0 .. cast(size_t) count * MaybeTerm.sizeof]);
+		}
+
+		/// Ditto, reading what `serialize` wrote into the empty `self` and advancing `data` past it. Returns false if `data` is too short or allocation fails, leaving `self` empty and `data` as it was.
+		///
+		/// Examples:
+		/// ---
+		/// Relation!dynamicExtent many;
+		/// static immutable ubyte[2] bytes = [1, 0];
+		/// const(ubyte)[] truncated = bytes[];
+		/// assert(!Relation!dynamicExtent.deserialize(many, truncated));
+		/// assert(many.related is null && truncated.length == 2);
+		/// ---
+		static bool deserialize(ref Relation self, ref const(ubyte)[] data) @trusted {
+			ulong count;
+			if (data.length < count.sizeof) return false;
+			memcpy(&count, data.ptr, count.sizeof);
+			if (count > (data.length - count.sizeof) / MaybeTerm.sizeof) return false;
+			immutable bytes = cast(size_t) count * MaybeTerm.sizeof;
+			if (count > 0) {
+				if (fp.dynarray.growToSize(self.related, cast(size_t) count) is null) return false;
+				memcpy(self.related, data.ptr + count.sizeof, bytes);
+			}
+			data = data[count.sizeof + bytes .. $];
+			return true;
+		}
 	}
 }
 
@@ -170,6 +217,24 @@ unittest {
 	assert(copy.related is null);
 	copy.finalize();
 	original.finalize();
+
+	// Encoding round-trips terms too, and an empty relation stays without a dynarray.
+	alias Terms = Relation!(dynamicExtent, true);
+	static assert(ecrs.registry.hasSerialize!Terms && !ecrs.registry.hasSerialize!(Relation!3));
+	Terms terms, decoded, blank, decodedBlank;
+	assert(fp.dynarray.pushBack(terms.related, Term()));
+	assert(fp.dynarray.pushBack(terms.related, Term(ecrs.registry.EntityId(4))));
+	scope(exit) terms.finalize();
+	scope(exit) decoded.finalize();
+	ubyte* bytes = null;
+	scope(exit) fp.dynarray.free(bytes);
+	assert(Terms.serialize(terms, bytes) && Terms.serialize(blank, bytes));
+	const(ubyte)[] data = fp.dynarray.slice(bytes);
+	assert(Terms.deserialize(decoded, data) && Terms.deserialize(decodedBlank, data) && data.length == 0);
+	assert(fp.dynarray.length(decoded.related) == 2 && decoded.related[0].isVar && decoded.related[1].constant == 4);
+	assert(decodedBlank.related is null);
+	data = fp.dynarray.slice(bytes)[0 .. ulong.sizeof + Term.sizeof];
+	assert(!Terms.deserialize(decodedBlank, data) && decodedBlank.related is null);
 
 	// A container of relations frees each one's dynarray with itself.
 	Dynamic* list = null;

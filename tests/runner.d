@@ -11,6 +11,7 @@ private enum modules = [
 	"ecrs.context",
 	"ecrs.system",
 	"ecrs.datalog",
+	"ecrs.serialization",
 	"datalog_hammer",
 ];
 

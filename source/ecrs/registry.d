@@ -15,6 +15,7 @@ static import fp.hashtable;
 static import fp.lifecycle;
 static import fp.pointer;
 static import fp.string;
+static import std.traits;
 
 @nogc nothrow:
 
@@ -28,7 +29,12 @@ enum EntityId invalidEntity = 0;
 /// Relabels every entity id a type-erased component holds, `remap[old]` being the id `old` becomes.
 alias RemapFunction = void function(void* element, const(EntityId)[] remap) @nogc nothrow;
 
-/// The callbacks storage runs on one component type's type-erased elements, recorded when the type registers, so storage created from a runtime id still ends lifetimes, and a holder of entity ids is renumbered by every `ecrs.context.reorderEntities` without the caller naming it. A null hook means the type has none.
+/// Appends a type-erased component's encoding to the byte dynarray `out_`. Returns false if allocation fails.
+alias SerializeFunction = bool function(const(void)* element, ref ubyte* out_) @nogc nothrow;
+
+/// Decodes a component from the front of `data` into the zero-filled `element`, advancing `data` past it. Returns false if `data` is malformed or allocation fails, leaving `element` safe to finalize.
+alias DeserializeFunction = bool function(void* element, ref const(ubyte)[] data) @nogc nothrow;
+
 /// How `ecrs.datalog` reads a component as a relation: the owning entity, then `columns` entity ids at offset 0 of the element. A fixed relation holds one tuple of them, a dynamic one a dynarray of `columns`-wide tuples; with `columns` 0 the component is a unary predicate, present or not.
 struct RelationShape {
 	size_t columns = 0; /// Entity columns after the owner.
@@ -48,6 +54,9 @@ struct Hooks {
 	fp.lifecycle.FinalizeFunction finalizeFunction = null; /// Ends a component's lifetime, as `fp.lifecycle` defines it, before its slot is discarded.
 	RemapFunction remapFunction = null; /// Run on a component by every entity renumbering.
 	RelationShape shape; /// How `ecrs.datalog` reads the component.
+	bool opaque = false; /// Whether the component holds pointers, so its bytes mean nothing outside this process and `ecrs.serialization` needs the encoding hooks to save it.
+	SerializeFunction serializeFunction = null; /// Encodes the component for `ecrs.serialization`, in place of copying its bytes.
+	DeserializeFunction deserializeFunction = null; /// Decodes what `serializeFunction` wrote.
 }
 
 /// Whether `T` implements `static void remapEntities(ref T, const(EntityId)[] remap)`, relabelling every entity id an instance holds, `remap[old]` being the id `old` becomes.
@@ -64,6 +73,29 @@ enum hasRemapEntities(T) = __traits(compiles, {
 });
 
 private void remapThunk(T)(void* p, const(EntityId)[] remap) @trusted { T.remapEntities(*cast(T*) p, remap); }
+
+/// Whether `T` implements `static bool serialize(const ref T, ref ubyte* out_)` and `static bool deserialize(ref T, ref const(ubyte)[] data)`, encoding itself for `ecrs.serialization` as `SerializeFunction` and `DeserializeFunction` describe.
+///
+/// Examples:
+/// ---
+/// static struct Boxed {
+/// 	int* value;
+/// 	static bool serialize(const ref Boxed, ref ubyte*) @nogc nothrow { return true; }
+/// 	static bool deserialize(ref Boxed, ref const(ubyte)[]) @nogc nothrow { return true; }
+/// }
+/// static assert(hasSerialize!Boxed && !hasSerialize!int);
+/// ---
+enum hasSerialize(T) = __traits(compiles, {
+	const T source = T.init;
+	T dest = T.init;
+	ubyte* out_;
+	const(ubyte)[] data;
+	bool written = T.serialize(source, out_);
+	bool read = T.deserialize(dest, data);
+});
+
+private bool serializeThunk(T)(const(void)* p, ref ubyte* out_) @trusted { return T.serialize(*cast(const(T)*) p, out_); }
+private bool deserializeThunk(T)(void* p, ref const(ubyte)[] data) @trusted { return T.deserialize(*cast(T*) p, data); }
 
 /// The shape of an `ecrs.relation.Relation` whose slots are entities rather than terms, detected structurally because this module cannot import that one. Every other type reads as a unary predicate.
 ///
@@ -82,12 +114,12 @@ template shapeFor(T) {
 		enum shapeFor = RelationShape.init;
 }
 
-/// The hooks `T` declares: `fp.lifecycle.finalizeFunction!T`, set unless `T`'s lifetime is its bytes, `remapEntities`, as `hasRemapEntities` detects it, and `shapeFor!T`.
+/// The hooks `T` declares: `fp.lifecycle.finalizeFunction!T`, set unless `T`'s lifetime is its bytes, `remapEntities`, as `hasRemapEntities` detects it, `shapeFor!T`, whether `T` has indirections, and its encoding hooks, as `hasSerialize` detects them.
 ///
 /// Examples:
 /// ---
 /// static struct Owner { int* data; void finalize() @nogc nothrow { data = null; } }
-/// assert(hooksFor!Owner().finalizeFunction !is null);
+/// assert(hooksFor!Owner().finalizeFunction !is null && hooksFor!Owner().opaque);
 /// assert(hooksFor!int() == Hooks.init);
 /// ---
 Hooks hooksFor(T)() {
@@ -95,6 +127,11 @@ Hooks hooksFor(T)() {
 	hooks.finalizeFunction = fp.lifecycle.finalizeFunction!T();
 	static if (hasRemapEntities!T) hooks.remapFunction = &remapThunk!T;
 	hooks.shape = shapeFor!T;
+	hooks.opaque = std.traits.hasIndirections!T;
+	static if (hasSerialize!T) {
+		hooks.serializeFunction = &serializeThunk!T;
+		hooks.deserializeFunction = &deserializeThunk!T;
+	}
 	return hooks;
 }
 
@@ -447,7 +484,7 @@ version(unittest) {
 }
 
 unittest {
-	// componentId records each type's hooks; plain data gets none.
+	// componentId records each type's hooks; plain data gets none, and only a type holding pointers is opaque.
 	static struct Owns {
 		int* p;
 		void finalize() @nogc nothrow { p = null; }
@@ -461,7 +498,7 @@ unittest {
 	static struct Plain { int x; }
 
 	immutable owns = lookupHooks(componentId!Owns());
-	assert(owns.finalizeFunction !is null && owns.remapFunction is null);
+	assert(owns.finalizeFunction !is null && owns.remapFunction is null && owns.opaque);
 	Owns o = Owns(cast(int*) 1);
 	owns.finalizeFunction(cast(inout(ubyte)[]) (cast(ubyte*) &o)[0 .. Owns.sizeof]);
 	assert(o.p is null);
@@ -474,7 +511,27 @@ unittest {
 	assert(r.target == 5);
 
 	immutable plain = lookupHooks(componentId!Plain());
-	assert(plain.finalizeFunction is null && plain.remapFunction is null);
+	assert(plain.finalizeFunction is null && plain.remapFunction is null && !plain.opaque);
+	assert(plain.serializeFunction is null && plain.deserializeFunction is null);
+
+	static struct Encoded {
+		int value;
+		static bool serialize(const ref Encoded self, ref ubyte* out_) @nogc nothrow { return fp.dynarray.pushBack(out_, cast(ubyte) self.value); }
+		static bool deserialize(ref Encoded self, ref const(ubyte)[] data) @nogc nothrow {
+			if (data.length == 0) return false;
+			self.value = data[0];
+			data = data[1 .. $];
+			return true;
+		}
+	}
+	immutable encoded = lookupHooks(componentId!Encoded());
+	assert(encoded.serializeFunction !is null && encoded.deserializeFunction !is null);
+	ubyte* bytes = null;
+	scope(exit) fp.dynarray.free(bytes);
+	Encoded source = Encoded(9), dest;
+	assert(encoded.serializeFunction(&source, bytes));
+	const(ubyte)[] data = fp.dynarray.slice(bytes);
+	assert(encoded.deserializeFunction(&dest, data) && data.length == 0 && dest.value == 9);
 
 	assert(lookupHooks(fp.pointer.notFound) == Hooks.init);
 }
