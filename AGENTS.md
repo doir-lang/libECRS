@@ -37,7 +37,7 @@
 ## Style
 
 - Prefer plain-data structs operated on by free functions that take them by `ref` (for example `post(s)`, `free(s)`), rather than methods.
-  Use member functions only for operator overloads and for what a language protocol requires to be a member, such as range primitives (`empty`, `front`, `popFront`) or an `alias this` target.
+  Use member functions only for operator overloads, for `@property` accessors that name part of a field (such as `ecrs.relation.Relates` naming a slot of `related`), and for what a language protocol requires to be a member, such as range primitives (`empty`, `front`, `popFront`) or an `alias this` target.
 - Prefer fully qualified names to aliasing imports: call `bc.semaphore.free(s)` rather than `import bc.semaphore : semaphoreFree = free;` or `alias semaphoreFree = bc.semaphore.free;`.
   A `static import` keeps a module's names out of scope so every use has to be qualified.
 - One ecrs module uses another, or a libfp or bc-threads module, through a `static import`, so every call names its layer (`ecrs.storage.add`, `fp.dynarray.pushBack`, `bc.spinlock.readLock`).

@@ -508,6 +508,49 @@ template getComponent(T, size_t unique = 0) {
 	}
 }
 
+/// Entity `e`'s component `componentId`, or null if `e` lacks it. `elementSize`, unless `Storage.invalid`, is checked against the storage's. The address is stable on the terms `addComponent` gives.
+///
+/// Examples:
+/// ---
+/// Context ctx = create();
+/// scope(exit) free(ctx);
+/// EntityId e = addEntity(ctx);
+/// immutable id = ecrs.registry.componentId!int();
+/// assert(findComponent(ctx, e, id) is null);
+/// void* added = addComponent(ctx, e, id);
+/// assert(findComponent(ctx, e, id) is added);
+/// ---
+void* findComponent(ref Context self, EntityId e, size_t componentId, size_t elementSize = ecrs.storage.Storage.invalid) @trusted {
+	if (!hasComponent(self, e, componentId)) return null;
+	return getComponent(self, e, componentId, elementSize);
+}
+
+/// Ditto
+const(void)* findComponent(const ref Context self, EntityId e, size_t componentId, size_t elementSize = ecrs.storage.Storage.invalid) @trusted {
+	if (!hasComponent(self, e, componentId)) return null;
+	return getComponent(self, e, componentId, elementSize);
+}
+
+/// Ditto, for component `(T, unique)`.
+///
+/// Examples:
+/// ---
+/// Context ctx = create();
+/// scope(exit) free(ctx);
+/// EntityId e = addEntity(ctx);
+/// assert(findComponent!int(ctx, e) is null);
+/// *addComponent!int(ctx, e) = 3;
+/// if (auto p = findComponent!int(ctx, e)) assert(*p == 3);
+/// ---
+template findComponent(T, size_t unique = 0) {
+	T* findComponent(ref Context self, EntityId e) @trusted {
+		return cast(T*) .findComponent(self, e, ecrs.registry.componentId!(T, unique)(), T.sizeof);
+	}
+	const(T)* findComponent(const ref Context self, EntityId e) @trusted {
+		return cast(const(T)*) .findComponent(self, e, ecrs.registry.componentId!(T, unique)(), T.sizeof);
+	}
+}
+
 /// Entity `e`'s component `componentId`, added as `addComponent` would if `e` lacks it.
 ///
 /// Returns null if adding fails, leaving `e` without the component.
@@ -522,7 +565,7 @@ template getComponent(T, size_t unique = 0) {
 /// assert(p !is null && getOrAddComponent(ctx, e, id) is p);
 /// ---
 void* getOrAddComponent(ref Context self, EntityId e, size_t componentId, size_t elementSize = ecrs.storage.Storage.invalid) {
-	if (hasComponent(self, e, componentId)) return getComponent(self, e, componentId, elementSize);
+	if (auto p = findComponent(self, e, componentId, elementSize)) return p;
 	return addComponent(self, e, componentId, elementSize);
 }
 
@@ -538,7 +581,7 @@ void* getOrAddComponent(ref Context self, EntityId e, size_t componentId, size_t
 /// ---
 template getOrAddComponent(T, size_t unique = 0) {
 	T* getOrAddComponent(ref Context self, EntityId e) {
-		if (.hasComponent!(T, unique)(self, e)) return &.getComponent!(T, unique)(self, e);
+		if (auto p = .findComponent!(T, unique)(self, e)) return p;
 		return .addComponent!(T, unique)(self, e);
 	}
 }
@@ -837,12 +880,18 @@ unittest {
 	assert(xsum == 1 + 5);
 
 	assert(!hasComponent!Counter(ctx, e1));
+	assert(findComponent!Counter(ctx, e1) is null);
+	assert(findComponent!Counter(ctx, invalidEntity) is null);
+	assert(findComponent!Vec2(ctx, e1) is &getComponent!Vec2(ctx, e1));
+	const(Context)* view = &ctx;
+	assert(findComponent!Vec2(*view, e3).x == 5);
 	auto c = getOrAddComponent!Counter(ctx, e1);
 	c.value = 5;
 	assert(getOrAddComponent!Counter(ctx, e1) is c);
 	assert(getComponent!Counter(ctx, e1).value == 5);
 	removeComponent!Counter(ctx, e1);
 	assert(!hasComponent!Counter(ctx, e1));
+	assert(findComponent!Counter(ctx, e1) is null);
 }
 
 unittest {
@@ -856,11 +905,14 @@ unittest {
 	immutable id = ecrs.registry.componentId!Flag();
 
 	assert(!hasComponent(ctx, e, id));
+	assert(findComponent(ctx, e, id) is null);
 	auto p = getOrAddComponent(ctx, e, id);
 	(cast(Flag*) p).v = 42;
 	assert(hasComponent(ctx, e, id));
 	assert(getOrAddComponent(ctx, e, id) is p);
 	assert((cast(Flag*) getComponent(ctx, e, id)).v == 42);
+	assert(findComponent(ctx, e, id, Flag.sizeof) is p);
+	assert(findComponent(*cast(const(Context)*) &ctx, e, id) is p);
 
 	removeComponent(ctx, e, id);
 	assert(!hasComponent(ctx, e, id));
