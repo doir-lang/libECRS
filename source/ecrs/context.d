@@ -25,9 +25,9 @@ private struct RemapHook {
 	void* userData;
 }
 
-private enum JournalKind : ubyte { addedEntity, removedEntity, addedComponent, removedComponent, replacedComponent }
+private enum JournalKind : ubyte { touchedStorage, removedEntity, removedComponent, replacedComponent }
 
-// One undoable step of a transaction; `saved` is the offset of a replaced component's old bytes in `Context.saved`.
+// One undoable step of a transaction; `saved` is the offset of a replaced component's old bytes in `Context.saved`. Additions are not journaled one by one: a storage's first is a `touchedStorage` holding its size in `slot` and its hole count in `saved`, and new entities are those from `Context.firstNew`.
 private struct JournalEntry {
 	JournalKind kind;
 	EntityId e;
@@ -40,7 +40,7 @@ private struct JournalEntry {
 ///
 /// It is plain data, released only by `free`: pair `create` with `scope(exit) free(ctx)`.
 ///
-/// Between `beginTransaction` and `commitTransaction` it journals every change, so `rollbackTransaction` can restore it as it was without allocating.
+/// Between `beginTransaction` and `commitTransaction` it journals every change, so `rollbackTransaction` can restore it as it was without allocating. Removals and replacements take an entry each; additions take one per storage, however many there are, so building a large store in one transaction costs no journal to speak of.
 ///
 /// Concurrency: any number of threads may read at once, and may write existing components of distinct entities. Structural changes, meaning adding or removing entities, components, storages or remap hooks, renumbering and sorting, need exclusive access; inside an `ecrs.system` parallel combinator they fail an assert rather than race, whatever the pool size.
 struct Context {
@@ -50,6 +50,7 @@ struct Context {
 	private RemapHook* remapHooks = null;
 	private size_t parallelDepth = 0; // atomic; nonzero while a parallel system runs
 	private bool transaction = false;
+	private size_t firstNew; // the entity count when the transaction began; it adds entities only past it
 	private JournalEntry* journal = null;
 	private ubyte* saved = null; // replaced components' old bytes, each at an offset aligned to `savedAlignment`
 }
@@ -205,6 +206,7 @@ void beginTransaction(ref Context self) {
 	assert(!self.transaction, "ecrs: transactions do not nest");
 	assert(!inParallel(self), structuralChange);
 	self.transaction = true;
+	self.firstNew = fp.dynarray.length(self.indexTable);
 }
 
 private bool reserveJournal(ref Context self, size_t n) @trusted {
@@ -217,7 +219,18 @@ private void record(ref Context self, JournalEntry entry) @trusted {
 	assert(recorded);
 }
 
+// Before the open transaction's first `add` to `storage`, records where a rollback restores it to. False if the journal cannot grow.
+private bool journalStorage(ref Context self, ref ecrs.storage.Storage storage, size_t componentId) @trusted {
+	if (storage.journaled) return true;
+	if (!reserveJournal(self, 1)) return false;
+	record(self, JournalEntry(JournalKind.touchedStorage, invalidEntity, componentId, ecrs.storage.size(storage), ecrs.storage.holeCount(storage)));
+	storage.journaled = true;
+	return true;
+}
+
 private void endTransaction(ref Context self) @trusted {
+	foreach (entry; fp.dynarray.slice(self.journal))
+		if (entry.kind == JournalKind.touchedStorage) existingStorage(self, entry.componentId).journaled = false;
 	fp.dynarray.clear(self.journal);
 	fp.dynarray.clear(self.saved);
 	self.transaction = false;
@@ -239,7 +252,7 @@ private void endTransaction(ref Context self) @trusted {
 void commitTransaction(ref Context self) @trusted {
 	assert(self.transaction);
 	foreach (entry; fp.dynarray.slice(self.journal)) final switch (entry.kind) {
-		case JournalKind.addedEntity, JournalKind.addedComponent:
+		case JournalKind.touchedStorage:
 			break;
 		case JournalKind.removedEntity:
 			fp.dynarray.free(self.indexTable[entry.e]);
@@ -255,7 +268,7 @@ void commitTransaction(ref Context self) @trusted {
 	endTransaction(self);
 }
 
-/// Closes the open transaction on `self`, undoing its changes in reverse order, so every entity and component is as it was when it began. Storage generations still advance, and storages and index-list room it grew stay allocated. It cannot fail.
+/// Closes the open transaction on `self`, undoing its changes in reverse order, so every entity and component is as it was when it began, holes included: each storage it added to goes back to its size and holes then, and the entities it added are cut from the table. Storage generations still advance, and storages and index-list room it grew stay allocated. It cannot fail.
 ///
 /// Examples:
 /// ---
@@ -273,19 +286,16 @@ void commitTransaction(ref Context self) @trusted {
 void rollbackTransaction(ref Context self) @trusted {
 	assert(self.transaction);
 	foreach_reverse (entry; fp.dynarray.slice(self.journal)) final switch (entry.kind) {
-		case JournalKind.addedEntity:
-			assert(entry.e + 1 == fp.dynarray.length(self.indexTable));
-			fp.dynarray.free(self.indexTable[entry.e]);
-			cast(void) fp.dynarray.popBack(self.indexTable);
+		case JournalKind.touchedStorage:
+			ecrs.storage.restore(existingStorage(self, entry.componentId), entry.componentId, self.indexTable, entry.slot, entry.saved);
 			break;
 		case JournalKind.removedEntity:
 			assert(*fp.dynarray.back(self.freelist) == entry.e);
 			cast(void) fp.dynarray.popBack(self.freelist);
 			break;
-		case JournalKind.addedComponent:
-			cast(void) ecrs.storage.remove(existingStorage(self, entry.componentId), entry.componentId, self.indexTable, entry.e);
-			break;
 		case JournalKind.removedComponent:
+			// An addition after the removal gave `e` a new slot, which its storage's `touchedStorage` reclaims further on.
+			if (hasComponent(self, entry.e, entry.componentId)) cast(void) ecrs.storage.detach(existingStorage(self, entry.componentId), entry.componentId, self.indexTable, entry.e);
 			ecrs.storage.reattach(existingStorage(self, entry.componentId), entry.componentId, self.indexTable, entry.e, entry.slot);
 			break;
 		case JournalKind.replacedComponent:
@@ -295,6 +305,9 @@ void rollbackTransaction(ref Context self) @trusted {
 			memcpy(p, self.saved + entry.saved, storage.elementSize);
 			break;
 	}
+	// The entities it added are the tail of the table; restoring their storages has taken every component off them.
+	foreach (e; self.firstNew .. fp.dynarray.length(self.indexTable)) fp.dynarray.free(self.indexTable[e]);
+	cast(void) fp.dynarray.popBackCount(self.indexTable, fp.dynarray.length(self.indexTable) - self.firstNew);
 	endTransaction(self);
 }
 
@@ -450,15 +463,11 @@ size_t entityCount(const ref Context self) @trusted {
 EntityId addEntity(ref Context self) @trusted {
 	assert(!inParallel(self), structuralChange);
 	if (self.transaction) {
-		immutable n = fp.dynarray.length(self.indexTable);
-		if (!reserveJournal(self, 2) || !reserveMore(self.indexTable, 2)) return invalidEntity;
-		if (n == 0) {
-			cast(void) reserveInvalidEntity(self); // reserved above
-			record(self, JournalEntry(JournalKind.addedEntity, invalidEntity));
-		}
+		// Never a freed id: a rollback removes what the transaction added by cutting the table back to `firstNew`.
+		if (!reserveMore(self.indexTable, 2)) return invalidEntity;
+		if (fp.dynarray.length(self.indexTable) == 0) cast(void) reserveInvalidEntity(self); // reserved above
 		immutable e = cast(EntityId) fp.dynarray.length(self.indexTable);
 		cast(void) fp.dynarray.pushBack(self.indexTable, cast(ecrs.storage.IndexList) null); // reserved above
-		record(self, JournalEntry(JournalKind.addedEntity, e));
 		return e;
 	}
 	if (fp.dynarray.length(self.indexTable) == 0 && !reserveInvalidEntity(self)) return invalidEntity;
@@ -493,18 +502,18 @@ bool removeEntity(ref Context self, EntityId e) @trusted {
 	if (self.transaction) {
 		size_t count = 0;
 		foreach (componentId; 0 .. fp.dynarray.length(indices))
-			if (indices[componentId] != ecrs.storage.Storage.invalid) ++count;
+			if (indices[componentId] != ecrs.storage.Storage.absent) ++count;
 		if (!reserveJournal(self, count + 1)) return false;
 		// The index list stays, so a rollback can reattach the components; the commit frees it.
 		foreach (componentId; 0 .. fp.dynarray.length(indices))
-			if (indices[componentId] != ecrs.storage.Storage.invalid)
+			if (indices[componentId] != ecrs.storage.Storage.absent)
 				record(self, JournalEntry(JournalKind.removedComponent, e, componentId, ecrs.storage.detach(self.storages[componentId], componentId, self.indexTable, e)));
 		record(self, JournalEntry(JournalKind.removedEntity, e));
 		cast(void) fp.dynarray.pushBack(self.freelist, cast(size_t) e); // reserved above
 		return true;
 	}
 	foreach (componentId; 0 .. fp.dynarray.length(indices))
-		if (indices[componentId] != ecrs.storage.Storage.invalid)
+		if (indices[componentId] != ecrs.storage.Storage.absent)
 			cast(void) ecrs.storage.remove(self.storages[componentId], componentId, self.indexTable, e);
 	fp.dynarray.free(self.indexTable[e]);
 	self.indexTable[e] = null;
@@ -525,7 +534,7 @@ bool removeEntity(ref Context self, EntityId e) @trusted {
 bool hasComponent(const ref Context self, EntityId e, size_t componentId) @trusted {
 	return e < fp.dynarray.length(self.indexTable)
 		&& fp.dynarray.length(self.indexTable[e]) > componentId
-		&& self.indexTable[e][componentId] != ecrs.storage.Storage.invalid;
+		&& self.indexTable[e][componentId] != ecrs.storage.Storage.absent;
 }
 
 /// Ditto, for component `(T, unique)`.
@@ -562,12 +571,9 @@ void* addComponent(ref Context self, EntityId e, size_t componentId, size_t elem
 	assert(!inParallel(self), structuralChange);
 	assert(!hasComponent(self, e, componentId));
 	immutable size = elementSize == ecrs.storage.Storage.invalid ? ecrs.registry.lookupSize(componentId) : elementSize;
-	if (self.transaction && !reserveJournal(self, 1)) return null;
 	auto storage = getStorage(self, componentId, size);
-	if (storage is null) return null;
-	auto p = ecrs.storage.add(*storage, componentId, self.indexTable, e);
-	if (p !is null && self.transaction) record(self, JournalEntry(JournalKind.addedComponent, e, componentId));
-	return p;
+	if (storage is null || (self.transaction && !journalStorage(self, *storage, componentId))) return null;
+	return ecrs.storage.add(*storage, componentId, self.indexTable, e);
 }
 
 /// Ditto, for component `(T, unique)`, which starts as `T.init`. Returns null also if `T` cannot be registered.
@@ -585,12 +591,9 @@ template addComponent(T, size_t unique = 0) {
 	T* addComponent(ref Context self, EntityId e) {
 		assert(!inParallel(self), structuralChange);
 		assert(!.hasComponent!(T, unique)(self, e));
-		if (self.transaction && !reserveJournal(self, 1)) return null;
 		auto storage = .getStorage!(T, unique)(self);
-		if (storage is null) return null;
-		auto p = ecrs.storage.add!(T, unique)(*storage, self.indexTable, e);
-		if (p !is null && self.transaction) record(self, JournalEntry(JournalKind.addedComponent, e, ecrs.registry.componentId!(T, unique)()));
-		return p;
+		if (storage is null || (self.transaction && !journalStorage(self, *storage, ecrs.registry.componentId!(T, unique)()))) return null;
+		return ecrs.storage.add!(T, unique)(*storage, self.indexTable, e);
 	}
 }
 
@@ -1127,13 +1130,17 @@ unittest {
 			auto ctx = create();
 			scope(exit) free(ctx);
 			EntityId kept = addEntity(ctx), doomed = addEntity(ctx), freed = addEntity(ctx);
-			assert(removeEntity(ctx, freed));
+			// `freed`'s components leave holes, which the transaction's additions reuse and a rollback must give back in order.
+			addComponent!Tracked(ctx, freed).value = 3;
+			assert(setComponent!int(ctx, freed, 5));
 			assert(setComponent!int(ctx, kept, 10) && setComponent!short(ctx, doomed, 4));
 			Many list;
 			assert(fp.dynarray.pushBack(list.related, doomed));
 			assert(setComponent!Many(ctx, kept, list));
 			addComponent!Tracked(ctx, kept).value = 1;
 			addComponent!Tracked(ctx, doomed).value = 2;
+			assert(removeEntity(ctx, freed));
+			Tracked.finalized = 0;
 			int* held = &getComponent!int(ctx, kept);
 			auto before = snapshot(ctx);
 			scope(exit) fp.dynarray.free(before);

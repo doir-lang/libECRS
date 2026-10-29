@@ -20,8 +20,8 @@ public import ecrs.registry : EntityId, invalidEntity;
 @nogc nothrow:
 
 
-/// One entity's index list: a dynarray holding, for each component id, `Storage.invalid` or the slot of the entity's component in that component's storage.
-alias IndexList = size_t*;
+/// One entity's index list: a dynarray holding, for each component id, `Storage.absent` or the slot of the entity's component in that component's storage. Slots are 32-bit, since an entity's list runs to the highest component id it has and most of a large store is these lists.
+alias IndexList = uint*;
 
 /// Every entity's index list, as a dynarray indexed by entity id.
 alias IndexTable = IndexList*;
@@ -63,8 +63,10 @@ alias LessWithEntityFunction = bool function(const(void)* a, EntityId ea, const(
 ///
 /// It is plain data: `Context` keeps these in an `fp.dynarray`, which relocates them as bytes, and that never moves the components, which sit in pages it points to.
 struct Storage {
-	/// The `elementSize` of a storage not yet created, and the index-list entry of an absent component.
+	/// The `elementSize` of a storage not yet created, and the slot `detach` returns for an absent component.
 	enum size_t invalid = size_t.max;
+	/// The index-list entry of an absent component; every slot is below it.
+	enum uint absent = uint.max;
 
 	size_t elementSize = invalid; /// Bytes per component.
 	private fp.pagedarray.PagedArray elements;
@@ -73,6 +75,7 @@ struct Storage {
 	private size_t live = 0;
 	private ecrs.registry.RemapFunction remapFunction = null;
 	private size_t changes = 0; // atomic; see `generation`
+	package bool journaled = false; // whether the open transaction has recorded where to `restore` this storage to
 }
 
 
@@ -231,13 +234,13 @@ private bool ensureIndexSlot(ref IndexList indices, size_t componentId) @trusted
 	if (oldLength > componentId) return true;
 	if (fp.dynarray.growToSize(indices, componentId + 1) is null) return false;
 	foreach (i; oldLength .. componentId + 1)
-		indices[i] = Storage.invalid;
+		indices[i] = Storage.absent;
 	return true;
 }
 
 /// Gives entity `e` an empty, zero-filled slot for component `componentId`, reusing a hole if there is one, and records it in `e`'s index list, which `indexTable` must already have. `e` must not have this component yet.
 ///
-/// Returns the slot, or null if allocation fails, leaving `self` as it was; `e`'s index list may have grown, its new entries `Storage.invalid`.
+/// Returns the slot, or null if allocation fails, leaving `self` as it was; `e`'s index list may have grown, its new entries `Storage.absent`.
 ///
 /// Examples:
 /// ---
@@ -256,7 +259,7 @@ private bool ensureIndexSlot(ref IndexList indices, size_t componentId) @trusted
 void* add(ref Storage self, size_t componentId, ref IndexTable indexTable, EntityId e) @trusted {
 	assert(e != invalidEntity && e < fp.dynarray.length(indexTable));
 	if (!ensureIndexSlot(indexTable[e], componentId)) return null;
-	assert(indexTable[e][componentId] == Storage.invalid);
+	assert(indexTable[e][componentId] == Storage.absent);
 
 	size_t slot;
 	if (fp.dynarray.length(self.holes) > 0) {
@@ -270,8 +273,9 @@ void* add(ref Storage self, size_t componentId, ref IndexTable indexTable, Entit
 		}
 		slot = size(self) - 1;
 	}
+	assert(slot < Storage.absent, "ecrs: a storage's slots must stay below Storage.absent");
 	self.slotOwners[slot] = e;
-	indexTable[e][componentId] = slot;
+	indexTable[e][componentId] = cast(uint) slot;
 	++self.live;
 
 	void* p = get(self, slot);
@@ -357,10 +361,10 @@ bool remove(ref Storage self, size_t componentId, ref IndexTable indexTable, Ent
 package size_t detach(ref Storage self, size_t componentId, ref IndexTable indexTable, EntityId e) @trusted {
 	if (e >= fp.dynarray.length(indexTable)) return Storage.invalid;
 	auto indices = indexTable[e];
-	if (fp.dynarray.length(indices) <= componentId || indices[componentId] == Storage.invalid)
+	if (fp.dynarray.length(indices) <= componentId || indices[componentId] == Storage.absent)
 		return Storage.invalid;
-	immutable slot = indices[componentId];
-	indices[componentId] = Storage.invalid;
+	immutable size_t slot = indices[componentId];
+	indices[componentId] = Storage.absent;
 	self.slotOwners[slot] = invalidEntity;
 	--self.live;
 	touch(self);
@@ -384,10 +388,10 @@ package size_t detach(ref Storage self, size_t componentId, ref IndexTable index
 /// fp.dynarray.free(indices);
 /// ---
 package void reattach(ref Storage self, size_t componentId, ref IndexTable indexTable, EntityId e, size_t slot) @trusted {
-	assert(fp.dynarray.length(indexTable[e]) > componentId && indexTable[e][componentId] == Storage.invalid);
+	assert(fp.dynarray.length(indexTable[e]) > componentId && indexTable[e][componentId] == Storage.absent);
 	assert(slot < size(self) && self.slotOwners[slot] == invalidEntity);
 	self.slotOwners[slot] = e;
-	indexTable[e][componentId] = slot;
+	indexTable[e][componentId] = cast(uint) slot;
 	++self.live;
 	touch(self);
 }
@@ -421,6 +425,56 @@ package void release(ref Storage self, size_t slot) @trusted {
 	memset(p, 0, self.elementSize);
 	// A hole missing from the list just waits for the next reorder to reclaim it.
 	cast(void) fp.dynarray.pushBack(self.holes, slot);
+}
+
+/// The number of holes `add` would reuse before growing.
+///
+/// Examples:
+/// ---
+/// Storage storage = create(int.sizeof);
+/// assert(holeCount(storage) == 0);
+/// free(storage);
+/// ---
+package size_t holeCount(const ref Storage self) @trusted {
+	return fp.dynarray.length(cast(size_t*) self.holes);
+}
+
+/// Undoes every `add` since the storage had `oldSize` slots and `oldHoles` holes, for a transaction rollback: the slots added past `oldSize` and the holes reused are taken off their owners, their components' lifetimes end, and both lists are as they were. Nothing may have released a slot in between, which a transaction never does until it commits. It cannot fail.
+///
+/// Examples:
+/// ---
+/// Storage storage = create(int.sizeof);
+/// scope(exit) free(storage);
+/// IndexTable indices = null;
+/// assert(fp.dynarray.growToSize(indices, 2) !is null);
+/// indices[1] = null;
+/// immutable id = ecrs.registry.componentId!int();
+/// assert(add(storage, id, indices, 1) !is null);
+/// restore(storage, id, indices, 0, 0);
+/// assert(size(storage) == 0 && indices[1][id] == Storage.absent);
+/// fp.dynarray.free(indices[1]);
+/// fp.dynarray.free(indices);
+/// ---
+package void restore(ref Storage self, size_t componentId, ref IndexTable indexTable, size_t oldSize, size_t oldHoles) @trusted {
+	immutable reusedFrom = holeCount(self);
+	assert(reusedFrom <= oldHoles && fp.dynarray.capacity(self.holes) >= oldHoles && oldSize <= size(self));
+	// Popping a hole leaves its slot number in place past the list's end, so the reused ones are still there to read back.
+	foreach (i; reusedFrom .. oldHoles) {
+		immutable slot = self.holes[i];
+		if (self.slotOwners[slot] != invalidEntity) cast(void) detach(self, componentId, indexTable, self.slotOwners[slot]);
+		void* p = fp.pagedarray.get(self.elements, slot);
+		finalizeBytes(self, p);
+		memset(p, 0, self.elementSize);
+	}
+	if (reusedFrom < oldHoles) cast(void) fp.dynarray.growToSize(self.holes, oldHoles); // within capacity, so it keeps the slot numbers
+	foreach (slot; oldSize .. size(self))
+		if (self.slotOwners[slot] != invalidEntity) cast(void) detach(self, componentId, indexTable, self.slotOwners[slot]);
+	immutable added = size(self) - oldSize;
+	if (added) {
+		fp.pagedarray.popBackCount(self.elements, added);
+		cast(void) fp.dynarray.popBackCount(self.slotOwners, added);
+	}
+	touch(self);
 }
 
 /// Ends the lifetime of a component of this storage's type at `p`, which need not be in the storage, leaving its bytes for the caller to zero or reuse.
@@ -517,8 +571,8 @@ private void swapSlots(ref Storage self, size_t componentId, IndexTable indexTab
 	immutable ownerA = self.slotOwners[a];
 	self.slotOwners[a] = self.slotOwners[b];
 	self.slotOwners[b] = ownerA;
-	if (self.slotOwners[a] != invalidEntity) indexTable[self.slotOwners[a]][componentId] = a;
-	if (self.slotOwners[b] != invalidEntity) indexTable[self.slotOwners[b]][componentId] = b;
+	if (self.slotOwners[a] != invalidEntity) indexTable[self.slotOwners[a]][componentId] = cast(uint) a;
+	if (self.slotOwners[b] != invalidEntity) indexTable[self.slotOwners[b]][componentId] = cast(uint) b;
 }
 
 private void settleHoles(ref Storage self) @trusted {
