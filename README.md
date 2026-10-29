@@ -8,7 +8,7 @@ An entity-component-relation-system library for `-betterC` D. Entities are ids, 
 
 - `ecrs.registry`: gives every component type a stable numeric id, with name, size and hook tables for callers that only have an id or a name.
 - `ecrs.storage`: per-type component storage, whose components never move while they exist.
-- `ecrs.context`: the entity and component database, `Context`.
+- `ecrs.context`: the entity and component database, `Context`, with transactions that journal changes so a rollback restores it without allocating.
 - `ecrs.relation`: fixed- or dynamic-arity relation components, `Relation!n`, and the `Relates` mixin that makes a struct of your own one.
 - `ecrs.system`: systems, and combinators that run them over a `Context` in sequence or concurrently on a `bc.threadpool`.
 - `ecrs.datalog`: stratified, semi-naive Datalog whose relations are components.

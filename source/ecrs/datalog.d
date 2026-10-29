@@ -1303,7 +1303,8 @@ Status evaluate(ref Program self, ref ecrs.context.Context ctx, bc.threadpool.Th
 	if (immutable status = stratify(self, order, start)) return status;
 
 	self.evaluated = false;
-	foreach (relation; fp.dynarray.slice(self.derived)) ecrs.context.clearComponent(ctx, relation);
+	foreach (relation; fp.dynarray.slice(self.derived))
+		if (!ecrs.context.clearComponent(ctx, relation)) return Status.outOfMemory;
 	foreach (k; 0 .. fp.dynarray.length(start) - 1)
 		if (!evaluateStratum(self, ctx, order[start[k] .. start[k + 1]], pool)) return Status.outOfMemory;
 
@@ -1535,7 +1536,7 @@ unittest {
 	assert(fp.dynarray.pushBack(ecrs.context.getOrAddComponent!Parent(f.ctx, f.abraham).related, adam));
 	assert(sameSet(solutions(p, f.ctx, 1, atom(ancestor, constant(f.lisa), y)), f.homer, f.marge, f.abraham, f.jackie, adam));
 
-	ecrs.context.removeComponent!Parent(f.ctx, f.homer);
+	assert(ecrs.context.removeComponent!Parent(f.ctx, f.homer));
 	assert(sameSet(solutions(p, f.ctx, 1, atom(ancestor, constant(f.lisa), y)), f.homer, f.marge, f.jackie));
 
 	// Every allocation evaluation makes can fail, reported as such; the next evaluation still derives everything.

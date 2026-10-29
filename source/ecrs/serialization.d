@@ -228,7 +228,7 @@ unittest {
 	auto terms = ecrs.context.addComponent!ManyTerms(saved, e[0]);
 	assert(fp.dynarray.pushBack(terms.related, ecrs.relation.Term()) && fp.dynarray.pushBack(terms.related, ecrs.relation.Term(e[4])));
 	assert(ecrs.context.addComponent!Handle(saved, e[0]) !is null);
-	ecrs.context.removeComponent!Vec2(saved, e[2]); // leaves a hole
+	assert(ecrs.context.removeComponent!Vec2(saved, e[2])); // leaves a hole
 	assert(ecrs.context.removeEntity(saved, e[3]));
 	assert(ecrs.context.removeEntity(saved, e[1]));
 
