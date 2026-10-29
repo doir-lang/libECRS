@@ -2,7 +2,7 @@
 ///
 /// Element bytes live in an `fp.pagedarray`, so a component's address never changes while it exists: a query may hold a `ref` to one while nested queries add more. Each slot also records its owning entity, so finding a slot's entity is O(1). Removal leaves a hole for the next add to reuse rather than moving another component into the gap; only `reorder` and the sorts move components, and they also trim trailing holes.
 ///
-/// Components follow `fp.lifecycle`: a type with a `finalize()` or destructor has it run once, when the component is removed or its storage freed. Every slot that holds no component is empty, all zero bytes.
+/// Components follow `fp.lifecycle`: a type with a `finalize()` or destructor has it run once, when the component is removed or its storage freed. Every slot that holds no component is empty, all zero bytes, except one `detach` took, which keeps its bytes until `release` or `reattach`.
 module ecrs.storage;
 
 import core.atomic : atomicLoad, atomicOp;
@@ -328,30 +328,115 @@ template add(T, size_t unique = 0) {
 /// fp.dynarray.free(indices);
 /// ---
 bool remove(ref Storage self, size_t componentId, ref IndexTable indexTable, EntityId e) @trusted {
-	if (e >= fp.dynarray.length(indexTable)) return false;
+	immutable slot = detach(self, componentId, indexTable, e);
+	if (slot == Storage.invalid) return false;
+	release(self, slot);
+	return true;
+}
+
+/// Takes entity `e`'s component `componentId` off `e` without ending its lifetime: the slot keeps its bytes and reads as a hole, but no `add` reuses it until `release` frees it or `reattach` gives it back. A transaction removes components this way so a rollback cannot fail.
+///
+/// Returns the slot, or `Storage.invalid`, changing nothing, if `e` has no such component.
+///
+/// Examples:
+/// ---
+/// Storage storage = create(int.sizeof);
+/// scope(exit) free(storage);
+/// IndexTable indices = null;
+/// assert(fp.dynarray.growToSize(indices, 2) !is null);
+/// indices[1] = null;
+/// immutable id = ecrs.registry.componentId!int();
+/// *add!int(storage, indices, 1) = 5;
+/// immutable slot = detach(storage, id, indices, 1);
+/// assert(slot == 0 && empty(storage) && owner(storage, 0) == invalidEntity);
+/// reattach(storage, id, indices, 1, slot);
+/// assert(ecrs.storage.get!int(storage, indices[1][id]) == 5);
+/// fp.dynarray.free(indices[1]);
+/// fp.dynarray.free(indices);
+/// ---
+package size_t detach(ref Storage self, size_t componentId, ref IndexTable indexTable, EntityId e) @trusted {
+	if (e >= fp.dynarray.length(indexTable)) return Storage.invalid;
 	auto indices = indexTable[e];
 	if (fp.dynarray.length(indices) <= componentId || indices[componentId] == Storage.invalid)
-		return false;
-
+		return Storage.invalid;
 	immutable slot = indices[componentId];
 	indices[componentId] = Storage.invalid;
+	self.slotOwners[slot] = invalidEntity;
 	--self.live;
+	touch(self);
+	return slot;
+}
+
+/// Gives the slot `detach` took back to entity `e`, whose index list must still have room for `componentId` and must not name another slot for it. It cannot fail.
+///
+/// Examples:
+/// ---
+/// Storage storage = create(int.sizeof);
+/// scope(exit) free(storage);
+/// IndexTable indices = null;
+/// assert(fp.dynarray.growToSize(indices, 2) !is null);
+/// indices[1] = null;
+/// immutable id = ecrs.registry.componentId!int();
+/// assert(add(storage, id, indices, 1) !is null);
+/// reattach(storage, id, indices, 1, detach(storage, id, indices, 1));
+/// assert(liveCount(storage) == 1 && owner(storage, 0) == 1);
+/// fp.dynarray.free(indices[1]);
+/// fp.dynarray.free(indices);
+/// ---
+package void reattach(ref Storage self, size_t componentId, ref IndexTable indexTable, EntityId e, size_t slot) @trusted {
+	assert(fp.dynarray.length(indexTable[e]) > componentId && indexTable[e][componentId] == Storage.invalid);
+	assert(slot < size(self) && self.slotOwners[slot] == invalidEntity);
+	self.slotOwners[slot] = e;
+	indexTable[e][componentId] = slot;
+	++self.live;
+	touch(self);
+}
+
+/// Ends the lifetime of the component in `slot`, which no entity owns any more, and frees the slot: the last slot is popped, and any other becomes a hole. It cannot fail.
+///
+/// Examples:
+/// ---
+/// Storage storage = create(int.sizeof);
+/// scope(exit) free(storage);
+/// IndexTable indices = null;
+/// assert(fp.dynarray.growToSize(indices, 2) !is null);
+/// indices[1] = null;
+/// assert(add!int(storage, indices, 1) !is null);
+/// release(storage, detach(storage, ecrs.registry.componentId!int(), indices, 1));
+/// assert(size(storage) == 0);
+/// fp.dynarray.free(indices[1]);
+/// fp.dynarray.free(indices);
+/// ---
+package void release(ref Storage self, size_t slot) @trusted {
+	assert(slot < size(self) && self.slotOwners[slot] == invalidEntity);
 	touch(self);
 	if (slot + 1 == size(self)) {
 		cast(void) fp.dynarray.popBack(self.slotOwners);
 		fp.pagedarray.popBack(self.elements);
-		return true;
+		return;
 	}
-
-	void* p = get(self, slot);
-	if (self.elements.finalizeFunction !is null)
-		self.elements.finalizeFunction(cast(inout(ubyte)[]) (cast(ubyte*) p)[0 .. self.elementSize]);
+	void* p = fp.pagedarray.get(self.elements, slot);
+	finalizeBytes(self, p);
 	// Zeroed even without a finalizer, so a hole never holds a stale value that looks live.
 	memset(p, 0, self.elementSize);
-	self.slotOwners[slot] = invalidEntity;
 	// A hole missing from the list just waits for the next reorder to reclaim it.
 	cast(void) fp.dynarray.pushBack(self.holes, slot);
-	return true;
+}
+
+/// Ends the lifetime of a component of this storage's type at `p`, which need not be in the storage, leaving its bytes for the caller to zero or reuse.
+///
+/// Examples:
+/// ---
+/// static struct Owner { int* data; void finalize() @nogc nothrow { data = null; } }
+/// Storage storage = create(Owner.sizeof, fp.lifecycle.finalizeFunction!Owner());
+/// scope(exit) free(storage);
+/// Owner o = Owner(cast(int*) 1);
+/// finalizeBytes(storage, &o);
+/// assert(o.data is null);
+/// ---
+package void finalizeBytes(ref Storage self, void* p) @trusted {
+	if (self.elements.finalizeFunction !is null)
+		self.elements.finalizeFunction(cast(inout(ubyte)[]) (cast(ubyte*) p)[0 .. self.elementSize]);
 }
 
 /// Ditto, for component `(T, unique)`.
