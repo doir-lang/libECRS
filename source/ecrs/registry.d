@@ -10,7 +10,7 @@ import core.atomic : atomicLoad, atomicOp, atomicStore, MemoryOrder;
 static import bc.spinlock;
 static import core.stdc.string;
 static import fp.dynarray;
-static import fp.fnv1a;
+static import fp.hash;
 static import fp.hashtable;
 static import fp.lifecycle;
 static import fp.pointer;
@@ -158,14 +158,14 @@ private const(char)[] nameOf(const(ForwardEntry)* e) @trusted {
 }
 
 private size_t nameHash(inout(ubyte)[] data) @trusted {
-	return fp.fnv1a.hash(nameOf(cast(const(ForwardEntry)*) data.ptr));
+	return fp.hash.fnv1a(nameOf(cast(const(ForwardEntry)*) data.ptr));
 }
 private bool nameEqual(inout(ubyte)[] a, inout(ubyte)[] b) @trusted {
 	return nameOf(cast(const(ForwardEntry)*) a.ptr) == nameOf(cast(const(ForwardEntry)*) b.ptr);
 }
 
 private size_t idHash(inout(ubyte)[] data) @trusted {
-	return fp.fnv1a.hash(data[0 .. size_t.sizeof]);
+	return fp.hash.fnv1a(data[0 .. size_t.sizeof]);
 }
 private bool idEqual(inout(ubyte)[] a, inout(ubyte)[] b) @trusted {
 	return a[0 .. size_t.sizeof] == b[0 .. size_t.sizeof];
