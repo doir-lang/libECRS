@@ -62,7 +62,7 @@ mixin template Relates(size_t n = ecrs.relation.dynamicExtent, bool canBeTerm = 
 	static import ecrs.registry;
 	static import ecrs.relation;
 	static import fp.dynarray;
-	static import fp.fnv1a;
+	static import fp.hash;
 
 	alias MaybeTerm = ecrs.relation.Slot!canBeTerm; /// What each slot holds.
 	enum bool canBeTermValue = canBeTerm; /// Whether slots may hold variables.
@@ -122,10 +122,10 @@ mixin template Relates(size_t n = ecrs.relation.dynamicExtent, bool canBeTerm = 
 			ulong h = 0xcbf29ce484222325;
 			foreach (ref t; slots(self)) {
 				immutable size_t[2] word = [t.isVar, t.isVar ? t.varId : t.constant];
-				h = (h ^ fp.fnv1a.hash(word[])) * 0x100000001b3;
+				h = (h ^ fp.hash.fnv1a(word[])) * 0x100000001b3;
 			}
 			return cast(size_t) h;
-		} else return fp.fnv1a.hash(slots(self));
+		} else return fp.hash.fnv1a(slots(self));
 	}
 
 	/// Whether `a` and `b` hold the same slots in the same order.
