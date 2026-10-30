@@ -6,6 +6,7 @@ module ecrs.context;
 import core.atomic : atomicLoad, atomicOp;
 import core.stdc.string : memcpy, memset;
 
+static import bc.spinlock;
 static import ecrs.registry;
 static import ecrs.storage;
 static import fp.dynarray;
@@ -42,7 +43,7 @@ private struct JournalEntry {
 ///
 /// Between `beginTransaction` and `commitTransaction` it journals every change, so `rollbackTransaction` can restore it as it was without allocating. Removals and replacements take an entry each; additions take one per storage, however many there are, so building a large store in one transaction costs no journal to speak of.
 ///
-/// Concurrency: any number of threads may read at once, and may write existing components of distinct entities. Structural changes, meaning adding or removing entities, components, storages or remap hooks, renumbering and sorting, need exclusive access; inside an `ecrs.system` parallel combinator they fail an assert rather than race, whatever the pool size.
+/// Concurrency: any number of threads may read at once, and may write existing components of distinct entities. Structural changes, meaning adding or removing entities, components, storages or remap hooks, renumbering and sorting, need exclusive access; inside an `ecrs.system` parallel combinator they fail an assert rather than race, whatever the pool size. Between `beginConcurrentWrites` and `endConcurrentWrites` threads may also add, set and remove components of distinct existing entities, in storages that already exist.
 struct Context {
 	private ecrs.storage.Storage* storages = null;
 	ecrs.storage.IndexTable indexTable = null; /// Every entity's index list, freed entities' included.
@@ -51,6 +52,8 @@ struct Context {
 	private size_t parallelDepth = 0; // atomic; nonzero while a parallel system runs
 	private bool transaction = false;
 	private size_t firstNew; // the entity count when the transaction began; it adds entities only past it
+	private bool concurrent = false; // inside `beginConcurrentWrites`
+	private bc.spinlock.SpinLock journalLock; // held while concurrent writes reserve and append journal entries
 	private JournalEntry* journal = null;
 	private ubyte* saved = null; // replaced components' old bytes, each at an offset aligned to `savedAlignment`
 }
@@ -95,6 +98,8 @@ private bool reserveMore(T)(ref T* da, size_t n) @trusted {
 }
 
 private enum string structuralChange = "ecrs: structural change inside a parallel system; make it after the pass";
+private enum string concurrentStructure = "ecrs: an entity or storage added or removed during concurrent writes; make it before `beginConcurrentWrites`";
+private enum string unprepared = "ecrs: a concurrent addition to a storage `prepareConcurrentAdds` did not prepare";
 
 
 private bool freelistContains(const(size_t)* freelist, size_t value) @trusted {
@@ -219,9 +224,11 @@ private void record(ref Context self, JournalEntry entry) @trusted {
 	assert(recorded);
 }
 
-// Before the open transaction's first `add` to `storage`, records where a rollback restores it to. False if the journal cannot grow.
+// Before the open transaction's first `add` to `storage`, whose lock the caller holds in concurrent writes, records where a rollback restores it to. False if the journal cannot grow.
 private bool journalStorage(ref Context self, ref ecrs.storage.Storage storage, size_t componentId) @trusted {
 	if (storage.journaled) return true;
+	if (self.concurrent) bc.spinlock.writeLock(self.journalLock);
+	scope(exit) if (self.concurrent) bc.spinlock.writeUnlock(self.journalLock);
 	if (!reserveJournal(self, 1)) return false;
 	record(self, JournalEntry(JournalKind.touchedStorage, invalidEntity, componentId, ecrs.storage.size(storage), ecrs.storage.holeCount(storage)));
 	storage.journaled = true;
@@ -312,6 +319,79 @@ void rollbackTransaction(ref Context self) @trusted {
 }
 
 
+/// Readies the storage of component `componentId`, making it with `elementSize`-byte elements if need be, for up to `n` additions during concurrent writes: slots are made now and handed out without a lock then, so nothing another thread reads moves. Within one phase an entity takes one new slot per component it gains, even one it held before the phase and lost in it, so `n` is the number of entities the writers change unless one gains the same component twice. Inside a transaction the storage is journaled now. Call it, outside the phase, for every storage the writers add to.
+///
+/// Returns false if allocation fails, leaving the storage able to be prepared again.
+///
+/// Examples:
+/// ---
+/// Context ctx = create();
+/// scope(exit) free(ctx);
+/// assert(prepareConcurrentAdds(ctx, ecrs.registry.componentId!int(), 8, int.sizeof));
+/// beginConcurrentWrites(ctx);
+/// endConcurrentWrites(ctx);
+/// ---
+bool prepareConcurrentAdds(ref Context self, size_t componentId, size_t n, size_t elementSize = ecrs.storage.Storage.invalid) @trusted {
+	assert(!self.concurrent, concurrentStructure);
+	immutable size = elementSize == ecrs.storage.Storage.invalid ? ecrs.registry.lookupSize(componentId) : elementSize;
+	auto storage = getStorage(self, componentId, size);
+	return storage !is null && (!self.transaction || journalStorage(self, *storage, componentId)) && ecrs.storage.prepareClaims(*storage, n);
+}
+
+/// Ditto, for component `(T, unique)`. Returns false also if `T` cannot be registered.
+///
+/// Examples:
+/// ---
+/// Context ctx = create();
+/// scope(exit) free(ctx);
+/// assert(prepareConcurrentAdds!int(ctx, 8));
+/// beginConcurrentWrites(ctx);
+/// endConcurrentWrites(ctx);
+/// ---
+template prepareConcurrentAdds(T, size_t unique = 0) {
+	bool prepareConcurrentAdds(ref Context self, size_t n) {
+		immutable id = ecrs.registry.componentId!(T, unique)();
+		return id != fp.pointer.notFound && .prepareConcurrentAdds(self, id, n, T.sizeof);
+	}
+}
+
+/// Opens a phase in which several threads may add, set and remove components of existing entities at once, until `endConcurrentWrites`: each entity is changed by one thread at a time, each storage they add to has been readied by `prepareConcurrentAdds`, and removals happen only inside a transaction, which keeps their slots until it ends. Meanwhile no entity or storage may be added or removed, nor anything renumbered or sorted. Inside a transaction the changes are journaled as ever, so a rollback undoes them; the journal is the one lock writers share.
+///
+/// Examples:
+/// ---
+/// Context ctx = create();
+/// scope(exit) free(ctx);
+/// EntityId e = addEntity(ctx);
+/// assert(prepareConcurrentAdds!int(ctx, 1) && prepareConcurrentAdds!short(ctx, 1));
+/// beginConcurrentWrites(ctx);
+/// assert(setComponent!int(ctx, e, 3) && setComponent!short(ctx, e, 4)); // from any thread, each with its own entities
+/// endConcurrentWrites(ctx);
+/// assert(getComponent!int(ctx, e) == 3);
+/// ---
+void beginConcurrentWrites(ref Context self) @trusted {
+	assert(!self.concurrent, "ecrs: concurrent writes do not nest");
+	self.concurrent = true;
+	foreach (i; 0 .. fp.dynarray.length(self.storages)) self.storages[i].quiet = true;
+}
+
+/// Closes the phase `beginConcurrentWrites` opened, every thread writing in it having finished, and gives back the slots prepared storages did not use. It cannot fail.
+///
+/// Examples:
+/// ---
+/// Context ctx = create();
+/// scope(exit) free(ctx);
+/// beginConcurrentWrites(ctx);
+/// endConcurrentWrites(ctx);
+/// ---
+void endConcurrentWrites(ref Context self) @trusted {
+	assert(self.concurrent);
+	self.concurrent = false;
+	foreach (i; 0 .. fp.dynarray.length(self.storages)) {
+		self.storages[i].quiet = false;
+		ecrs.storage.endClaims(self.storages[i]);
+	}
+}
+
 /// A context with the invalid entity, id 0, already reserved. Use it rather than `Context.init`. It cannot fail: if it cannot allocate, the first `addEntity` reserves entity 0 instead.
 ///
 /// Examples:
@@ -365,6 +445,7 @@ void free(ref Context self) @trusted {
 ecrs.storage.Storage* getStorage(ref Context self, size_t componentId, size_t elementSize) @trusted {
 	if (hasStorage(self, componentId)) return &self.storages[componentId];
 	assert(!inParallel(self), structuralChange);
+	assert(!self.concurrent, concurrentStructure);
 	assert(elementSize != ecrs.storage.Storage.invalid, "ecrs: component of unknown size");
 
 	immutable count = fp.dynarray.length(self.storages);
@@ -462,6 +543,7 @@ size_t entityCount(const ref Context self) @trusted {
 /// ---
 EntityId addEntity(ref Context self) @trusted {
 	assert(!inParallel(self), structuralChange);
+	assert(!self.concurrent, concurrentStructure);
 	if (self.transaction) {
 		// Never a freed id: a rollback removes what the transaction added by cutting the table back to `firstNew`.
 		if (!reserveMore(self.indexTable, 2)) return invalidEntity;
@@ -481,6 +563,27 @@ EntityId addEntity(ref Context self) @trusted {
 	return e;
 }
 
+/// Adds `n` live entities with consecutive ids and no components, returning the first; unlike `addEntity` it never reuses a freed id, so the run is contiguous whatever was removed. Inside a transaction a rollback removes them, as it does what `addEntity` adds.
+///
+/// Returns `invalidEntity` if allocation fails, leaving `self` as it was.
+///
+/// Examples:
+/// ---
+/// Context ctx = create();
+/// scope(exit) free(ctx);
+/// immutable first = addEntities(ctx, 3);
+/// assert(first == 1 && entityCount(ctx) == 4);
+/// ---
+EntityId addEntities(ref Context self, size_t n) @trusted {
+	assert(!inParallel(self), structuralChange);
+	assert(!self.concurrent, concurrentStructure);
+	if (!reserveMore(self.indexTable, n + 1)) return invalidEntity;
+	if (fp.dynarray.length(self.indexTable) == 0) cast(void) reserveInvalidEntity(self); // reserved above
+	immutable first = cast(EntityId) fp.dynarray.length(self.indexTable);
+	foreach (i; 0 .. n) cast(void) fp.dynarray.pushBack(self.indexTable, cast(ecrs.storage.IndexList) null); // reserved above
+	return first;
+}
+
 /// Removes the live entity `e`, which must not be `invalidEntity`, ending its components' lifetimes; its id goes on the freelist for `addEntity` to hand out again.
 ///
 /// Returns false if allocation fails, leaving `self` as it was.
@@ -495,6 +598,7 @@ EntityId addEntity(ref Context self) @trusted {
 /// ---
 bool removeEntity(ref Context self, EntityId e) @trusted {
 	assert(!inParallel(self), structuralChange);
+	assert(!self.concurrent, concurrentStructure);
 	assert(e != invalidEntity && e < fp.dynarray.length(self.indexTable));
 	if (!reserveMore(self.freelist, 1)) return false;
 
@@ -572,7 +676,9 @@ void* addComponent(ref Context self, EntityId e, size_t componentId, size_t elem
 	assert(!hasComponent(self, e, componentId));
 	immutable size = elementSize == ecrs.storage.Storage.invalid ? ecrs.registry.lookupSize(componentId) : elementSize;
 	auto storage = getStorage(self, componentId, size);
-	if (storage is null || (self.transaction && !journalStorage(self, *storage, componentId))) return null;
+	if (storage is null) return null;
+	assert(!self.concurrent || storage.claimLimit, unprepared);
+	if (self.transaction && !journalStorage(self, *storage, componentId)) return null;
 	return ecrs.storage.add(*storage, componentId, self.indexTable, e);
 }
 
@@ -592,7 +698,9 @@ template addComponent(T, size_t unique = 0) {
 		assert(!inParallel(self), structuralChange);
 		assert(!.hasComponent!(T, unique)(self, e));
 		auto storage = .getStorage!(T, unique)(self);
-		if (storage is null || (self.transaction && !journalStorage(self, *storage, ecrs.registry.componentId!(T, unique)()))) return null;
+		if (storage is null) return null;
+		assert(!self.concurrent || storage.claimLimit, unprepared);
+		if (self.transaction && !journalStorage(self, *storage, ecrs.registry.componentId!(T, unique)())) return null;
 		return ecrs.storage.add!(T, unique)(*storage, self.indexTable, e);
 	}
 }
@@ -615,7 +723,10 @@ bool removeComponent(ref Context self, EntityId e, size_t componentId) {
 	assert(!inParallel(self), structuralChange);
 	assert(hasComponent(self, e, componentId));
 	auto storage = &existingStorage(self, componentId);
+	assert(!self.concurrent || self.transaction, "ecrs: concurrent writes remove components only inside a transaction, which keeps their slots until it ends");
 	if (!self.transaction) return ecrs.storage.remove(*storage, componentId, self.indexTable, e);
+	if (self.concurrent) bc.spinlock.writeLock(self.journalLock);
+	scope(exit) if (self.concurrent) bc.spinlock.writeUnlock(self.journalLock);
 	if (!reserveJournal(self, 1)) return false;
 	record(self, JournalEntry(JournalKind.removedComponent, e, componentId, ecrs.storage.detach(*storage, componentId, self.indexTable, e)));
 	return true;
@@ -653,6 +764,7 @@ template removeComponent(T, size_t unique = 0) {
 /// ---
 bool clearComponent(ref Context self, size_t componentId) @trusted {
 	assert(!inParallel(self), structuralChange);
+	assert(!self.concurrent, concurrentStructure);
 	if (!hasStorage(self, componentId)) return true;
 	auto storage = &self.storages[componentId];
 	if (self.transaction) {
@@ -796,7 +908,7 @@ template getOrAddComponent(T, size_t unique = 0) {
 	}
 }
 
-/// Gives entity `e` component `(T, unique)` with `value`, adding it as `addComponent` would or replacing the one it has, whose lifetime ends; inside a transaction the old value is kept until the commit, so a rollback restores it. The component keeps its address, and the old value is moved by its bytes. Takes over `value`'s lifetime.
+/// Gives entity `e` component `(T, unique)` with `value`, adding it as `addComponent` would or replacing the one it has, whose lifetime ends; inside a transaction the old value is kept until the commit, so a rollback restores it, unless the transaction added `e`, which a rollback removes whole. The component keeps its address, and the old value is moved by its bytes. Takes over `value`'s lifetime.
 ///
 /// Returns false if allocation fails, leaving `e` as it was and ending `value`'s lifetime.
 ///
@@ -822,11 +934,14 @@ template setComponent(T, size_t unique = 0) {
 			fp.lifecycle.moveInto(*p, value);
 			return true;
 		}
-		if (!self.transaction) {
+		// An entity the transaction added goes whole on a rollback, so its old value need not be kept for one.
+		if (!self.transaction || e >= self.firstNew) {
 			fp.lifecycle.moveInto(*existing, value);
 			return true;
 		}
 		immutable id = ecrs.registry.componentId!(T, unique)();
+		if (self.concurrent) bc.spinlock.writeLock(self.journalLock);
+		scope(exit) if (self.concurrent) bc.spinlock.writeUnlock(self.journalLock);
 		immutable offset = (fp.dynarray.length(self.saved) + savedAlignment - 1) / savedAlignment * savedAlignment;
 		if (!reserveJournal(self, 1) || !reserveMore(self.saved, offset + T.sizeof - fp.dynarray.length(self.saved)) || fp.dynarray.growToSize(self.saved, offset + T.sizeof) is null) {
 			fp.lifecycle.endLifetime(value);
@@ -1550,4 +1665,56 @@ unittest {
 	}
 	assert(&getComponent!Payload(ctx, first) is held);
 	assert(held.value == 7);
+}
+
+unittest {
+	// Concurrent writes: threads change components of their own entities inside a transaction, which a rollback undoes exactly and a commit keeps.
+	static import bc.threadpool;
+	static struct Job { Context* ctx; EntityId first; size_t count; bool ok; }
+	static void write(void* arg) @nogc nothrow {
+		auto job = cast(Job*) arg;
+		job.ok = true;
+		foreach (i; 0 .. job.count) {
+			immutable e = cast(EntityId) (job.first + i);
+			job.ok &= setComponent!int(*job.ctx, e, cast(int) e) && setComponent!short(*job.ctx, e, 7) && setComponent!int(*job.ctx, e, cast(int) e * 2);
+			if (e % 3 == 0) job.ok &= removeComponent!short(*job.ctx, e);
+		}
+	}
+	auto pool = bc.threadpool.create(4);
+	assert(pool !is null);
+	scope(exit) bc.threadpool.free(pool);
+	foreach (commit; [false, true]) {
+		auto ctx = create();
+		scope(exit) free(ctx);
+		EntityId kept = addEntity(ctx);
+		assert(setComponent!int(ctx, kept, 1));
+		auto before = snapshot(ctx);
+		scope(exit) fp.dynarray.free(before);
+		beginTransaction(ctx);
+		immutable first = addEntities(ctx, 400);
+		assert(first != invalidEntity);
+		Job[8] jobs;
+		bc.threadpool.Job[8] work;
+		foreach (i, ref job; jobs) {
+			job = Job(&ctx, cast(EntityId) (first + i * 50), 50);
+			work[i] = bc.threadpool.Job(&write, &job);
+		}
+		assert(prepareConcurrentAdds!int(ctx, 400) && prepareConcurrentAdds!short(ctx, 400));
+		beginConcurrentWrites(ctx);
+		assert(bc.threadpool.run(pool, work[]));
+		endConcurrentWrites(ctx);
+		foreach (ref job; jobs) assert(job.ok);
+		if (!commit) {
+			rollbackTransaction(ctx);
+			auto after = snapshot(ctx);
+			scope(exit) fp.dynarray.free(after);
+			assert(fp.dynarray.slice(after) == fp.dynarray.slice(before));
+			continue;
+		}
+		commitTransaction(ctx);
+		foreach (i; 0 .. 400) {
+			immutable e = cast(EntityId) (first + i);
+			assert(getComponent!int(ctx, e) == e * 2 && hasComponent!short(ctx, e) == (e % 3 != 0));
+		}
+	}
 }

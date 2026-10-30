@@ -76,6 +76,10 @@ struct Storage {
 	private ecrs.registry.RemapFunction remapFunction = null;
 	private size_t changes = 0; // atomic; see `generation`
 	package bool journaled = false; // whether the open transaction has recorded where to `restore` this storage to
+	package size_t claimLimit = 0; // while concurrent writes add to it, the end of the slots `prepareClaims` made
+	package size_t claimBase; // where those slots begin
+	package size_t claimNext; // atomic; the next of those slots `add` hands out
+	package bool quiet; // during concurrent writes, which count changes once at the end rather than on every access
 }
 
 
@@ -162,7 +166,8 @@ size_t generation(const ref Storage self) @trusted {
 }
 
 private void touch(ref Storage self) @trusted {
-	atomicOp!"+="(*cast(shared(size_t)*) &self.changes, 1);
+	// Threads writing concurrently would all contend for this one counter, so the phase counts once when it ends.
+	if (!self.quiet) atomicOp!"+="(*cast(shared(size_t)*) &self.changes, 1);
 }
 
 /// The component in slot `i`, which must be below `size`; the typed form checks that `T` is the right size.
@@ -260,6 +265,16 @@ void* add(ref Storage self, size_t componentId, ref IndexTable indexTable, Entit
 	assert(e != invalidEntity && e < fp.dynarray.length(indexTable));
 	if (!ensureIndexSlot(indexTable[e], componentId)) return null;
 	assert(indexTable[e][componentId] == Storage.absent);
+	if (self.claimLimit) {
+		// Concurrent writes: slots were made beforehand, so taking one moves nothing another thread reads.
+		immutable claimed = atomicOp!"+="(*cast(shared(size_t)*) &self.claimNext, 1) - 1;
+		assert(claimed < self.claimLimit, "ecrs: more concurrent additions to a storage than `prepareConcurrentAdds` allowed");
+		self.slotOwners[claimed] = e;
+		indexTable[e][componentId] = cast(uint) claimed;
+		void* q = fp.pagedarray.get(self.elements, claimed);
+		memset(q, 0, self.elementSize);
+		return q;
+	}
 
 	size_t slot;
 	if (fp.dynarray.length(self.holes) > 0) {
@@ -366,9 +381,59 @@ package size_t detach(ref Storage self, size_t componentId, ref IndexTable index
 	immutable size_t slot = indices[componentId];
 	indices[componentId] = Storage.absent;
 	self.slotOwners[slot] = invalidEntity;
-	--self.live;
+	atomicOp!"-="(*cast(shared(size_t)*) &self.live, 1);
 	touch(self);
 	return slot;
+}
+
+/// Makes `n` empty slots past the end, for `add` to hand out from any thread until `endClaims`, so that adding moves nothing another thread may read. False on refusal, leaving `self` as it was.
+///
+/// Examples:
+/// ---
+/// Storage storage = create(int.sizeof);
+/// scope(exit) free(storage);
+/// IndexTable indices = null;
+/// assert(fp.dynarray.growToSize(indices, 2) !is null);
+/// indices[1] = null;
+/// assert(prepareClaims(storage, 4));
+/// assert(add(storage, ecrs.registry.componentId!int(), indices, 1) !is null);
+/// endClaims(storage);
+/// assert(size(storage) == 1 && liveCount(storage) == 1);
+/// fp.dynarray.free(indices[1]);
+/// fp.dynarray.free(indices);
+/// ---
+package bool prepareClaims(ref Storage self, size_t n) @trusted {
+	assert(!self.claimLimit, "ecrs: a storage prepared twice for concurrent additions");
+	immutable base = size(self);
+	if (n == 0) return true;
+	if (fp.dynarray.reserve(self.slotOwners, base + n) is null || fp.pagedarray.grow(self.elements, n) is null) return false;
+	foreach (i; 0 .. n) cast(void) fp.dynarray.pushBack(self.slotOwners, invalidEntity); // reserved above
+	self.claimBase = self.claimNext = base;
+	self.claimLimit = base + n;
+	return true;
+}
+
+/// Ends what `prepareClaims` began, giving back the slots no `add` took. It cannot fail.
+///
+/// Examples:
+/// ---
+/// Storage storage = create(int.sizeof);
+/// scope(exit) free(storage);
+/// assert(prepareClaims(storage, 2));
+/// endClaims(storage);
+/// assert(size(storage) == 0);
+/// ---
+package void endClaims(ref Storage self) @trusted {
+	if (!self.claimLimit) return;
+	// Claimed slots were left out of the live count, which every claim would otherwise have contended for.
+	self.live += self.claimNext - self.claimBase;
+	immutable unclaimed = self.claimLimit - self.claimNext;
+	if (unclaimed) {
+		fp.pagedarray.popBackCount(self.elements, unclaimed);
+		cast(void) fp.dynarray.popBackCount(self.slotOwners, unclaimed);
+	}
+	self.claimLimit = 0;
+	touch(self);
 }
 
 /// Gives the slot `detach` took back to entity `e`, whose index list must still have room for `componentId` and must not name another slot for it. It cannot fail.
