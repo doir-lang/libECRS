@@ -5,7 +5,7 @@
 /// Components follow `fp.lifecycle`: a type with a `finalize()` or destructor has it run once, when the component is removed or its storage freed. Every slot that holds no component is empty, all zero bytes, except one `detach` took, which keeps its bytes until `release` or `reattach`.
 module ecrs.storage;
 
-import core.atomic : atomicLoad, atomicOp;
+import core.atomic : atomicLoad, atomicOp, atomicStore, MemoryOrder;
 import core.stdc.string : memset;
 
 static import ecrs.registry;
@@ -80,6 +80,7 @@ struct Storage {
 	package size_t claimBase; // where those slots begin
 	package size_t claimNext; // atomic; the next of those slots `add` hands out
 	package bool quiet; // during concurrent writes, which count changes once at the end rather than on every access
+	private bool touchedQuietly; // atomic; accessed mutably while quiet, so `endQuiet` counts a change
 }
 
 
@@ -166,8 +167,35 @@ size_t generation(const ref Storage self) @trusted {
 }
 
 private void touch(ref Storage self) @trusted {
-	// Threads writing concurrently would all contend for this one counter, so the phase counts once when it ends.
+	// Threads writing concurrently would all contend for this one counter, so the phase counts once when it ends; reading the flag first keeps its line shared.
 	if (!self.quiet) atomicOp!"+="(*cast(shared(size_t)*) &self.changes, 1);
+	else if (!atomicLoad!(MemoryOrder.raw)(*cast(shared(bool)*) &self.touchedQuietly)) atomicStore!(MemoryOrder.raw)(*cast(shared(bool)*) &self.touchedQuietly, true);
+}
+
+/// Ends the quiet a concurrent phase put `self` in, counting one change if it was accessed mutably meanwhile, so its generation still says whether its contents may differ. It cannot fail.
+///
+/// Examples:
+/// ---
+/// Storage storage = create(int.sizeof);
+/// scope(exit) free(storage);
+/// IndexTable indices = null;
+/// assert(fp.dynarray.growToSize(indices, 2) !is null);
+/// indices[1] = null;
+/// assert(add!int(storage, indices, 1) !is null);
+/// immutable before = generation(storage);
+/// storage.quiet = true;
+/// ecrs.storage.get!int(storage, 0) = 5;
+/// assert(generation(storage) == before);
+/// endQuiet(storage);
+/// assert(generation(storage) > before);
+/// fp.dynarray.free(indices[1]);
+/// fp.dynarray.free(indices);
+/// ---
+package void endQuiet(ref Storage self) @trusted {
+	self.quiet = false;
+	if (!self.touchedQuietly) return;
+	self.touchedQuietly = false;
+	touch(self);
 }
 
 /// The component in slot `i`, which must be below `size`; the typed form checks that `T` is the right size.

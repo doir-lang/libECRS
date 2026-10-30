@@ -387,7 +387,7 @@ void endConcurrentWrites(ref Context self) @trusted {
 	assert(self.concurrent);
 	self.concurrent = false;
 	foreach (i; 0 .. fp.dynarray.length(self.storages)) {
-		self.storages[i].quiet = false;
+		ecrs.storage.endQuiet(self.storages[i]);
 		ecrs.storage.endClaims(self.storages[i]);
 	}
 }
@@ -1716,5 +1716,13 @@ unittest {
 			immutable e = cast(EntityId) (first + i);
 			assert(getComponent!int(ctx, e) == e * 2 && hasComponent!short(ctx, e) == (e % 3 != 0));
 		}
+
+		// A storage only written in place, never prepared, still counts the phase as a change; one only read does not.
+		immutable written = generation(ctx, ecrs.registry.componentId!int()), read = generation(ctx, ecrs.registry.componentId!short());
+		beginConcurrentWrites(ctx);
+		getComponent!int(ctx, first) = 9;
+		cast(void) getComponent!short(cast(const) ctx, first % 3 ? first : cast(EntityId) (first + 1));
+		endConcurrentWrites(ctx);
+		assert(generation(ctx, ecrs.registry.componentId!int()) > written && generation(ctx, ecrs.registry.componentId!short()) == read);
 	}
 }
