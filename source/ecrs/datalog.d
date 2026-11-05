@@ -1,10 +1,10 @@
 /// A Datalog query layer over the store, whose relations are components: a component is the relation `C(owner, columns...)` its `ecrs.registry.RelationShape` describes, so the store stays the only home of facts, derived ones included. A `Program` holds rules, evaluates them bottom-up, stratified and semi-naive, and writes what they derive back into components it owns.
 ///
-/// Provenance: a rule's head must be a relation the program declared with `derive`, and nothing else may write those. Base relations are any other components, written by ordinary code. `evaluate` recomputes the derived relations from scratch, and only when a relation the rules mention has a new `ecrs.context.generation`.
+/// Provenance: a rule's head must be a relation the program declared with `derive`, and nothing else may write those. Base relations are any other components, written by ordinary code. `evaluate` recomputes each stratum's derived relations from scratch, and only when a relation its rules mention has a new `ecrs.context.generation`.
 ///
 /// `invalidEntity` in a relation slot means no target: tuples holding it are not facts. Within one rule, it also marks an unbound variable.
 ///
-/// Binary relations may carry `ecrs.registry.RelationTrait`s, read as closures at join time. Given a thread pool, `evaluate` splits each round's joins across it; inserting the results stays on the calling thread.
+/// Binary relations may carry `ecrs.registry.RelationTrait`s, read as closures at join time. Given a thread pool, `evaluate` splits each round's joins, and large rounds' insertions, across it through `ecrs.schedules`'s combinators. `evaluation` makes it a schedule, to run between those writing base facts and those reading derived ones.
 module ecrs.datalog;
 
 import core.stdc.string : memcpy;
@@ -15,6 +15,7 @@ static import ecrs.context;
 static import ecrs.registry;
 static import ecrs.relation;
 static import ecrs.storage;
+static import ecrs.schedules;
 static import fp.dynarray;
 static import fp.pointer;
 static import std.algorithm.sorting;
@@ -141,21 +142,42 @@ private struct Index {
 	IndexEntry* entries; // dynarray
 }
 
+// Derived relations evaluated together, and every relation their rules mention, themselves included: what `whenChanged` watches to rerun it.
+private struct Stratum {
+	size_t* members = null; // indexes into `Program.derived`; dynarray
+	size_t* inputs = null; // component ids; dynarray
+	size_t seen = ecrs.schedules.neverRan;
+}
+
 /// A Datalog program: rules over component relations, the relations it derives, and the caches `evaluate` keeps. It is plain data, released only by `free`, and must not move while `attach`ed.
 struct Program {
 	private Rule* rules = null;
 	private size_t* derived = null;
-	private size_t* inputs = null; // every relation a rule mentions
-	private size_t* snapshot = null; // their generations after the last evaluate
+	private Stratum* strata = null; // dependencies first; current while `stratified`
 	private Index* indexes = null;
 	private bc.spinlock.SpinLock indexLock; // parallel joins build indexes lazily
-	private size_t traitsSeen = 0; // `traitsEpoch` at the last evaluate
-	private bool evaluated = false;
+	private size_t traitsSeen = 0; // `traitsEpoch` when the strata last forgot their runs
+	private bool stratified = false;
+	private Status status = Status.ok; // what the last evaluate returned
 }
 
 private void dropIndexes(ref Program self) @trusted {
 	foreach (ref index; fp.dynarray.slice(self.indexes)) fp.dynarray.free(index.entries);
 	if (self.indexes !is null) fp.dynarray.clear(self.indexes);
+}
+
+private void dropStrata(ref Program self) @trusted {
+	foreach (ref stratum; fp.dynarray.slice(self.strata)) {
+		fp.dynarray.free(stratum.members);
+		fp.dynarray.free(stratum.inputs);
+	}
+	if (self.strata !is null) fp.dynarray.clear(self.strata);
+	self.stratified = false;
+}
+
+// Makes every stratum rerun on the next evaluate, as when rule constants or traits change what the same inputs derive.
+private void forgetRuns(ref Program self) @trusted {
+	foreach (ref stratum; fp.dynarray.slice(self.strata)) stratum.seen = ecrs.schedules.neverRan;
 }
 
 /// Frees everything `self` owns, leaving it as `Program.init`; the facts it derived stay in the store. `detach` it first if it is attached.
@@ -170,8 +192,8 @@ void free(ref Program self) @trusted {
 	foreach (ref r; fp.dynarray.slice(self.rules)) fp.dynarray.free(r.body);
 	fp.dynarray.free(self.rules);
 	fp.dynarray.free(self.derived);
-	fp.dynarray.free(self.inputs);
-	fp.dynarray.free(self.snapshot);
+	dropStrata(self);
+	fp.dynarray.free(self.strata);
 	dropIndexes(self);
 	fp.dynarray.free(self.indexes);
 	self = Program.init;
@@ -240,8 +262,9 @@ size_t derive(ref Program self, const(char)[] name, size_t columns) @trusted {
 		if (existing.columns != shape.columns || existing.dynamic != shape.dynamic) return fp.pointer.notFound;
 	}
 
-	if (!contains(self.derived, id) && !fp.dynarray.pushBack(self.derived, id)) return fp.pointer.notFound;
-	self.evaluated = false;
+	if (contains(self.derived, id)) return id;
+	if (!fp.dynarray.pushBack(self.derived, id)) return fp.pointer.notFound;
+	self.stratified = false;
 	return id;
 }
 
@@ -270,26 +293,11 @@ Status addRule(ref Program self, Atom head, const(Atom)[] body...) @trusted {
 
 	Rule rule = Rule(head, null, varCount);
 	if (!append(rule.body, body)) return Status.outOfMemory;
-	immutable inputCount = fp.dynarray.length(self.inputs);
-	bool note(size_t relation) {
-		if (contains(self.inputs, relation)) return true;
-		if (!fp.dynarray.pushBack(self.inputs, relation)) return false;
-		if (fp.dynarray.pushBack(self.snapshot, size_t(0))) return true;
-		cast(void) fp.dynarray.popBack(self.inputs);
-		return false;
-	}
-	bool noted = note(head.relation);
-	foreach (ref a; body) noted = noted && note(a.relation);
-	if (!noted || !fp.dynarray.pushBack(self.rules, rule)) {
+	if (!fp.dynarray.pushBack(self.rules, rule)) {
 		fp.dynarray.free(rule.body);
-		immutable added = fp.dynarray.length(self.inputs) - inputCount;
-		if (added > 0) {
-			cast(void) fp.dynarray.popBackCount(self.inputs, added);
-			cast(void) fp.dynarray.popBackCount(self.snapshot, added);
-		}
 		return Status.outOfMemory;
 	}
-	self.evaluated = false;
+	self.stratified = false;
 	return Status.ok;
 }
 
@@ -317,7 +325,7 @@ void remapEntities(ref Program self, const(EntityId)[] remap) @trusted {
 	}
 	// Derived lists are sorted by id, so the old order no longer holds.
 	dropIndexes(self);
-	self.evaluated = false;
+	forgetRuns(self);
 }
 
 private void remapHook(void* program, const(EntityId)[] remap) {
@@ -498,6 +506,7 @@ private bool insertFacts(ref ecrs.context.Context ctx, size_t relation, const(En
 	immutable shape = ecrs.registry.lookupRelationShape(relation);
 	immutable k = shape.columns, arity = 1 + k;
 	immutable n = rows.length / arity;
+	const(ecrs.context.Context)* view = &ctx;
 	EntityId* fresh = null; // this owner's new rows, without the owner
 	scope(exit) fp.dynarray.free(fresh);
 
@@ -510,16 +519,17 @@ private bool insertFacts(ref ecrs.context.Context ctx, size_t relation, const(En
 			continue;
 		}
 
-		auto list = cast(EntityId**) ecrs.context.getOrAddComponent(ctx, e, relation);
-		if (list is null) return false;
-		immutable existing = fp.dynarray.length(*list) / k;
+		// Searched through a const view, so an owner gaining nothing leaves the relation's generation alone, and a round deriving nothing new changes nothing.
+		auto found = ecrs.context.findComponent(*view, e, relation);
+		const(EntityId)* old = found is null ? null : *cast(const(EntityId*)*) found;
+		immutable existing = fp.dynarray.length(old) / k;
 		if (fresh !is null) fp.dynarray.clear(fresh);
 		size_t lo = 0;
 		foreach (i; start .. end) {
 			auto row = rows[i * arity + 1 .. i * arity + arity];
 			// Rows ascend, so each search resumes where the last ended, galloping to bound it; every row before `lo` is less than `row`.
 			size_t hi = lo, step = 1;
-			while (hi < existing && lessTuple((*list)[hi * k .. hi * k + k], row)) {
+			while (hi < existing && lessTuple(old[hi * k .. hi * k + k], row)) {
 				lo = hi + 1;
 				hi = lo + step;
 				step *= 2;
@@ -527,15 +537,17 @@ private bool insertFacts(ref ecrs.context.Context ctx, size_t relation, const(En
 			if (hi > existing) hi = existing;
 			while (lo < hi) {
 				immutable mid = (lo + hi) / 2;
-				if (lessTuple((*list)[mid * k .. mid * k + k], row)) lo = mid + 1;
+				if (lessTuple(old[mid * k .. mid * k + k], row)) lo = mid + 1;
 				else hi = mid;
 			}
-			if (lo < existing && (*list)[lo * k .. lo * k + k] == row) continue;
+			if (lo < existing && old[lo * k .. lo * k + k] == row) continue;
 			if (!append(fresh, row) || !append(delta, rows[i * arity .. i * arity + arity])) return false;
 		}
 		immutable added = fp.dynarray.length(fresh) / k;
 		if (added == 0) continue;
 
+		auto list = cast(EntityId**) ecrs.context.getOrAddComponent(ctx, e, relation);
+		if (list is null) return false;
 		if (fp.dynarray.grow(*list, added * k) is null) return false;
 		auto all = *list;
 		// Backward merge: `i` walks the old rows, `j` the new, `w` the output.
@@ -999,13 +1011,6 @@ private bool join(ref Program self, ref ecrs.context.Context ctx, const(Atom)[] 
 }
 
 
-private bool upToDate(const ref Program self, const ref ecrs.context.Context ctx) @trusted {
-	if (!self.evaluated || self.traitsSeen != ecrs.registry.traitsEpoch()) return false;
-	foreach (i, relation; fp.dynarray.slice(self.inputs))
-		if (ecrs.context.generation(ctx, relation) != self.snapshot[i]) return false;
-	return true;
-}
-
 private size_t derivedIndex(const ref Program self, size_t relation) @trusted {
 	foreach (i, d; fp.dynarray.slice(self.derived)) if (d == relation) return i;
 	return fp.pointer.notFound;
@@ -1069,10 +1074,37 @@ private Status stratify(const ref Program self, ref size_t* order, ref size_t* s
 	return Status.ok;
 }
 
+// Rebuilds `self.strata` from the rules, every one yet to run. Returns what `stratify` does, leaving no strata unless it succeeds.
+private Status buildStrata(ref Program self) @trusted {
+	dropStrata(self);
+	size_t* order = null, start = null;
+	scope(exit) { fp.dynarray.free(order); fp.dynarray.free(start); }
+	if (immutable status = stratify(self, order, start)) return status;
+	foreach (k; 0 .. fp.dynarray.length(start) - 1) {
+		auto members = order[start[k] .. start[k + 1]];
+		if (!fp.dynarray.pushBack(self.strata, Stratum.init)) {
+			dropStrata(self);
+			return Status.outOfMemory;
+		}
+		auto stratum = fp.dynarray.back(self.strata);
+		bool note(size_t relation) { return contains(stratum.inputs, relation) || fp.dynarray.pushBack(stratum.inputs, relation); }
+		bool built = append(stratum.members, members);
+		foreach (d; members) built = built && note(self.derived[d]);
+		foreach (ref r; fp.dynarray.slice(self.rules))
+			if (contains(stratum.members, derivedIndex(self, r.head.relation)))
+				foreach (ref a; fp.dynarray.slice(r.body)) built = built && note(a.relation);
+		if (!built) {
+			dropStrata(self);
+			return Status.outOfMemory;
+		}
+	}
+	self.stratified = true;
+	return Status.ok;
+}
+
 // One partition of one rule's join for one round, buffering the head tuples it derives, so tasks share nothing they write.
 private struct Task {
 	Program* program;
-	ecrs.context.Context* ctx;
 	const(Rule)* rule;
 	size_t deltaAtom;
 	const(EntityId)[] delta;
@@ -1082,14 +1114,13 @@ private struct Task {
 	bool failed = false;
 }
 
-private void runTask(void* arg) @trusted {
-	auto task = cast(Task*) arg;
+private bool runTask(ref ecrs.context.Context ctx, ref Task task) @trusted {
 	const head = &task.rule.head;
 	bool buffered = true;
 	// Head tuples reach `output` in batches, sparing each one a dynarray append's checks.
 	EntityId[128 * maxArity] pending;
 	size_t used = 0;
-	immutable joined = join(*task.program, *task.ctx, fp.dynarray.slice(task.rule.body), task.rule.varCount, task.deltaAtom, task.delta, (b) {
+	immutable joined = join(*task.program, ctx, fp.dynarray.slice(task.rule.body), task.rule.varCount, task.deltaAtom, task.delta, (b) {
 		if (used + head.arity > pending.length) {
 			buffered = append(task.output, pending[0 .. used]);
 			used = 0;
@@ -1100,12 +1131,7 @@ private void runTask(void* arg) @trusted {
 	}, task.partition, task.partitions);
 	buffered = buffered && append(task.output, pending[0 .. used]);
 	task.failed = !joined || !buffered;
-}
-
-// Runs `jobs` on `pool`, or inline on this thread if the pool cannot take them.
-private void runJobs(bc.threadpool.ThreadPool* pool, bc.threadpool.Job[] jobs) {
-	if (bc.threadpool.run(pool, jobs)) return;
-	foreach (job; jobs) job.fn(job.arg);
+	return !task.failed;
 }
 
 // Below this many ids a join or commit is not worth waking the pool: at 512, a 600-round chain closure ran twice as slow.
@@ -1113,24 +1139,25 @@ private enum size_t parallelThreshold = 8192;
 
 // One owner bucket of a parallel commit, so buckets write disjoint entities' lists.
 private struct Bucket {
-	ecrs.context.Context* ctx;
 	size_t relation, arity;
 	EntityId* rows = null;
 	EntityId* delta = null;
-	bool failed = false;
+	size_t newOwners = 0; // owners in `rows` without a list yet
 }
 
-private void sortBucket(void* arg) @trusted {
-	auto b = cast(Bucket*) arg;
-	b.failed = !sortUnique(b.rows, b.arity);
+// Sorts `b`'s rows and counts the lists inserting them will add, which concurrent writes must prepare for.
+private bool sortBucket(ref ecrs.context.Context ctx, ref Bucket b) @trusted {
+	if (!sortUnique(b.rows, b.arity)) return false;
+	for (size_t j = 0; j < fp.dynarray.length(b.rows); j += b.arity)
+		if ((j == 0 || b.rows[j] != b.rows[j - b.arity]) && !ecrs.context.hasComponent(ctx, b.rows[j], b.relation)) ++b.newOwners;
+	return true;
 }
 
-private void insertBucket(void* arg) @trusted {
-	auto b = cast(Bucket*) arg;
-	b.failed = !insertFacts(*b.ctx, b.relation, fp.dynarray.slice(b.rows), b.delta);
+private bool insertBucket(ref ecrs.context.Context ctx, ref Bucket b) @trusted {
+	return insertFacts(ctx, b.relation, fp.dynarray.slice(b.rows), b.delta);
 }
 
-// `sortUnique` and `insertFacts` across `pool`; owners' lists are created serially between the phases, since only writes to existing components may run concurrently.
+// `sortUnique` and `insertFacts` across `pool`, buckets holding disjoint owners, so each owner's list is created and written by one thread under concurrent writes.
 private bool insertInParallel(ref ecrs.context.Context ctx, bc.threadpool.ThreadPool* pool, size_t parts, size_t relation, size_t arity, const(Task)* tasks, size_t member, ref EntityId* delta) @trusted {
 	auto buckets = fp.dynarray.create!Bucket(parts);
 	if (buckets is null) return false;
@@ -1138,7 +1165,7 @@ private bool insertInParallel(ref ecrs.context.Context ctx, bc.threadpool.Thread
 		foreach (ref b; fp.dynarray.slice(buckets)) { fp.dynarray.free(b.rows); fp.dynarray.free(b.delta); }
 		fp.dynarray.free(buckets);
 	}
-	foreach (ref b; fp.dynarray.slice(buckets)) b = Bucket(&ctx, relation, arity);
+	foreach (ref b; fp.dynarray.slice(buckets)) b = Bucket(relation, arity);
 	foreach (ref t; fp.dynarray.slice(tasks)) {
 		if (t.member != member) continue;
 		immutable n = fp.dynarray.length(t.output);
@@ -1146,136 +1173,166 @@ private bool insertInParallel(ref ecrs.context.Context ctx, bc.threadpool.Thread
 			if (!append(buckets[(t.output[j] * 0x9E3779B1u >> 7) % parts].rows, t.output[j .. j + arity])) return false;
 	}
 
-	auto jobs = fp.dynarray.create!(bc.threadpool.Job)(parts);
-	if (jobs is null) return false;
-	scope(exit) fp.dynarray.free(jobs);
-	bool phase(bc.threadpool.JobFunction fn) {
-		foreach (k; 0 .. parts) jobs[k] = bc.threadpool.Job(fn, &buckets[k]);
-		ecrs.context.enterParallel(ctx);
-		runJobs(pool, jobs[0 .. parts]);
-		ecrs.context.exitParallel(ctx);
-		foreach (ref b; fp.dynarray.slice(buckets)) if (b.failed) return false;
-		return true;
-	}
-	if (!phase(&sortBucket)) return false;
-	foreach (ref b; fp.dynarray.slice(buckets))
-		for (size_t j = 0; j < fp.dynarray.length(b.rows); j += arity)
-			if ((j == 0 || b.rows[j] != b.rows[j - arity]) && ecrs.context.getOrAddComponent(ctx, b.rows[j], relation) is null) return false;
-	if (!phase(&insertBucket)) return false;
+	if (!ecrs.schedules.parallel!sortBucket(ctx, pool, fp.dynarray.slice(buckets))) return false;
+	size_t newOwners = 0;
+	foreach (ref b; fp.dynarray.slice(buckets)) newOwners += b.newOwners;
+	if (!ecrs.context.prepareConcurrentAdds(ctx, relation, newOwners)) return false;
+	if (!ecrs.schedules.concurrentWrites(ctx, ecrs.schedules.parallel!insertBucket(pool, fp.dynarray.slice(buckets)))) return false;
 	foreach (ref b; fp.dynarray.slice(buckets))
 		if (!append(delta, fp.dynarray.slice(b.delta))) return false;
 	return true;
 }
 
-// Semi-naive evaluation of one stratum; each round reads one fixed store, so its joins may run on `pool`. False if allocation fails.
-private bool evaluateStratum(ref Program self, ref ecrs.context.Context ctx, const(size_t)[] members, bc.threadpool.ThreadPool* pool) @trusted {
-	immutable m = members.length;
-	immutable partitions = pool is null ? 1 : bc.threadpool.workerCount(pool);
-	auto delta = cast(EntityId**) fp.pointer.allocFunction(null, m * (EntityId*).sizeof);
-	if (delta is null) return false;
-	scope(exit) cast(void) fp.pointer.allocFunction(delta, 0);
-	foreach (i; 0 .. m) delta[i] = null;
-	scope(exit) foreach (i; 0 .. m) fp.dynarray.free(delta[i]);
+// One stratum's semi-naive state: what the last round added to each member, and the next round's tasks, whose joins read one fixed store.
+private struct Rounds {
+	Program* program;
+	const(size_t)[] members; // indexes into `program.derived`
+	bc.threadpool.ThreadPool* pool;
+	size_t partitions;
+	EntityId** delta = null; // per member
 	Task* tasks = null;
-	scope(exit) {
-		foreach (ref t; fp.dynarray.slice(tasks)) fp.dynarray.free(t.output);
-		fp.dynarray.free(tasks);
-	}
-	bool failed = false;
-
-	size_t member(size_t relation) {
-		immutable d = derivedIndex(self, relation);
-		foreach (i, x; members) if (x == d) return i;
-		return fp.pointer.notFound;
-	}
-
 	bool wide = false; // some task this round is split across the pool
-	void schedule(const(Rule)* r, size_t deltaAtom, const(EntityId)[] deltaFacts) {
-		immutable split = deltaAtom != fp.pointer.notFound && deltaFacts.length < parallelThreshold ? 1 : partitions;
-		wide |= split > 1;
-		foreach (p; 0 .. split)
-			failed |= !fp.dynarray.pushBack(tasks, Task(&self, &ctx, r, deltaAtom, deltaFacts, p, split, member(r.head.relation)));
-	}
-
-	void dispatch() {
-		immutable n = fp.dynarray.length(tasks);
-		scope(exit) wide = false;
-		auto jobs = !wide || n <= 1 ? null : fp.dynarray.create!(bc.threadpool.Job)(n);
-		scope(exit) fp.dynarray.free(jobs);
-		if (jobs is null) {
-			foreach (ref t; fp.dynarray.slice(tasks)) runTask(&t);
-		} else {
-			foreach (i, ref t; fp.dynarray.slice(tasks)) jobs[i] = bc.threadpool.Job(&runTask, &t);
-			ecrs.context.enterParallel(ctx); // a structural change from a join now fails loudly
-			runJobs(pool, jobs[0 .. n]);
-			ecrs.context.exitParallel(ctx);
-		}
-		foreach (ref t; fp.dynarray.slice(tasks)) failed |= t.failed;
-	}
-
-	bool commit() {
-		bool any = false;
-		foreach (i; 0 .. m) {
-			immutable relation = self.derived[members[i]];
-			immutable arity = 1 + ecrs.registry.lookupRelationShape(relation).columns;
-			if (delta[i] !is null) fp.dynarray.clear(delta[i]);
-			immutable before = ecrs.context.generation(ctx, relation);
-			size_t total = 0;
-			foreach (ref t; fp.dynarray.slice(tasks))
-				if (t.member == i) total += fp.dynarray.length(t.output);
-			bool inserted;
-			if (partitions > 1 && total >= parallelThreshold && arity > 1)
-				inserted = insertInParallel(ctx, pool, partitions, relation, arity, tasks, i, delta[i]);
-			else {
-				EntityId* rows = null;
-				scope(exit) fp.dynarray.free(rows);
-				inserted = true;
-				foreach (ref t; fp.dynarray.slice(tasks))
-					if (t.member == i) inserted = inserted && append(rows, fp.dynarray.slice(t.output));
-				inserted = inserted && sortUnique(rows, arity) && insertFacts(ctx, relation, fp.dynarray.slice(rows), delta[i]);
-			}
-			if (!inserted) {
-				failed = true;
-				return false;
-			}
-			extendIndexes(self, ctx, relation, before, delta[i], arity);
-			any |= fp.dynarray.length(delta[i]) > 0;
-		}
-		foreach (ref t; fp.dynarray.slice(tasks)) fp.dynarray.free(t.output);
-		if (tasks !is null) fp.dynarray.clear(tasks);
-		return any;
-	}
-
-	foreach (ref r; fp.dynarray.slice(self.rules))
-		if (member(r.head.relation) != fp.pointer.notFound) schedule(&r, fp.pointer.notFound, null);
-	if (!failed) dispatch();
-
-	while (!failed && commit()) {
-		foreach (ref r; fp.dynarray.slice(self.rules)) {
-			if (member(r.head.relation) == fp.pointer.notFound) continue;
-			// A closure can pair an old fact with a new one, which no delta shows, so rules reading a grown trait relation rerun fully.
-			bool rerun = false;
-			foreach (ref a; fp.dynarray.slice(r.body)) {
-				immutable k = member(a.relation);
-				rerun |= !a.negated && k != fp.pointer.notFound && ecrs.registry.lookupRelationShape(a.relation).traits != 0
-					&& fp.dynarray.length(delta[k]) > 0;
-			}
-			if (rerun) {
-				schedule(&r, fp.pointer.notFound, null);
-				continue;
-			}
-			foreach (i, ref a; fp.dynarray.slice(r.body)) {
-				immutable k = member(a.relation);
-				if (a.negated || k == fp.pointer.notFound || fp.dynarray.length(delta[k]) == 0) continue;
-				schedule(&r, i, fp.dynarray.slice(delta[k]));
-			}
-		}
-		if (!failed) dispatch();
-	}
-	return !failed;
 }
 
-/// Brings every relation `self` derives up to date with `ctx`: a no-op if no relation the rules mention, nor any trait, changed since the last call, and otherwise a full recomputation, each round's joins spread over `pool` if one is given. Read results through a `const` context: a mutable access counts as a change, so forces the next call to recompute.
+private void free(ref Rounds self) @trusted {
+	if (self.delta !is null) foreach (i; 0 .. self.members.length) fp.dynarray.free(self.delta[i]);
+	cast(void) fp.pointer.allocFunction(self.delta, 0);
+	foreach (ref t; fp.dynarray.slice(self.tasks)) fp.dynarray.free(t.output);
+	fp.dynarray.free(self.tasks);
+	self.delta = null;
+	self.tasks = null;
+}
+
+private size_t member(const ref Rounds self, size_t relation) {
+	immutable d = derivedIndex(*self.program, relation);
+	foreach (i, x; self.members) if (x == d) return i;
+	return fp.pointer.notFound;
+}
+
+private bool schedule(ref Rounds self, const(Rule)* r, size_t deltaAtom, const(EntityId)[] deltaFacts) {
+	immutable split = deltaAtom != fp.pointer.notFound && deltaFacts.length < parallelThreshold ? 1 : self.partitions;
+	self.wide |= split > 1;
+	foreach (p; 0 .. split)
+		if (!fp.dynarray.pushBack(self.tasks, Task(self.program, r, deltaAtom, deltaFacts, p, split, member(self, r.head.relation)))) return false;
+	return true;
+}
+
+private bool dispatch(ref ecrs.context.Context ctx, ref Rounds self) @trusted {
+	scope(exit) self.wide = false;
+	auto all = fp.dynarray.slice(self.tasks);
+	return self.wide ? ecrs.schedules.parallel!runTask(ctx, self.pool, all) : ecrs.schedules.sequential!runTask(ctx, all);
+}
+
+// Inserts what the round's tasks derived, making it the next round's delta. False if allocation fails.
+private bool commit(ref ecrs.context.Context ctx, ref Rounds self) @trusted {
+	foreach (i; 0 .. self.members.length) {
+		immutable relation = self.program.derived[self.members[i]];
+		immutable arity = 1 + ecrs.registry.lookupRelationShape(relation).columns;
+		if (self.delta[i] !is null) fp.dynarray.clear(self.delta[i]);
+		immutable before = ecrs.context.generation(ctx, relation);
+		size_t total = 0;
+		foreach (ref t; fp.dynarray.slice(self.tasks))
+			if (t.member == i) total += fp.dynarray.length(t.output);
+		bool inserted;
+		if (self.partitions > 1 && total >= parallelThreshold && arity > 1)
+			inserted = insertInParallel(ctx, self.pool, self.partitions, relation, arity, self.tasks, i, self.delta[i]);
+		else {
+			EntityId* rows = null;
+			scope(exit) fp.dynarray.free(rows);
+			inserted = true;
+			foreach (ref t; fp.dynarray.slice(self.tasks))
+				if (t.member == i) inserted = inserted && append(rows, fp.dynarray.slice(t.output));
+			inserted = inserted && sortUnique(rows, arity) && insertFacts(ctx, relation, fp.dynarray.slice(rows), self.delta[i]);
+		}
+		if (!inserted) return false;
+		extendIndexes(*self.program, ctx, relation, before, self.delta[i], arity);
+	}
+	foreach (ref t; fp.dynarray.slice(self.tasks)) fp.dynarray.free(t.output);
+	if (self.tasks !is null) fp.dynarray.clear(self.tasks);
+	return true;
+}
+
+// Every rule of the stratum, in full.
+private bool firstRound(ref ecrs.context.Context ctx, ref Rounds self) @trusted {
+	foreach (ref r; fp.dynarray.slice(self.program.rules))
+		if (member(self, r.head.relation) != fp.pointer.notFound && !schedule(self, &r, fp.pointer.notFound, null)) return false;
+	return dispatch(ctx, self) && commit(ctx, self);
+}
+
+// Each rule joined against what the last round added to a relation it reads, once per such atom.
+private bool nextRound(ref ecrs.context.Context ctx, ref Rounds self) @trusted {
+	foreach (ref r; fp.dynarray.slice(self.program.rules)) {
+		if (member(self, r.head.relation) == fp.pointer.notFound) continue;
+		// A closure can pair an old fact with a new one, which no delta shows, so rules reading a grown trait relation rerun fully.
+		bool rerun = false;
+		foreach (ref a; fp.dynarray.slice(r.body)) {
+			immutable k = member(self, a.relation);
+			rerun |= !a.negated && k != fp.pointer.notFound && ecrs.registry.lookupRelationShape(a.relation).traits != 0
+				&& fp.dynarray.length(self.delta[k]) > 0;
+		}
+		if (rerun) {
+			if (!schedule(self, &r, fp.pointer.notFound, null)) return false;
+			continue;
+		}
+		foreach (i, ref a; fp.dynarray.slice(r.body)) {
+			immutable k = member(self, a.relation);
+			if (a.negated || k == fp.pointer.notFound || fp.dynarray.length(self.delta[k]) == 0) continue;
+			if (!schedule(self, &r, i, fp.dynarray.slice(self.delta[k]))) return false;
+		}
+	}
+	return dispatch(ctx, self) && commit(ctx, self);
+}
+
+// Semi-naive evaluation of one stratum: a first round, then rounds until one leaves the members' generations unchanged. False if allocation fails.
+private bool evaluateStratum(ref Program self, ref ecrs.context.Context ctx, const(size_t)[] members, bc.threadpool.ThreadPool* pool) @trusted {
+	immutable m = members.length;
+	Rounds[1] rounds;
+	rounds[0] = Rounds(&self, members, pool, pool is null ? 1 : bc.threadpool.workerCount(pool));
+	scope(exit) free(rounds[0]);
+	auto delta = cast(EntityId**) fp.pointer.allocFunction(null, m * (EntityId*).sizeof);
+	if (delta is null) return false;
+	foreach (i; 0 .. m) delta[i] = null;
+	rounds[0].delta = delta;
+	auto watched = cast(size_t*) fp.pointer.allocFunction(null, m * size_t.sizeof);
+	if (watched is null) return false;
+	scope(exit) cast(void) fp.pointer.allocFunction(watched, 0);
+	foreach (i; 0 .. m) watched[i] = self.derived[members[i]];
+	return ecrs.schedules.sequential(ctx, ecrs.schedules.sequential!firstRound(rounds[]), ecrs.schedules.untilStable(ecrs.schedules.sequential!nextRound(rounds[]), watched[0 .. m]));
+}
+
+// A stratum's evaluation as a schedule: its members cleared, then derived afresh.
+private struct StratumRun {
+	Program* program;
+	const(Stratum)* stratum;
+	bc.threadpool.ThreadPool* pool;
+
+	@nogc nothrow:
+	bool opCall(ref ecrs.context.Context ctx) @trusted {
+		const(size_t)[] members = fp.dynarray.slice(stratum.members);
+		foreach (d; members)
+			if (!ecrs.context.clearComponent(ctx, program.derived[d])) return false;
+		return evaluateStratum(*program, ctx, members, pool);
+	}
+}
+
+// `evaluate`'s work, apart from recording the status it returns.
+private Status recompute(ref Program self, ref ecrs.context.Context ctx, bc.threadpool.ThreadPool* pool) @trusted {
+	assert(!ecrs.context.inParallel(ctx), "ecrs: Datalog evaluation writes the store; run it outside parallel schedules");
+	if (!self.stratified)
+		if (immutable status = buildStrata(self)) return status;
+	immutable epoch = ecrs.registry.traitsEpoch();
+	if (self.traitsSeen != epoch) {
+		forgetRuns(self);
+		self.traitsSeen = epoch;
+	}
+
+	bool runStratum(ref ecrs.context.Context c, ref Stratum stratum) {
+		return ecrs.schedules.whenChanged(c, StratumRun(&self, &stratum, pool), stratum.seen, fp.dynarray.slice(stratum.inputs));
+	}
+	return ecrs.schedules.sequential!runStratum(ctx, fp.dynarray.slice(self.strata)) ? Status.ok : Status.outOfMemory;
+}
+
+/// Brings every relation `self` derives up to date with `ctx`, stratum by stratum through `ecrs.schedules.whenChanged`: a stratum is recomputed from scratch only if a relation its rules mention, or any trait, changed since it last ran, and what it rewrites counts as a change to the strata reading it. Each round's joins spread over `pool` if one is given. Read results through a `const` context: a mutable access counts as a change, so forces the next call to recompute.
 ///
 /// Returns `Status.unstratifiable`, changing nothing, if the rules recurse through negation, or `Status.outOfMemory` if allocation fails, leaving the derived relations partial until a later call succeeds.
 ///
@@ -1293,26 +1350,20 @@ private bool evaluateStratum(ref Program self, ref ecrs.context.Context ctx, con
 /// assert(evaluate(p, ctx) == Status.ok);
 /// assert(ecrs.context.hasComponent(ctx, child, hasParent) && !ecrs.context.hasComponent(ctx, parent, hasParent));
 /// ---
-Status evaluate(ref Program self, ref ecrs.context.Context ctx, bc.threadpool.ThreadPool* pool = null) @trusted {
-	assert(!ecrs.context.inParallel(ctx), "ecrs: Datalog evaluation writes the store; run it outside parallel systems");
-	if (upToDate(self, ctx)) return Status.ok;
-
-	size_t* order = null, start = null;
-	scope(exit) { fp.dynarray.free(order); fp.dynarray.free(start); }
-	if (immutable status = stratify(self, order, start)) return status;
-
-	self.evaluated = false;
-	foreach (relation; fp.dynarray.slice(self.derived))
-		if (!ecrs.context.clearComponent(ctx, relation)) return Status.outOfMemory;
-	foreach (k; 0 .. fp.dynarray.length(start) - 1)
-		if (!evaluateStratum(self, ctx, order[start[k] .. start[k + 1]], pool)) return Status.outOfMemory;
-
-	foreach (i, relation; fp.dynarray.slice(self.inputs))
-		self.snapshot[i] = ecrs.context.generation(ctx, relation);
-	self.traitsSeen = ecrs.registry.traitsEpoch();
-	self.evaluated = true;
-	return Status.ok;
+Status evaluate(ref Program self, ref ecrs.context.Context ctx, bc.threadpool.ThreadPool* pool = null) {
+	self.status = recompute(self, ctx, pool);
+	return self.status;
 }
+
+/// What the last `evaluate` of `self` returned, directly or through `query` or an `evaluation` schedule, or `Status.ok` if it has never run.
+///
+/// Examples:
+/// ---
+/// Program p;
+/// scope(exit) free(p);
+/// assert(lastStatus(p) == Status.ok);
+/// ---
+Status lastStatus(const ref Program self) { return self.status; }
 
 /// Evaluates `self`, on `pool` if given, then calls `onMatch` with the bindings, indexed by variable id, of each solution of `body` against `ctx`, until it returns false. A solution may repeat if a base relation lists a tuple twice. `onMatch` runs on the calling thread and must not change the store.
 ///
@@ -1337,6 +1388,49 @@ Status query(ref Program self, ref ecrs.context.Context ctx, const(Atom)[] body,
 	if (!validBody(body, varCount)) return Status.invalid;
 	if (immutable status = evaluate(self, ctx, pool)) return status;
 	return join(self, ctx, body, varCount, fp.pointer.notFound, null, onMatch) ? Status.ok : Status.outOfMemory;
+}
+
+
+/// `evaluate` as an `ecrs.schedules` schedule, from `evaluation(program, pool)`: a copyable struct callable as `bool opCall(ref Context)`, or with any type owning its context as a `ctx` member, so a schedule can bring derived relations up to date between the schedules that write base facts and those that read derived ones. It returns whether `evaluate` succeeded; `lastStatus` says how it failed. The program must not move, nor be freed, while bound. Like `evaluate`, it must not run inside a parallel combinator.
+struct Evaluation {
+	private Program* program;
+	private bc.threadpool.ThreadPool* pool;
+
+	@nogc nothrow:
+	/// Evaluates the program against `ctx`.
+	///
+	/// Examples:
+	/// ---
+	/// auto ctx = ecrs.context.create();
+	/// scope(exit) ecrs.context.free(ctx);
+	/// Program p;
+	/// scope(exit) free(p);
+	/// auto schedule = evaluation(p);
+	/// assert(schedule(ctx) && lastStatus(p) == Status.ok);
+	/// ---
+	bool opCall(ref ecrs.context.Context ctx) { return evaluate(*program, ctx, pool) == Status.ok; }
+
+	/// Ditto, over the context a type owns as a `ctx` member.
+	bool opCall(ContextLike)(ref ContextLike contextLike) if (ecrs.schedules.isContextLike!ContextLike) {
+		return evaluate(*program, ecrs.schedules.contextOf(contextLike), pool) == Status.ok;
+	}
+}
+
+/// Ditto
+///
+/// Examples:
+/// ---
+/// static bool writeFacts(ref ecrs.context.Context) @nogc nothrow { return true; }
+/// static bool readDerived(ref ecrs.context.Context) @nogc nothrow { return true; }
+/// auto ctx = ecrs.context.create();
+/// scope(exit) ecrs.context.free(ctx);
+/// Program p;
+/// scope(exit) free(p);
+/// auto frame = ecrs.schedules.sequential(&writeFacts, evaluation(p), &readDerived);
+/// assert(frame(ctx));
+/// ---
+Evaluation evaluation(ref Program self, bc.threadpool.ThreadPool* pool = null) @trusted {
+	return Evaluation(&self, pool);
 }
 
 
@@ -1426,7 +1520,10 @@ unittest {
 
 	assert(p.addRule(atom(a, x), atom(person, x), negate(atom(b, x))) == Status.ok);
 	assert(p.addRule(atom(b, x), atom(person, x), negate(atom(a, x))) == Status.ok);
+	assert(lastStatus(p) == Status.ok);
 	assert(p.evaluate(ctx) == Status.unstratifiable);
+	assert(lastStatus(p) == Status.unstratifiable);
+	assert(!evaluation(p)(ctx) && lastStatus(p) == Status.unstratifiable);
 
 	assert(p.addRule(atom(a, y), atom(person, x)) == Status.invalid); // head variable unbound
 	assert(p.addRule(atom(a, x), atom(person, x), negate(atom(b, y))) == Status.invalid); // negated variable unbound
@@ -1435,9 +1532,17 @@ unittest {
 	assert(p.addRule(negate(atom(a, x)), atom(person, x)) == Status.invalid);
 	assert(p.derive("test.datalog.a", 1) == fp.pointer.notFound);
 	assert(p.derive("test.datalog.a", 0) == a);
+	// A name too long for the stack buffer is copied to the heap to be terminated, and that copy can be refused.
+	static immutable longName = "test.datalog." ~ "long-name-past-the-stack-buffer-of-derive-" ~ "long-name-past-the-stack-buffer-of-derive-" ~ "long-name-past-the-stack-buffer-of-derive-";
+	static assert(longName.length >= 128);
+	ecrs.registry.failAllocationsAfter(0);
+	assert(p.derive(longName, 0) == fp.pointer.notFound);
+	ecrs.registry.restoreAllocations();
+	immutable long_ = p.derive(longName, 0);
+	assert(long_ != fp.pointer.notFound && p.derive(longName, 0) == long_);
 
 	// Every allocation addRule makes can fail, leaving the program as it was.
-	immutable rules = fp.dynarray.length(p.rules), inputs = fp.dynarray.length(p.inputs);
+	immutable rules = fp.dynarray.length(p.rules);
 	immutable c = p.derive("test.datalog.c", 0);
 	foreach (n; 0 .. 16) {
 		ecrs.registry.failAllocationsAfter(n);
@@ -1445,8 +1550,7 @@ unittest {
 		ecrs.registry.restoreAllocations();
 		if (status == Status.ok) break;
 		assert(status == Status.outOfMemory);
-		assert(fp.dynarray.length(p.rules) == rules && fp.dynarray.length(p.inputs) == inputs);
-		assert(fp.dynarray.length(p.snapshot) == inputs);
+		assert(fp.dynarray.length(p.rules) == rules);
 	}
 	assert(fp.dynarray.length(p.rules) == rules + 1);
 }
@@ -1497,6 +1601,28 @@ unittest {
 			if (sorted) break;
 			assert(fp.dynarray.slice(rows) == before[0 .. 6 * arity]);
 		}
+	}
+
+	// Inserting only rows a derived relation already holds leaves its generation alone, which is what ends a stratum's rounds.
+	auto ctx = ecrs.context.create();
+	scope(exit) ecrs.context.free(ctx);
+	Program p;
+	scope(exit) free(p);
+	immutable pairs = p.derive("test.datalog.insertPairs", 1), tags = p.derive("test.datalog.insertTags", 0);
+	immutable a = ecrs.context.addEntity(ctx), b = ecrs.context.addEntity(ctx);
+	immutable EntityId[4] pairRows = [a, b, b, a];
+	immutable EntityId[2] tagRows = [a, b];
+	EntityId* delta = null;
+	scope(exit) fp.dynarray.free(delta);
+	foreach (i; 0 .. 2) {
+		immutable relation = i == 0 ? pairs : tags;
+		const(EntityId)[] rows = i == 0 ? pairRows[] : tagRows[];
+		if (delta !is null) fp.dynarray.clear(delta);
+		assert(insertFacts(ctx, relation, rows, delta) && fp.dynarray.length(delta) == rows.length);
+		immutable g = ecrs.context.generation(ctx, relation);
+		fp.dynarray.clear(delta);
+		assert(insertFacts(ctx, relation, rows, delta) && fp.dynarray.length(delta) == 0);
+		assert(ecrs.context.generation(ctx, relation) == g);
 	}
 }
 
@@ -1606,6 +1732,37 @@ unittest {
 
 	assert(sameSet(solutions(p, f.ctx, 0, atom(root, x)), f.abraham, f.jackie));
 	assert(sameSet(solutions(p, f.ctx, 0, atom(person, x), negate(atom(root, x))), f.bart, f.lisa, f.homer, f.marge));
+
+	// As a schedule: one settling a base relation fed by a derived one. Each root adopts a fresh child until no person is a root.
+	static struct Adopt {
+		size_t root;
+		bool opCall(ref ecrs.context.Context ctx) @nogc nothrow @trusted {
+			const(ecrs.context.Context)* view = &ctx;
+			EntityId orphan = invalidEntity;
+			foreach (e; ecrs.context.entities(*view))
+				if (ecrs.context.hasComponent(*view, e, root) && ecrs.context.hasComponent!Person(*view, e)) { orphan = e; break; }
+			if (orphan == invalidEntity) return true;
+			immutable adopter = ecrs.context.addEntity(ctx);
+			return adopter != invalidEntity && fp.dynarray.pushBack(ecrs.context.getOrAddComponent!Parent(ctx, orphan).related, adopter);
+		}
+	}
+	immutable size_t[1] watched = [parent];
+	auto settle = ecrs.schedules.untilStable(ecrs.schedules.sequential(evaluation(p), Adopt(root)), watched[]);
+	assert(settle(f.ctx) && lastStatus(p) == Status.ok);
+	assert(count(p, f.ctx, atom(root, x), atom(person, x)) == 0);
+	assert(sameSet(solutions(p, f.ctx, 0, atom(parent, constant(f.abraham), x)), f.jackie + 1));
+	assert(sameSet(solutions(p, f.ctx, 0, atom(parent, constant(f.jackie), x)), f.jackie + 2));
+
+	// A stratum reruns only when what its rules read changes: a new person reruns `root`'s alone; a new parent reruns `hasParent`'s, then `root`'s.
+	immutable hasParentAt = ecrs.context.generation(f.ctx, hasParent), rootAt = ecrs.context.generation(f.ctx, root);
+	immutable maggie = ecrs.context.addEntity(f.ctx);
+	assert(maggie != invalidEntity && ecrs.context.addComponent!Person(f.ctx, maggie) !is null);
+	assert(sameSet(solutions(p, f.ctx, 0, atom(root, x), atom(person, x)), maggie));
+	assert(ecrs.context.generation(f.ctx, hasParent) == hasParentAt && ecrs.context.generation(f.ctx, root) > rootAt);
+
+	assert(fp.dynarray.pushBack(ecrs.context.getOrAddComponent!Parent(f.ctx, maggie).related, f.homer));
+	assert(count(p, f.ctx, atom(root, x), atom(person, x)) == 0);
+	assert(ecrs.context.generation(f.ctx, hasParent) > hasParentAt);
 }
 
 unittest {
@@ -1815,16 +1972,4 @@ unittest {
 	assert(fp.dynarray.slice(results[2]) == fp.dynarray.slice(results[0]));
 	assert(isolated[0] > 0 && isolated[0] < n);
 	assert(isolated[1] == isolated[0] && isolated[2] == isolated[0]);
-
-	// A pool that cannot take the jobs, as a fresh one whose job stack cannot grow, leaves them to run inline.
-	static void count(void* arg) @nogc nothrow { ++*cast(int*) arg; }
-	auto fresh = bc.threadpool.create(2);
-	assert(fresh !is null);
-	scope(exit) bc.threadpool.free(fresh);
-	int ran = 0;
-	bc.threadpool.Job[2] jobs = [bc.threadpool.Job(&count, &ran), bc.threadpool.Job(&count, &ran)];
-	ecrs.registry.failAllocationsAfter(0);
-	runJobs(fresh, jobs[]);
-	ecrs.registry.restoreAllocations();
-	assert(ran == 2);
 }

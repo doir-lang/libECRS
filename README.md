@@ -10,8 +10,8 @@ An entity-component-relation-system library for `-betterC` D. Entities are ids, 
 - `ecrs.storage`: per-type component storage, whose components never move while they exist.
 - `ecrs.context`: the entity and component database, `Context`, with transactions that journal changes so a rollback restores it without allocating.
 - `ecrs.relation`: fixed- or dynamic-arity relation components, `Relation!n`, and the `Relates` mixin that makes a struct of your own one.
-- `ecrs.system`: systems, and combinators that run them over a `Context` in sequence or concurrently on a `bc.threadpool`.
-- `ecrs.datalog`: stratified, semi-naive Datalog whose relations are components.
+- `ecrs.schedules`: schedules over a `Context`, or a type owning one alongside state of its own, and the combinators that build them: systems that run a function per entity or per element of a slice, and schedules of schedules, run in sequence or concurrently on a `bc.threadpool`, repeated until the store settles, or rerun only when what they watch changes.
+- `ecrs.datalog`: stratified, semi-naive Datalog whose relations are components, evaluated directly or as a schedule.
 - `ecrs.serialization`: saves a `Context` by copying out its components, or through encoding hooks for those holding pointers such as dynamic relations, and loads it back with every entity id intact.
 
 Types are plain data operated on by free functions taking them by `ref`, and every function that can fail says in its documentation how it reports it. `AGENTS.md` sets out the conventions in full.

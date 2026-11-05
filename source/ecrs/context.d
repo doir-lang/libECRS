@@ -43,13 +43,14 @@ private struct JournalEntry {
 ///
 /// Between `beginTransaction` and `commitTransaction` it journals every change, so `rollbackTransaction` can restore it as it was without allocating. Removals and replacements take an entry each; additions take one per storage, however many there are, so building a large store in one transaction costs no journal to speak of.
 ///
-/// Concurrency: any number of threads may read at once, and may write existing components of distinct entities. Structural changes, meaning adding or removing entities, components, storages or remap hooks, renumbering and sorting, need exclusive access; inside an `ecrs.system` parallel combinator they fail an assert rather than race, whatever the pool size. Between `beginConcurrentWrites` and `endConcurrentWrites` threads may also add, set and remove components of distinct existing entities, in storages that already exist.
+/// Concurrency: any number of threads may read at once, and may write existing components of distinct entities. Structural changes, meaning adding or removing entities, components, storages or remap hooks, renumbering and sorting, need exclusive access; inside an `ecrs.schedules` parallel combinator they fail an assert rather than race, whatever the pool size, unless made between `beginExclusive` and `endExclusive` by a caller that keeps every other thread out of the store meanwhile. Between `beginConcurrentWrites` and `endConcurrentWrites` threads may also add, set and remove components of distinct existing entities, in storages that already exist, from inside parallel combinators too.
 struct Context {
 	private ecrs.storage.Storage* storages = null;
 	ecrs.storage.IndexTable indexTable = null; /// Every entity's index list, freed entities' included.
 	size_t* freelist = null; /// Freed entity ids, which `addEntity` hands out again, last freed first.
 	private RemapHook* remapHooks = null;
-	private size_t parallelDepth = 0; // atomic; nonzero while a parallel system runs
+	private size_t parallelDepth = 0; // atomic; nonzero while a parallel schedule runs
+	private size_t exclusiveDepth = 0; // nonzero while one thread holds the store to itself, read only by that thread
 	private bool transaction = false;
 	private size_t firstNew; // the entity count when the transaction began; it adds entities only past it
 	private bool concurrent = false; // inside `beginConcurrentWrites`
@@ -58,7 +59,7 @@ struct Context {
 	private ubyte* saved = null; // replaced components' old bytes, each at an offset aligned to `savedAlignment`
 }
 
-/// Whether an `ecrs.system` parallel combinator is running on `self`.
+/// Whether an `ecrs.schedules` parallel combinator is running on `self`.
 ///
 /// Examples:
 /// ---
@@ -97,7 +98,45 @@ private bool reserveMore(T)(ref T* da, size_t n) @trusted {
 	return fp.dynarray.reserve(da, needed > 2 * capacity ? needed : 2 * capacity) !is null;
 }
 
-private enum string structuralChange = "ecrs: structural change inside a parallel system; make it after the pass";
+private enum string structuralChange = "ecrs: structural change inside a parallel schedule; make it after the pass, or between `beginExclusive` and `endExclusive`";
+
+/// Marks `self` as held by the calling thread alone until the matching `endExclusive`, so structural changes it makes meanwhile are allowed even inside an `ecrs.schedules` parallel combinator. The caller guarantees what the mark claims: every other thread stays out of the store, reading included, until it ends, as a stop-the-world protocol of the caller's own keeps them. Marks nest, and the phase `beginConcurrentWrites` opens still forbids adding or removing entities and storages.
+///
+/// Examples:
+/// ---
+/// Context ctx = create();
+/// scope(exit) free(ctx);
+/// beginExclusive(ctx);
+/// assert(inExclusive(ctx) && addEntity(ctx) != invalidEntity);
+/// endExclusive(ctx);
+/// assert(!inExclusive(ctx));
+/// ---
+void beginExclusive(ref Context self) {
+	++self.exclusiveDepth;
+}
+
+/// Ditto
+void endExclusive(ref Context self) {
+	assert(self.exclusiveDepth, "ecrs: endExclusive without beginExclusive");
+	--self.exclusiveDepth;
+}
+
+/// Whether a `beginExclusive` on `self` is still open.
+///
+/// Examples:
+/// ---
+/// Context ctx = create();
+/// assert(!inExclusive(ctx));
+/// free(ctx);
+/// ---
+bool inExclusive(const ref Context self) {
+	return self.exclusiveDepth != 0;
+}
+
+// Whether a structural change may happen now: outside parallel combinators, or inside an exclusive hold.
+private bool structureFree(const ref Context self) {
+	return self.exclusiveDepth != 0 || !inParallel(self);
+}
 private enum string concurrentStructure = "ecrs: an entity or storage added or removed during concurrent writes; make it before `beginConcurrentWrites`";
 private enum string unprepared = "ecrs: a concurrent addition to a storage `prepareConcurrentAdds` did not prepare";
 
@@ -209,7 +248,7 @@ bool inTransaction(const ref Context self) { return self.transaction; }
 /// ---
 void beginTransaction(ref Context self) {
 	assert(!self.transaction, "ecrs: transactions do not nest");
-	assert(!inParallel(self), structuralChange);
+	assert(structureFree(self), structuralChange);
 	self.transaction = true;
 	self.firstNew = fp.dynarray.length(self.indexTable);
 }
@@ -332,6 +371,7 @@ void rollbackTransaction(ref Context self) @trusted {
 /// endConcurrentWrites(ctx);
 /// ---
 bool prepareConcurrentAdds(ref Context self, size_t componentId, size_t n, size_t elementSize = ecrs.storage.Storage.invalid) @trusted {
+	assert(structureFree(self), structuralChange);
 	assert(!self.concurrent, concurrentStructure);
 	immutable size = elementSize == ecrs.storage.Storage.invalid ? ecrs.registry.lookupSize(componentId) : elementSize;
 	auto storage = getStorage(self, componentId, size);
@@ -355,7 +395,7 @@ template prepareConcurrentAdds(T, size_t unique = 0) {
 	}
 }
 
-/// Opens a phase in which several threads may add, set and remove components of existing entities at once, until `endConcurrentWrites`: each entity is changed by one thread at a time, each storage they add to has been readied by `prepareConcurrentAdds`, and removals happen only inside a transaction, which keeps their slots until it ends. Meanwhile no entity or storage may be added or removed, nor anything renumbered or sorted. Inside a transaction the changes are journaled as ever, so a rollback undoes them; the journal is the one lock writers share.
+/// Opens a phase in which several threads may add, set and remove components of existing entities at once, until `endConcurrentWrites`: each entity is changed by one thread at a time, each storage they add to has been readied by `prepareConcurrentAdds`, and removals happen only inside a transaction, which keeps their slots until it ends. Meanwhile no entity or storage may be added or removed, nor anything renumbered or sorted. The phase may enclose `ecrs.schedules` parallel combinators, whose schedules may then make these writes, but must open and close outside them. Inside a transaction the changes are journaled as ever, so a rollback undoes them; the journal is the one lock writers share.
 ///
 /// Examples:
 /// ---
@@ -369,6 +409,7 @@ template prepareConcurrentAdds(T, size_t unique = 0) {
 /// assert(getComponent!int(ctx, e) == 3);
 /// ---
 void beginConcurrentWrites(ref Context self) @trusted {
+	assert(structureFree(self), structuralChange);
 	assert(!self.concurrent, "ecrs: concurrent writes do not nest");
 	self.concurrent = true;
 	foreach (i; 0 .. fp.dynarray.length(self.storages)) self.storages[i].quiet = true;
@@ -384,6 +425,7 @@ void beginConcurrentWrites(ref Context self) @trusted {
 /// endConcurrentWrites(ctx);
 /// ---
 void endConcurrentWrites(ref Context self) @trusted {
+	assert(structureFree(self), structuralChange);
 	assert(self.concurrent);
 	self.concurrent = false;
 	foreach (i; 0 .. fp.dynarray.length(self.storages)) {
@@ -444,7 +486,7 @@ void free(ref Context self) @trusted {
 /// ---
 ecrs.storage.Storage* getStorage(ref Context self, size_t componentId, size_t elementSize) @trusted {
 	if (hasStorage(self, componentId)) return &self.storages[componentId];
-	assert(!inParallel(self), structuralChange);
+	assert(structureFree(self), structuralChange);
 	assert(!self.concurrent, concurrentStructure);
 	assert(elementSize != ecrs.storage.Storage.invalid, "ecrs: component of unknown size");
 
@@ -516,6 +558,24 @@ size_t generation(const ref Context self, size_t componentId) {
 	return storage is null ? 0 : ecrs.storage.generation(*storage);
 }
 
+/// A counter that advances whenever any component of `self` changes, as the per-component `generation` does for one: the sum of every storage's.
+///
+/// Examples:
+/// ---
+/// Context ctx = create();
+/// scope(exit) free(ctx);
+/// immutable before = generation(ctx);
+/// assert(addComponent!int(ctx, addEntity(ctx)) !is null);
+/// assert(generation(ctx) > before);
+/// ---
+size_t generation(const ref Context self) @trusted {
+	size_t sum = 0;
+	foreach (i; 0 .. fp.dynarray.length(self.storages))
+		if (self.storages[i].elementSize != ecrs.storage.Storage.invalid)
+			sum += ecrs.storage.generation(self.storages[i]);
+	return sum;
+}
+
 
 /// The number of live entities, the reserved entity 0 included.
 ///
@@ -542,7 +602,7 @@ size_t entityCount(const ref Context self) @trusted {
 /// assert(e == 1);
 /// ---
 EntityId addEntity(ref Context self) @trusted {
-	assert(!inParallel(self), structuralChange);
+	assert(structureFree(self), structuralChange);
 	assert(!self.concurrent, concurrentStructure);
 	if (self.transaction) {
 		// Never a freed id: a rollback removes what the transaction added by cutting the table back to `firstNew`.
@@ -575,7 +635,7 @@ EntityId addEntity(ref Context self) @trusted {
 /// assert(first == 1 && entityCount(ctx) == 4);
 /// ---
 EntityId addEntities(ref Context self, size_t n) @trusted {
-	assert(!inParallel(self), structuralChange);
+	assert(structureFree(self), structuralChange);
 	assert(!self.concurrent, concurrentStructure);
 	if (!reserveMore(self.indexTable, n + 1)) return invalidEntity;
 	if (fp.dynarray.length(self.indexTable) == 0) cast(void) reserveInvalidEntity(self); // reserved above
@@ -597,7 +657,7 @@ EntityId addEntities(ref Context self, size_t n) @trusted {
 /// assert(entityCount(ctx) == 1);
 /// ---
 bool removeEntity(ref Context self, EntityId e) @trusted {
-	assert(!inParallel(self), structuralChange);
+	assert(structureFree(self), structuralChange);
 	assert(!self.concurrent, concurrentStructure);
 	assert(e != invalidEntity && e < fp.dynarray.length(self.indexTable));
 	if (!reserveMore(self.freelist, 1)) return false;
@@ -672,7 +732,7 @@ template hasComponent(T, size_t unique = 0) {
 /// assert(p !is null && *p == 0);
 /// ---
 void* addComponent(ref Context self, EntityId e, size_t componentId, size_t elementSize = ecrs.storage.Storage.invalid) {
-	assert(!inParallel(self), structuralChange);
+	assert(self.concurrent || structureFree(self), structuralChange);
 	assert(!hasComponent(self, e, componentId));
 	immutable size = elementSize == ecrs.storage.Storage.invalid ? ecrs.registry.lookupSize(componentId) : elementSize;
 	auto storage = getStorage(self, componentId, size);
@@ -695,7 +755,7 @@ void* addComponent(ref Context self, EntityId e, size_t componentId, size_t elem
 /// ---
 template addComponent(T, size_t unique = 0) {
 	T* addComponent(ref Context self, EntityId e) {
-		assert(!inParallel(self), structuralChange);
+		assert(self.concurrent || structureFree(self), structuralChange);
 		assert(!.hasComponent!(T, unique)(self, e));
 		auto storage = .getStorage!(T, unique)(self);
 		if (storage is null) return null;
@@ -720,7 +780,7 @@ template addComponent(T, size_t unique = 0) {
 /// assert(!hasComponent(ctx, e, id));
 /// ---
 bool removeComponent(ref Context self, EntityId e, size_t componentId) {
-	assert(!inParallel(self), structuralChange);
+	assert(self.concurrent || structureFree(self), structuralChange);
 	assert(hasComponent(self, e, componentId));
 	auto storage = &existingStorage(self, componentId);
 	assert(!self.concurrent || self.transaction, "ecrs: concurrent writes remove components only inside a transaction, which keeps their slots until it ends");
@@ -763,7 +823,7 @@ template removeComponent(T, size_t unique = 0) {
 /// assert(!hasComponent(ctx, e, id));
 /// ---
 bool clearComponent(ref Context self, size_t componentId) @trusted {
-	assert(!inParallel(self), structuralChange);
+	assert(structureFree(self), structuralChange);
 	assert(!self.concurrent, concurrentStructure);
 	if (!hasStorage(self, componentId)) return true;
 	auto storage = &self.storages[componentId];
@@ -968,7 +1028,7 @@ template setComponent(T, size_t unique = 0) {
 /// assert(addRemapHook(ctx, &onRemap, null));
 /// ---
 bool addRemapHook(ref Context self, RemapHookFunction fn, void* userData) @trusted {
-	assert(!inParallel(self), structuralChange);
+	assert(structureFree(self), structuralChange);
 	return fp.dynarray.pushBack(self.remapHooks, RemapHook(fn, userData));
 }
 
@@ -984,7 +1044,7 @@ bool addRemapHook(ref Context self, RemapHookFunction fn, void* userData) @trust
 /// assert(!removeRemapHook(ctx, &onRemap, null));
 /// ---
 bool removeRemapHook(ref Context self, RemapHookFunction fn, void* userData) @trusted {
-	assert(!inParallel(self), structuralChange);
+	assert(structureFree(self), structuralChange);
 	foreach (i; 0 .. fp.dynarray.length(self.remapHooks))
 		if (self.remapHooks[i].fn is fn && self.remapHooks[i].userData is userData) {
 			cast(void) fp.dynarray.removeAt(self.remapHooks, i);
@@ -996,7 +1056,7 @@ bool removeRemapHook(ref Context self, RemapHookFunction fn, void* userData) @tr
 
 // Renumbers every holder at once: the index lists, storage owners, components with a remap hook, the freelist and external hooks.
 private bool renumber(ref Context self, const(size_t)[] order, const(EntityId)[] remap) @trusted {
-	assert(!inParallel(self), structuralChange);
+	assert(structureFree(self), structuralChange);
 	assert(!self.transaction, notInTransaction);
 	auto table = self.indexTable;
 	// The only step that can fail goes first, so a failure leaves every holder untouched.
@@ -1129,7 +1189,7 @@ bool compact(ref Context self) @trusted {
 /// ---
 template makeMonotonic(Ts...) if (Ts.length != 1 || !is(typeof(Ts[0]) : size_t)) {
 	bool makeMonotonic(ref Context self) {
-		assert(!inParallel(self), structuralChange);
+		assert(structureFree(self), structuralChange);
 		assert(!self.transaction, notInTransaction);
 		bool sorted = true;
 		static foreach (T; Ts) {{
@@ -1150,7 +1210,7 @@ template makeMonotonic(Ts...) if (Ts.length != 1 || !is(typeof(Ts[0]) : size_t))
 /// ---
 template makeMonotonic(T, size_t unique = 0) {
 	bool makeMonotonic(ref Context self) {
-		assert(!inParallel(self), structuralChange);
+		assert(structureFree(self), structuralChange);
 		assert(!self.transaction, notInTransaction);
 		auto storage = .getStorage!(T, unique)(self);
 		return storage !is null && ecrs.storage.sortMonotonic!(T, unique)(*storage, self.indexTable);
@@ -1166,7 +1226,7 @@ template makeMonotonic(T, size_t unique = 0) {
 /// assert(makeMonotonic(ctx, ecrs.registry.componentId!int()));
 /// ---
 bool makeMonotonic(ref Context self, size_t componentId, size_t elementSize = ecrs.storage.Storage.invalid) @trusted {
-	assert(!inParallel(self), structuralChange);
+	assert(structureFree(self), structuralChange);
 	assert(!self.transaction, notInTransaction);
 	if (!hasStorage(self, componentId)) return true;
 	assert(elementSize == ecrs.storage.Storage.invalid || elementSize == self.storages[componentId].elementSize);
@@ -1184,7 +1244,7 @@ bool makeMonotonic(ref Context self, size_t componentId, size_t elementSize = ec
 /// assert(makeAllMonotonic(ctx));
 /// ---
 bool makeAllMonotonic(ref Context self) @trusted {
-	assert(!inParallel(self), structuralChange);
+	assert(structureFree(self), structuralChange);
 	assert(!self.transaction, notInTransaction);
 	bool sorted = true;
 	foreach (id; 0 .. fp.dynarray.length(self.storages))
@@ -1425,12 +1485,19 @@ unittest {
 		assert(addComponent(ctx, m, id) !is null && addComponent!Other(ctx, m) !is null);
 	}
 	assert(removeComponent(ctx, marked[1], id));
-	immutable g = generation(ctx, id);
+	immutable g = generation(ctx, id), whole = generation(ctx);
 	assert(clearComponent(ctx, id));
-	assert(generation(ctx, id) > g);
+	assert(generation(ctx, id) > g && generation(ctx) > whole);
 	assert(ecrs.storage.empty(*getStorage(*constCtx, id)));
 	foreach (m; marked)
 		assert(!hasComponent(ctx, m, id) && hasComponent!Other(ctx, m));
+
+	// The whole context's generation moves with any one storage's, and holds still under const access.
+	immutable settled = generation(ctx);
+	cast(void) getComponent!Other(*constCtx, marked[0]);
+	assert(generation(ctx) == settled);
+	++getComponent!Other(ctx, marked[0]).v;
+	assert(generation(ctx) > settled);
 }
 
 unittest {
