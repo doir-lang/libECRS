@@ -5,6 +5,6 @@ public import ecrs.registry;
 public import ecrs.storage;
 public import ecrs.context;
 public import ecrs.relation;
-public import ecrs.system;
+public import ecrs.schedules;
 public import ecrs.datalog;
 public import ecrs.serialization;

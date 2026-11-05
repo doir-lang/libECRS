@@ -147,7 +147,7 @@ EntityId owner(const ref Storage self, size_t slot) @trusted {
 	return self.slotOwners[slot];
 }
 
-/// A counter that advances on every change to `self`, and on every mutable access, since its caller may write through the pointer; equal generations mean unchanged contents. Atomic, because parallel systems may write distinct entities at once.
+/// A counter that advances on every change to `self`, and on every mutable access, since its caller may write through the pointer; equal generations mean unchanged contents. Atomic, because parallel schedules may write distinct entities at once.
 ///
 /// Examples:
 /// ---

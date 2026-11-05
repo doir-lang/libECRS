@@ -9,7 +9,7 @@ private enum modules = [
 	"ecrs.storage",
 	"ecrs.relation",
 	"ecrs.context",
-	"ecrs.system",
+	"ecrs.schedules",
 	"ecrs.datalog",
 	"ecrs.serialization",
 	"datalog_hammer",
