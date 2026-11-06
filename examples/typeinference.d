@@ -26,18 +26,18 @@ struct AddExpr {}
 // The same component type, kept apart as distinct relations by its `unique` parameter.
 alias Link = ecrs.relation.Relation!1;
 enum : size_t { initUnique = 1, calleeUnique, argumentUnique, annotationUnique, paramUnique, returnsUnique }
-alias Operands = ecrs.relation.Relation!(ecrs.relation.dynamicExtent);
+alias Operands = ecrs.relation.Relation!(ecrs.relation.dynamicArity);
 
 extern(C) int main() {
 	scope(exit) ecrs.registry.free();
-	auto ctx = ecrs.context.create();
-	scope(exit) ecrs.context.free(ctx);
+	auto context = ecrs.context.create();
+	scope(exit) ecrs.context.free(context);
 
 	// Each step can fail only by running out of memory, which a real program would handle more gracefully.
 	bool failed = false;
 	ecrs.registry.EntityId node(const(char)* name) {
-		immutable e = ecrs.context.addEntity(ctx);
-		auto component = e == ecrs.registry.invalidEntity ? null : ecrs.context.addComponent!Name(ctx, e);
+		immutable e = ecrs.context.addEntity(context);
+		auto component = e == ecrs.registry.invalidEntity ? null : ecrs.context.addComponent!Name(context, e);
 		if (component is null) {
 			failed = true;
 			return ecrs.registry.invalidEntity;
@@ -46,12 +46,12 @@ extern(C) int main() {
 		return e;
 	}
 	void link(size_t unique)(ecrs.registry.EntityId from, ecrs.registry.EntityId to) {
-		auto component = failed ? null : ecrs.context.addComponent!(Link, unique)(ctx, from);
+		auto component = failed ? null : ecrs.context.addComponent!(Link, unique)(context, from);
 		if (component is null) failed = true;
 		else component.related[0] = to;
 	}
 	void tag(T)(ecrs.registry.EntityId e) {
-		if (!failed && ecrs.context.addComponent!T(ctx, e) is null) failed = true;
+		if (!failed && ecrs.context.addComponent!T(context, e) is null) failed = true;
 	}
 	ecrs.registry.EntityId literal(const(char)* text) {
 		auto e = node(text);
@@ -61,7 +61,7 @@ extern(C) int main() {
 	ecrs.registry.EntityId add(ecrs.registry.EntityId left, ecrs.registry.EntityId right) {
 		auto e = node("+");
 		tag!AddExpr(e);
-		auto operands = failed ? null : ecrs.context.addComponent!Operands(ctx, e);
+		auto operands = failed ? null : ecrs.context.addComponent!Operands(context, e);
 		failed |= operands is null || !fp.dynarray.pushBack(operands.related, left) || !fp.dynarray.pushBack(operands.related, right);
 		return e;
 	}
@@ -107,7 +107,7 @@ extern(C) int main() {
 	immutable badArgument = ecrs.datalog.derive(p, "types.badArgument", 0);
 
 	mixin(ecrs.datalog.createVariables!("e", "t", "x", "f", "a"));
-	auto i = ecrs.datalog.constant(intType);
+	auto i = ecrs.relation.Term(intType);
 	ecrs.datalog.Status[7] added = [
 		// hasType(e, Int) :- intLiteral(e).   hasType(e, Int) :- addExpr(e).
 		ecrs.datalog.addRule(p, ecrs.datalog.atom(hasType, e, i), ecrs.datalog.atom(intLiteral, e)),
@@ -127,21 +127,21 @@ extern(C) int main() {
 		if (status != ecrs.datalog.Status.ok) return 1;
 
 	// Results are read through a const view: a const read is not a change, so the next query need not re-evaluate.
-	const(ecrs.context.Context)* view = &ctx;
+	const(ecrs.context.Context)* view = &context;
 	const(char)* nameOf(ecrs.registry.EntityId entity) { return ecrs.context.getComponent!Name(*view, entity).text; }
 
 	immutable ecrs.registry.EntityId[7] bindings = [one, two, isZero, sum, test, bad, oops];
 	foreach (binding; bindings) {
-		ecrs.datalog.Atom[1] typeOf = [ecrs.datalog.atom(hasType, ecrs.datalog.constant(binding), t)];
+		ecrs.datalog.Atom[1] typeOf = [ecrs.datalog.atom(hasType, ecrs.relation.Term(binding), t)];
 		cast(void) printf("%s:", nameOf(binding));
-		if (ecrs.datalog.query(p, ctx, typeOf[], (b) { cast(void) printf(" %s", nameOf(b[1])); return true; }) != ecrs.datalog.Status.ok) return 1;
+		if (ecrs.datalog.query(p, context, typeOf[], (b) { cast(void) printf(" %s", nameOf(b[1])); return true; }) != ecrs.datalog.Status.ok) return 1;
 		cast(void) printf("\n");
 	}
 
 	// An error names the binding whose initializer is ill-typed.
 	bool report(size_t errors, const(char)* message) {
 		ecrs.datalog.Atom[2] body = [ecrs.datalog.atom(errors, x), ecrs.datalog.atom(initOf, e, x)];
-		return ecrs.datalog.query(p, ctx, body[], (b) {
+		return ecrs.datalog.query(p, context, body[], (b) {
 			cast(void) printf("error in %s: %s\n", nameOf(b[0]), message);
 			return true;
 		}) == ecrs.datalog.Status.ok;

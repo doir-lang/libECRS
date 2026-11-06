@@ -21,10 +21,12 @@ private immutable char[4] magic = "ECRS";
 private enum uint formatVersion = 2;
 
 
+// wrapper: views a value as the bytes the encoding writes
 private bool put(ref ubyte* out_, const(void)[] bytes) @trusted {
 	return fp.dynarray.concatenate(out_, cast(const(ubyte)[]) bytes);
 }
 
+// wrapper: views a value as the bytes the encoding writes
 private bool putValue(T)(ref ubyte* out_, T value) @trusted {
 	return put(out_, (&value)[0 .. 1]);
 }
@@ -32,19 +34,19 @@ private bool putValue(T)(ref ubyte* out_, T value) @trusted {
 private bool serializable(const ref ecrs.context.Context self, size_t componentId) {
 	auto storage = ecrs.context.getStorage(self, componentId);
 	if (storage is null || ecrs.storage.empty(*storage)) return false;
-	immutable hooks = ecrs.registry.lookupHooks(componentId);
+	immutable hooks = ecrs.registry.hooksOf(componentId);
 	return !hooks.opaque || hooks.serializeFunction !is null;
 }
 
 private bool writeSection(ref ubyte* out_, const ref ecrs.storage.Storage storage, size_t componentId) @trusted {
-	immutable encode = ecrs.registry.lookupHooks(componentId).serializeFunction;
-	auto name = ecrs.registry.lookupName(componentId);
+	immutable encode = ecrs.registry.hooksOf(componentId).serializeFunction;
+	auto name = ecrs.registry.nameOf(componentId);
 	assert(name !is null, "ecrs: serializing a component the registry has forgotten");
 	auto named = name[0 .. strlen(name) + 1];
 	if (!putValue(out_, cast(ulong) named.length) || !put(out_, named)) return false;
 	if (!putValue(out_, cast(ulong) storage.elementSize) || !putValue(out_, cast(ubyte)(encode !is null))) return false;
 	if (!putValue(out_, cast(ulong) ecrs.storage.liveCount(storage))) return false;
-	foreach (slot; 0 .. ecrs.storage.size(storage)) {
+	foreach (slot; 0 .. ecrs.storage.slotCount(storage)) {
 		immutable owner = ecrs.storage.owner(storage, slot);
 		if (owner == invalidEntity) continue;
 		auto element = ecrs.storage.get(storage, slot);
@@ -78,10 +80,10 @@ private bool writeContext(ref ubyte* out_, const ref ecrs.context.Context self) 
 /// Examples:
 /// ---
 /// static struct Health { int points; }
-/// ecrs.context.Context ctx = ecrs.context.create();
-/// scope(exit) ecrs.context.free(ctx);
-/// ecrs.context.addComponent!Health(ctx, ecrs.context.addEntity(ctx)).points = 3;
-/// ubyte* bytes = serialize(ctx);
+/// ecrs.context.Context context = ecrs.context.create();
+/// scope(exit) ecrs.context.free(context);
+/// ecrs.context.addComponent!Health(context, ecrs.context.addEntity(context)).points = 3;
+/// ubyte* bytes = serialize(context);
 /// assert(bytes !is null);
 /// fp.dynarray.free(bytes);
 /// ---
@@ -100,6 +102,7 @@ private bool take(ref const(ubyte)[] data, void* dest, size_t n) @trusted {
 	return true;
 }
 
+// wrapper: views a value as the bytes the encoding writes
 private bool takeValue(T)(ref const(ubyte)[] data, out T value) @trusted {
 	return take(data, &value, T.sizeof);
 }
@@ -112,11 +115,11 @@ private bool readSection(ref ecrs.context.Context self, ref const(ubyte)[] data)
 	data = data[name.length .. $];
 	if (strlen(name.ptr) + 1 != name.length) return false;
 
-	immutable id = ecrs.registry.lookupId(name.ptr);
+	immutable id = ecrs.registry.idOf(name.ptr);
 	if (id == fp.pointer.notFound) return false;
-	immutable hooks = ecrs.registry.lookupHooks(id);
+	immutable hooks = ecrs.registry.hooksOf(id);
 	immutable decode = hooks.deserializeFunction;
-	if (!takeValue(data, elementSize) || elementSize != ecrs.registry.lookupSize(id)) return false;
+	if (!takeValue(data, elementSize) || elementSize != ecrs.registry.elementSizeOf(id)) return false;
 	if (!takeValue(data, encoded) || encoded != (decode !is null) || (decode is null && hooks.opaque)) return false;
 	if (!takeValue(data, count)) return false;
 	immutable size = cast(size_t) elementSize;
@@ -139,9 +142,9 @@ private bool readSection(ref ecrs.context.Context self, ref const(ubyte)[] data)
 private bool freeEntities(ref ecrs.context.Context self, const(ubyte)[] freedIds) @trusted {
 	if (freedIds.length == 0) return true;
 	immutable n = fp.dynarray.length(self.indexTable);
-	auto freed = cast(bool*) fp.pointer.allocFunction(null, n * bool.sizeof);
+	auto freed = cast(bool*) fp.pointer.allocator(null, n * bool.sizeof);
 	if (freed is null) return false;
-	scope(exit) cast(void) fp.pointer.allocFunction(freed, 0);
+	scope(exit) cast(void) fp.pointer.allocator(freed, 0);
 	freed[0 .. n] = false;
 	while (freedIds.length > 0) {
 		ulong e;
@@ -208,10 +211,10 @@ unittest {
 	static import ecrs.relation;
 	static struct Vec2 { float x = 0, y = 0; }
 	alias Next = ecrs.relation.Relation!1;
-	alias Many = ecrs.relation.Relation!(ecrs.relation.dynamicExtent);
-	alias ManyTerms = ecrs.relation.Relation!(ecrs.relation.dynamicExtent, true);
+	alias Many = ecrs.relation.Relation!(ecrs.relation.dynamicArity);
+	alias ManyTerms = ecrs.relation.Relation!(ecrs.relation.dynamicArity, true);
 	static struct Handle { int* p; }
-	assert(ecrs.registry.lookupHooks(ecrs.registry.componentId!Many()).opaque);
+	assert(ecrs.registry.hooksOf(ecrs.registry.componentId!Many()).opaque);
 
 	auto saved = ecrs.context.create();
 	scope(exit) ecrs.context.free(saved);
@@ -252,7 +255,7 @@ unittest {
 	auto loadedTerms = ecrs.context.getComponent!ManyTerms(loaded, e[0]).related;
 	assert(fp.dynarray.length(loadedTerms) == 2 && loadedTerms[0].isVar && loadedTerms[1].constant == e[4]);
 	assert(!ecrs.context.hasComponent!Handle(loaded, e[0]));
-	assert(ecrs.storage.size(*ecrs.context.getStorage!Vec2(loaded)) == 2);
+	assert(ecrs.storage.slotCount(*ecrs.context.getStorage!Vec2(loaded)) == 2);
 	assert(ecrs.context.addEntity(loaded) == ecrs.context.addEntity(saved));
 	assert(ecrs.context.addEntity(loaded) == ecrs.context.addEntity(saved));
 
@@ -270,25 +273,25 @@ unittest {
 unittest {
 	// Malformed data, an unknown name and failed allocations each fail, leaving a fresh context; truncation also cuts a dynamic relation short.
 	static import ecrs.relation;
-	alias Many = ecrs.relation.Relation!(ecrs.relation.dynamicExtent);
+	alias Many = ecrs.relation.Relation!(ecrs.relation.dynamicArity);
 	static struct Stamp { long value; }
 	auto saved = ecrs.context.create();
 	scope(exit) ecrs.context.free(saved);
 	foreach (i; 0 .. 3)
 		ecrs.context.addComponent!Stamp(saved, ecrs.context.addEntity(saved)).value = i;
 	foreach (EntityId related; 1 .. 4)
-		assert(fp.dynarray.pushBack(ecrs.context.getOrAddComponent!Many(saved, 1).related, related));
+		assert(fp.dynarray.pushBack(ecrs.context.ensureComponent!Many(saved, 1).related, related));
 	assert(ecrs.context.removeEntity(saved, 2));
 	ubyte* bytes = serialize(saved);
 	assert(bytes !is null);
 	scope(exit) fp.dynarray.free(bytes);
 	auto data = fp.dynarray.slice(bytes);
 
-	auto ctx = ecrs.context.create();
-	scope(exit) ecrs.context.free(ctx);
+	auto context = ecrs.context.create();
+	scope(exit) ecrs.context.free(context);
 	foreach (n; 0 .. data.length) {
-		assert(!deserialize(ctx, data[0 .. n]));
-		assert(ecrs.context.entityCount(ctx) == 1);
+		assert(!deserialize(context, data[0 .. n]));
+		assert(ecrs.context.entityCount(context) == 1);
 	}
 
 	ubyte* corruptBytes = fp.dynarray.clone(bytes);
@@ -296,7 +299,7 @@ unittest {
 	scope(exit) fp.dynarray.free(corruptBytes);
 	auto corrupt = fp.dynarray.slice(corruptBytes);
 	corrupt[0] = 'X';
-	assert(!deserialize(ctx, corrupt));
+	assert(!deserialize(context, corrupt));
 
 	enum name = ecrs.registry.componentName!Stamp;
 	bool renamed = false;
@@ -304,24 +307,24 @@ unittest {
 		if (cast(const(char)[]) data[i .. i + name.length] == name) {
 			memcpy(corrupt.ptr, data.ptr, data.length);
 			corrupt[i + name.length - 1] = '?';
-			assert(!deserialize(ctx, corrupt));
+			assert(!deserialize(context, corrupt));
 			renamed = true;
 		}
 	assert(renamed);
 
 	foreach (n; 0 .. 64) {
 		ecrs.registry.failAllocationsAfter(n);
-		immutable loaded = deserialize(ctx, data);
+		immutable loaded = deserialize(context, data);
 		ecrs.registry.restoreAllocations();
 		if (!loaded) {
-			assert(ecrs.context.entityCount(ctx) <= 1);
+			assert(ecrs.context.entityCount(context) <= 1);
 			continue;
 		}
-		assert(ecrs.context.getComponent!Stamp(ctx, 3).value == 2);
-		assert(fp.dynarray.length(ecrs.context.getComponent!Many(ctx, 1).related) == 3);
+		assert(ecrs.context.getComponent!Stamp(context, 3).value == 2);
+		assert(fp.dynarray.length(ecrs.context.getComponent!Many(context, 1).related) == 3);
 		break;
 	}
-	assert(ecrs.context.entityCount(ctx) == 3);
+	assert(ecrs.context.entityCount(context) == 3);
 
 	ecrs.registry.failAllocationsAfter(0);
 	assert(serialize(saved) is null);

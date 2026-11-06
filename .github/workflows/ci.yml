@@ -27,6 +27,17 @@ jobs:
       - name: Run unittests
         run: dub test --compiler=ldc2
 
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Check documentation examples
+        run: python tools/doctest.py
+
+      - name: Lint layering, naming and wrappers
+        run: python tools/lint.py
+
       # - name: Build static library
       #   run: dub build --config=library --compiler=ldc2
 
