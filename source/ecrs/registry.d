@@ -10,7 +10,7 @@ import core.atomic : atomicLoad, atomicOp, atomicStore, MemoryOrder;
 static import bc.monitor;
 static import core.stdc.string;
 static import fp.dynarray;
-static import fp.hash;
+static import fp.algorithms;
 static import fp.hashtable;
 static import fp.lifecycle;
 static import fp.pointer;
@@ -51,7 +51,7 @@ enum RelationTrait : uint {
 
 /// The callbacks storage runs on one component type's type-erased elements, recorded when the type registers, so storage created from a runtime id still ends lifetimes, and a holder of entity ids is renumbered by every `ecrs.context.reorderEntities` without the caller naming it. A null hook means the type has none.
 struct Hooks {
-	fp.lifecycle.FinalizeFunction finalizeFunction = null; /// Ends a component's lifetime, as `fp.lifecycle` defines it, before its slot is discarded.
+	fp.lifecycle.Finalizer finalizer = null; /// Ends a component's lifetime, as `fp.lifecycle` defines it, before its slot is discarded.
 	RemapFunction remapFunction = null; /// Run on a component by every entity renumbering.
 	RelationShape shape; /// How `ecrs.datalog` reads the component.
 	bool opaque = false; /// Whether the component holds pointers, so its bytes mean nothing outside this process and `ecrs.serialization` needs the encoding hooks to save it.
@@ -72,6 +72,7 @@ enum hasRemapEntities(T) = __traits(compiles, {
 	T.remapEntities(t, remap);
 });
 
+// wrapper: adapts a call to the function-pointer type a hook slot requires
 private void remapThunk(T)(void* p, const(EntityId)[] remap) @trusted { T.remapEntities(*cast(T*) p, remap); }
 
 /// Whether `T` implements `static bool serialize(const ref T, ref ubyte* out_)` and `static bool deserialize(ref T, ref const(ubyte)[] data)`, encoding itself for `ecrs.serialization` as `SerializeFunction` and `DeserializeFunction` describe.
@@ -94,7 +95,9 @@ enum hasSerialize(T) = __traits(compiles, {
 	bool read = T.deserialize(dest, data);
 });
 
+// wrapper: adapts a call to the function-pointer type a hook slot requires
 private bool serializeThunk(T)(const(void)* p, ref ubyte* out_) @trusted { return T.serialize(*cast(const(T)*) p, out_); }
+// wrapper: adapts a call to the function-pointer type a hook slot requires
 private bool deserializeThunk(T)(void* p, ref const(ubyte)[] data) @trusted { return T.deserialize(*cast(T*) p, data); }
 
 /// The shape of an `ecrs.relation.Relation` whose slots are entities rather than terms, detected structurally because this module cannot import that one. Every other type reads as a unary predicate.
@@ -114,17 +117,17 @@ template shapeFor(T) {
 		enum shapeFor = RelationShape.init;
 }
 
-/// The hooks `T` declares: `fp.lifecycle.finalizeFunction!T`, set unless `T`'s lifetime is its bytes, `remapEntities`, as `hasRemapEntities` detects it, `shapeFor!T`, whether `T` has indirections, and its encoding hooks, as `hasSerialize` detects them.
+/// The hooks `T` declares: `fp.lifecycle.finalizerOf!T`, set unless `T`'s lifetime is its bytes, `remapEntities`, as `hasRemapEntities` detects it, `shapeFor!T`, whether `T` has indirections, and its encoding hooks, as `hasSerialize` detects them.
 ///
 /// Examples:
 /// ---
 /// static struct Owner { int* data; void finalize() @nogc nothrow { data = null; } }
-/// assert(hooksFor!Owner().finalizeFunction !is null && hooksFor!Owner().opaque);
+/// assert(hooksFor!Owner().finalizer !is null && hooksFor!Owner().opaque);
 /// assert(hooksFor!int() == Hooks.init);
 /// ---
 Hooks hooksFor(T)() {
 	Hooks hooks;
-	hooks.finalizeFunction = fp.lifecycle.finalizeFunction!T();
+	hooks.finalizer = fp.lifecycle.finalizerOf!T();
 	static if (hasRemapEntities!T) hooks.remapFunction = &remapThunk!T;
 	hooks.shape = shapeFor!T;
 	hooks.opaque = std.traits.hasIndirections!T;
@@ -150,7 +153,7 @@ private struct SizeEntry {
 	size_t size;
 }
 
-// Marks a `lookupId` key, whose name is the caller's C string: `fp.string.slice` would misread the bytes before one as a fat-pointer header.
+// Marks a `idOf` key, whose name is the caller's C string: `fp.string.slice` would misread the bytes before one as a fat-pointer header.
 private enum size_t probeId = fp.pointer.notFound;
 
 private const(char)[] nameOf(const(ForwardEntry)* e) @trusted {
@@ -158,14 +161,15 @@ private const(char)[] nameOf(const(ForwardEntry)* e) @trusted {
 }
 
 private size_t nameHash(inout(ubyte)[] data) @trusted {
-	return fp.hash.fnv1a(nameOf(cast(const(ForwardEntry)*) data.ptr));
+	return fp.algorithms.hashBytesFast(nameOf(cast(const(ForwardEntry)*) data.ptr));
 }
 private bool nameEqual(inout(ubyte)[] a, inout(ubyte)[] b) @trusted {
 	return nameOf(cast(const(ForwardEntry)*) a.ptr) == nameOf(cast(const(ForwardEntry)*) b.ptr);
 }
 
+// wrapper: adapts a call to the function-pointer type a hook slot requires
 private size_t idHash(inout(ubyte)[] data) @trusted {
-	return fp.hash.fnv1a(data[0 .. size_t.sizeof]);
+	return fp.algorithms.hashBytesFast(data[0 .. size_t.sizeof]);
 }
 private bool idEqual(inout(ubyte)[] a, inout(ubyte)[] b) @trusted {
 	return a[0 .. size_t.sizeof] == b[0 .. size_t.sizeof];
@@ -195,7 +199,7 @@ private __gshared bc.monitor.Monitor!Tables registry;
 private bool ensureTables(ref Tables t) @trusted {
 	if (t.forwardMap is null) {
 		fp.hashtable.Config config = fp.hashtable.Config(&nameHash, &nameEqual);
-		config.finalizeFunction = &finalizeForwardEntry;
+		config.finalizer = &finalizeForwardEntry;
 		t.forwardMap = fp.hashtable.create!ForwardEntry(config);
 	}
 	if (t.reverseMap is null)
@@ -218,30 +222,30 @@ private bool reserveHooks(ref Tables t, size_t componentId) @trusted {
 ///
 /// Examples:
 /// ---
-/// immutable a = nextId();
-/// assert(nextId() == a + 1);
+/// immutable a = freshId();
+/// assert(freshId() == a + 1);
 /// ---
-size_t nextId() {
+size_t freshId() {
 	return atomicOp!"+="(idCounter, 1) - 1;
 }
 
 private size_t registerTypeLocked(ref Tables t, const(char)[] name, size_t componentId, size_t typeSize, Hooks hooks) @trusted {
 	assert(name.length > 0);
 	if (!ensureTables(t) || !reserveHooks(t, componentId)) return fp.pointer.notFound;
-	char* owned = fp.string.makeDynamic(name);
+	char* owned = fp.string.clone(name);
 	if (owned is null) return fp.pointer.notFound;
 
 	assert(fp.hashtable.find(t.forwardMap, ForwardEntry(owned, 0)) is null, "ecrs: component name registered twice");
-	if (fp.hashtable.insertAssumeUnique(t.forwardMap, ForwardEntry(owned, componentId)) is null) {
+	if (fp.hashtable.insertNew(t.forwardMap, ForwardEntry(owned, componentId)) is null) {
 		fp.string.free(owned);
 		return fp.pointer.notFound;
 	}
 	// From here on, removing the forward entry frees `owned` too.
-	if (fp.hashtable.insertAssumeUnique(t.reverseMap, ReverseEntry(componentId, owned)) is null) {
+	if (fp.hashtable.insertNew(t.reverseMap, ReverseEntry(componentId, owned)) is null) {
 		fp.hashtable.remove(t.forwardMap, ForwardEntry(owned, 0));
 		return fp.pointer.notFound;
 	}
-	if (fp.hashtable.insertAssumeUnique(t.sizeMap, SizeEntry(componentId, typeSize)) is null) {
+	if (fp.hashtable.insertNew(t.sizeMap, SizeEntry(componentId, typeSize)) is null) {
 		fp.hashtable.remove(t.reverseMap, ReverseEntry(componentId, null));
 		fp.hashtable.remove(t.forwardMap, ForwardEntry(owned, 0));
 		return fp.pointer.notFound;
@@ -250,16 +254,17 @@ private size_t registerTypeLocked(ref Tables t, const(char)[] name, size_t compo
 	return componentId;
 }
 
-/// Registers the non-empty `name` under `componentId`, usually from `nextId`, as a component of `typeSize` bytes with `hooks`. A name may be registered once; registering it again fails an assert.
+// wrapper: takes the registry lock around the locked registration
+/// Registers the non-empty `name` under `componentId`, usually from `freshId`, as a component of `typeSize` bytes with `hooks`. A name may be registered once; registering it again fails an assert.
 ///
 /// Returns `componentId`, or `fp.pointer.notFound` if allocation fails, leaving every lookup as it was.
 ///
 /// Examples:
 /// ---
-/// immutable id = registerType("RegisterTypeExample", nextId(), 8);
+/// immutable id = registerType("RegisterTypeExample", freshId(), 8);
 /// assert(id != fp.pointer.notFound);
-/// assert(lookupId("RegisterTypeExample") == id);
-/// assert(lookupSize(id) == 8);
+/// assert(idOf("RegisterTypeExample") == id);
+/// assert(elementSizeOf(id) == 8);
 /// ---
 size_t registerType(const(char)[] name, size_t componentId, size_t typeSize, Hooks hooks = Hooks.init) @trusted {
 	return registerTypeLocked(bc.monitor.write(registry).value, name, componentId, typeSize, hooks);
@@ -303,7 +308,7 @@ size_t componentId(T, size_t unique = 0)() @trusted {
 	auto tables = bc.monitor.write(registry);
 	immutable current = atomicLoad!(MemoryOrder.raw)(epoch);
 	if (atomicLoad!(MemoryOrder.raw)(cachedEpoch) != current) {
-		immutable registered = registerTypeLocked(tables.value, componentName!(T, unique), nextId(), T.sizeof, hooksFor!T());
+		immutable registered = registerTypeLocked(tables.value, componentName!(T, unique), freshId(), T.sizeof, hooksFor!T());
 		if (registered == fp.pointer.notFound) return fp.pointer.notFound;
 		atomicStore!(MemoryOrder.raw)(id, registered);
 		atomicStore!(MemoryOrder.rel)(cachedEpoch, current);
@@ -317,7 +322,7 @@ size_t componentId(T, size_t unique = 0)() @trusted {
 /// ---
 /// static struct Health { int points; }
 /// assert(register!(Health, float)());
-/// assert(lookupId(componentName!Health.ptr) == componentId!Health());
+/// assert(idOf(componentName!Health.ptr) == componentId!Health());
 /// ---
 bool register(Ts...)() {
 	bool registered = true;
@@ -332,13 +337,13 @@ bool register(Ts...)() {
 /// Examples:
 /// ---
 /// immutable id = componentId!long();
-/// assert(lookupId("long") == id);
-/// assert(lookupId("LookupComponentIdMissing") == fp.pointer.notFound);
+/// assert(idOf("long") == id);
+/// assert(idOf("LookupComponentIdMissing") == fp.pointer.notFound);
 /// ---
-size_t lookupId(const(char)* name) @trusted {
+size_t idOf(const(char)* name) @trusted {
 	auto tables = bc.monitor.read(registry);
 	if (tables.value.forwardMap is null) return fp.pointer.notFound;
-	immutable at = fp.hashtable.findPosition(tables.value.forwardMap, ForwardEntry(cast(char*) name, probeId));
+	immutable at = fp.hashtable.positionOf(tables.value.forwardMap, ForwardEntry(cast(char*) name, probeId));
 	return at == fp.pointer.notFound ? fp.pointer.notFound : tables.value.forwardMap[at].id;
 }
 
@@ -346,13 +351,13 @@ size_t lookupId(const(char)* name) @trusted {
 ///
 /// Examples:
 /// ---
-/// assert(lookupSize(componentId!short()) == short.sizeof);
-/// assert(lookupSize(fp.pointer.notFound) == fp.pointer.notFound);
+/// assert(elementSizeOf(componentId!short()) == short.sizeof);
+/// assert(elementSizeOf(fp.pointer.notFound) == fp.pointer.notFound);
 /// ---
-size_t lookupSize(size_t componentId) @trusted {
+size_t elementSizeOf(size_t componentId) @trusted {
 	auto tables = bc.monitor.read(registry);
 	if (tables.value.sizeMap is null) return fp.pointer.notFound;
-	immutable at = fp.hashtable.findPosition(tables.value.sizeMap, SizeEntry(componentId, 0));
+	immutable at = fp.hashtable.positionOf(tables.value.sizeMap, SizeEntry(componentId, 0));
 	return at == fp.pointer.notFound ? fp.pointer.notFound : tables.value.sizeMap[at].size;
 }
 
@@ -360,36 +365,24 @@ size_t lookupSize(size_t componentId) @trusted {
 ///
 /// Examples:
 /// ---
-/// assert(lookupHooks(componentId!ubyte()) == Hooks.init);
-/// assert(lookupHooks(fp.pointer.notFound) == Hooks.init);
+/// assert(hooksOf(componentId!ubyte()) == Hooks.init);
+/// assert(hooksOf(fp.pointer.notFound) == Hooks.init);
 /// ---
-Hooks lookupHooks(size_t componentId) @trusted {
+Hooks hooksOf(size_t componentId) @trusted {
 	auto tables = bc.monitor.read(registry);
 	return componentId < fp.dynarray.length(tables.value.hooksTable) ? tables.value.hooksTable[componentId] : Hooks.init;
 }
 
-/// The relation shape registered for `componentId`, or `RelationShape.init`, a unary predicate, for an unknown id.
-///
-/// Examples:
-/// ---
-/// static struct Next { enum bool isDynamic = false, canBeTermValue = false; EntityId[1] related; }
-/// assert(lookupRelationShape(componentId!Next()) == RelationShape(1, false));
-/// assert(lookupRelationShape(fp.pointer.notFound) == RelationShape.init);
-/// ---
-RelationShape lookupRelationShape(size_t componentId) {
-	return lookupHooks(componentId).shape;
-}
-
 private shared size_t traitChanges = 0;
 
-/// Replaces the `RelationTrait` flags of the registered binary relation `componentId`, and advances `traitsEpoch`, since every cached answer over it is now stale. It cannot fail.
+/// Replaces the `RelationTrait` flags of the registered binary relation `componentId`, and advances `traitsGeneration`, since every cached answer over it is now stale. It cannot fail.
 ///
 /// Examples:
 /// ---
 /// static struct Above { enum bool isDynamic = false, canBeTermValue = false; EntityId[1] related; }
 /// immutable id = componentId!Above();
 /// setRelationTraits(id, RelationTrait.transitive);
-/// assert(lookupRelationShape(id).traits == RelationTrait.transitive);
+/// assert(hooksOf(id).shape.traits == RelationTrait.transitive);
 /// setRelationTraits(id, 0);
 /// ---
 void setRelationTraits(size_t componentId, uint traits) @trusted {
@@ -401,28 +394,29 @@ void setRelationTraits(size_t componentId, uint traits) @trusted {
 	atomicOp!"+="(traitChanges, 1);
 }
 
+// wrapper: reads a private field
 /// A counter every `setRelationTraits` advances.
 ///
 /// Examples:
 /// ---
 /// static struct Near { enum bool isDynamic = false, canBeTermValue = false; EntityId[1] related; }
-/// immutable before = traitsEpoch();
+/// immutable before = traitsGeneration();
 /// setRelationTraits(componentId!Near(), 0);
-/// assert(traitsEpoch() == before + 1);
+/// assert(traitsGeneration() == before + 1);
 /// ---
-size_t traitsEpoch() { return atomicLoad(traitChanges); }
+size_t traitsGeneration() { return atomicLoad(traitChanges); }
 
 /// The name registered for `componentId`, which lives until `free`, or null for an unknown id.
 ///
 /// Examples:
 /// ---
-/// assert(fp.string.equal(lookupName(componentId!byte()), "byte"));
-/// assert(lookupName(fp.pointer.notFound) is null);
+/// assert(fp.string.equal(nameOf(componentId!byte()), "byte"));
+/// assert(nameOf(fp.pointer.notFound) is null);
 /// ---
-const(char)* lookupName(size_t componentId) @trusted {
+const(char)* nameOf(size_t componentId) @trusted {
 	auto tables = bc.monitor.read(registry);
 	if (tables.value.reverseMap is null) return null;
-	immutable at = fp.hashtable.findPosition(tables.value.reverseMap, ReverseEntry(componentId, null));
+	immutable at = fp.hashtable.positionOf(tables.value.reverseMap, ReverseEntry(componentId, null));
 	return at == fp.pointer.notFound ? null : tables.value.reverseMap[at].name;
 }
 
@@ -433,7 +427,7 @@ const(char)* lookupName(size_t componentId) @trusted {
 /// ---
 /// immutable before = componentId!dchar();
 /// free();
-/// assert(lookupSize(before) == fp.pointer.notFound);
+/// assert(elementSizeOf(before) == fp.pointer.notFound);
 /// assert(componentId!dchar() == 0);
 /// ---
 void free() @trusted {
@@ -450,7 +444,7 @@ void free() @trusted {
 version(unittest) {
 	private struct Twin { int x; }
 
-	private fp.pointer.AllocFunction underlyingAlloc = null;
+	private fp.pointer.Allocator underlyingAlloc = null;
 	private size_t allocationsLeft;
 
 	private void* failingAlloc(void* p, size_t size) {
@@ -464,8 +458,8 @@ version(unittest) {
 	// Makes the calling thread's libfp allocations fail once `n` more have succeeded, until `restoreAllocations`; freeing still works.
 	package void failAllocationsAfter(size_t n) @trusted {
 		if (underlyingAlloc is null) {
-			underlyingAlloc = fp.pointer.allocFunction;
-			fp.pointer.allocFunction = &failingAlloc;
+			underlyingAlloc = fp.pointer.allocator;
+			fp.pointer.allocator = &failingAlloc;
 		}
 		allocationsLeft = n;
 	}
@@ -473,7 +467,7 @@ version(unittest) {
 	// Undoes `failAllocationsAfter`.
 	package void restoreAllocations() @trusted {
 		if (underlyingAlloc is null) return;
-		fp.pointer.allocFunction = underlyingAlloc;
+		fp.pointer.allocator = underlyingAlloc;
 		underlyingAlloc = null;
 	}
 }
@@ -492,21 +486,21 @@ unittest {
 	}
 	static struct Plain { int x; }
 
-	immutable owns = lookupHooks(componentId!Owns());
-	assert(owns.finalizeFunction !is null && owns.remapFunction is null && owns.opaque);
+	immutable owns = hooksOf(componentId!Owns());
+	assert(owns.finalizer !is null && owns.remapFunction is null && owns.opaque);
 	Owns o = Owns(cast(int*) 1);
-	owns.finalizeFunction(cast(inout(ubyte)[]) (cast(ubyte*) &o)[0 .. Owns.sizeof]);
+	owns.finalizer(cast(inout(ubyte)[]) (cast(ubyte*) &o)[0 .. Owns.sizeof]);
 	assert(o.p is null);
 
-	immutable refers = lookupHooks(componentId!Refers());
-	assert(refers.finalizeFunction is null && refers.remapFunction !is null);
+	immutable refers = hooksOf(componentId!Refers());
+	assert(refers.finalizer is null && refers.remapFunction !is null);
 	Refers r = Refers(1);
 	immutable EntityId[2] remap = [0, 5];
 	refers.remapFunction(&r, remap[]);
 	assert(r.target == 5);
 
-	immutable plain = lookupHooks(componentId!Plain());
-	assert(plain.finalizeFunction is null && plain.remapFunction is null && !plain.opaque);
+	immutable plain = hooksOf(componentId!Plain());
+	assert(plain.finalizer is null && plain.remapFunction is null && !plain.opaque);
 	assert(plain.serializeFunction is null && plain.deserializeFunction is null);
 
 	static struct Encoded {
@@ -519,7 +513,7 @@ unittest {
 			return true;
 		}
 	}
-	immutable encoded = lookupHooks(componentId!Encoded());
+	immutable encoded = hooksOf(componentId!Encoded());
 	assert(encoded.serializeFunction !is null && encoded.deserializeFunction !is null);
 	ubyte* bytes = null;
 	scope(exit) fp.dynarray.free(bytes);
@@ -528,7 +522,7 @@ unittest {
 	const(ubyte)[] data = fp.dynarray.slice(bytes);
 	assert(encoded.deserializeFunction(&dest, data) && data.length == 0 && dest.value == 9);
 
-	assert(lookupHooks(fp.pointer.notFound) == Hooks.init);
+	assert(hooksOf(fp.pointer.notFound) == Hooks.init);
 }
 
 unittest {
@@ -545,27 +539,27 @@ unittest {
 	assert(barId != intId);
 	assert(componentId!Foo() == fooId);
 
-	assert(lookupId(componentName!Foo.ptr) == fooId);
-	assert(lookupId(componentName!Bar.ptr) == barId);
-	assert(lookupId("int") == intId);
-	assert(lookupId("nonexistent") == fp.pointer.notFound);
-	// A C string preceded by bytes that look like a fat-pointer header, as a `malloc` block can be, is still read to its terminator.
+	assert(idOf(componentName!Foo.ptr) == fooId);
+	assert(idOf(componentName!Bar.ptr) == barId);
+	assert(idOf("int") == intId);
+	assert(idOf("nonexistent") == fp.pointer.notFound);
+	// A C string preceded by bytes that look like a fat-pointer header, as a `allocate` block can be, is still read to its terminator.
 	{
 		ubyte[fp.pointer.Header.sizeof + 4] buffer;
 		*cast(fp.pointer.Header*) buffer.ptr = fp.pointer.Header(fp.pointer.PointerType.heap, 1);
 		buffer[fp.pointer.Header.sizeof .. $] = cast(const(ubyte)[]) "int\0";
-		assert(lookupId(cast(char*) buffer.ptr + fp.pointer.Header.sizeof) == intId);
+		assert(idOf(cast(char*) buffer.ptr + fp.pointer.Header.sizeof) == intId);
 	}
 
-	assert(lookupSize(fooId) == Foo.sizeof);
-	assert(lookupSize(barId) == Bar.sizeof);
-	assert(lookupSize(fp.pointer.notFound) == fp.pointer.notFound);
+	assert(elementSizeOf(fooId) == Foo.sizeof);
+	assert(elementSizeOf(barId) == Bar.sizeof);
+	assert(elementSizeOf(fp.pointer.notFound) == fp.pointer.notFound);
 
-	assert(fp.string.equal(cast(char*) lookupName(fooId), cast(char*) componentName!Foo.ptr));
+	assert(fp.string.equal(cast(char*) nameOf(fooId), cast(char*) componentName!Foo.ptr));
 
 	immutable fooId2 = componentId!(Foo, 1)();
 	assert(fooId2 != fooId);
-	assert(lookupId((componentName!Foo ~ "#1").ptr) == fooId2);
+	assert(idOf((componentName!Foo ~ "#1").ptr) == fooId2);
 	static assert(componentName!(Foo, 12) == componentName!Foo ~ "#12");
 
 	// Names are fully qualified, so two types sharing a short name register as two components.
@@ -576,9 +570,9 @@ unittest {
 	immutable outer = componentId!Outer();
 	immutable inner = componentId!Twin();
 	assert(outer != inner);
-	assert(lookupId(componentName!Outer.ptr) == outer);
-	assert(lookupId(componentName!Twin.ptr) == inner);
-	assert(lookupSize(inner) == long.sizeof);
+	assert(idOf(componentName!Outer.ptr) == outer);
+	assert(idOf(componentName!Twin.ptr) == inner);
+	assert(elementSizeOf(inner) == long.sizeof);
 }
 
 unittest {
@@ -588,14 +582,14 @@ unittest {
 		EntityId[1] related;
 	}
 	immutable id = componentId!Binary();
-	assert(lookupRelationShape(id) == RelationShape(1, false));
+	assert(hooksOf(id).shape == RelationShape(1, false));
 
-	immutable epoch = traitsEpoch();
+	immutable epoch = traitsGeneration();
 	setRelationTraits(id, RelationTrait.transitive | RelationTrait.reflexive);
-	assert(lookupRelationShape(id).traits == (RelationTrait.transitive | RelationTrait.reflexive));
-	assert(traitsEpoch() == epoch + 1);
+	assert(hooksOf(id).shape.traits == (RelationTrait.transitive | RelationTrait.reflexive));
+	assert(traitsGeneration() == epoch + 1);
 	setRelationTraits(id, 0);
-	assert(lookupRelationShape(id).traits == 0);
+	assert(hooksOf(id).shape.traits == 0);
 }
 
 unittest {
@@ -622,7 +616,7 @@ unittest {
 	assert(bc.threadpool.run(pool, work[]));
 	foreach (ref r; results)
 		assert(r.same == results[0].same);
-	assert(lookupId(componentName!Racer.ptr) == results[0].same);
+	assert(idOf(componentName!Racer.ptr) == results[0].same);
 
 	static void raceDistinct(void* arg) @nogc nothrow {
 		auto r = cast(Result*) arg;
@@ -643,24 +637,24 @@ unittest {
 	// free tears every table down and restarts ids, and cached ids register afresh.
 	static struct Cached { int x; }
 	immutable cached = componentId!Cached();
-	immutable id = registerType("FreeRegistryTest", nextId(), 8);
-	assert(lookupId("FreeRegistryTest") == id);
-	assert(lookupSize(id) == 8);
+	immutable id = registerType("FreeRegistryTest", freshId(), 8);
+	assert(idOf("FreeRegistryTest") == id);
+	assert(elementSizeOf(id) == 8);
 
 	free();
 
-	assert(lookupId("FreeRegistryTest") == fp.pointer.notFound);
-	assert(lookupSize(id) == fp.pointer.notFound);
-	assert(lookupName(id) is null);
-	assert(lookupName(cached) is null);
+	assert(idOf("FreeRegistryTest") == fp.pointer.notFound);
+	assert(elementSizeOf(id) == fp.pointer.notFound);
+	assert(nameOf(id) is null);
+	assert(nameOf(cached) is null);
 
-	immutable id2 = registerType("FreeRegistryTest", nextId(), 4);
+	immutable id2 = registerType("FreeRegistryTest", freshId(), 4);
 	assert(id2 == 0);
-	assert(lookupId("FreeRegistryTest") == id2);
-	assert(lookupSize(id2) == 4);
+	assert(idOf("FreeRegistryTest") == id2);
+	assert(elementSizeOf(id2) == 4);
 	immutable recached = componentId!Cached();
 	assert(recached == 1);
-	assert(lookupId(componentName!Cached.ptr) == recached);
+	assert(idOf(componentName!Cached.ptr) == recached);
 
 	// With the tables gone, every allocation registration makes can fail; each failure leaves no trace.
 	free();
@@ -671,11 +665,11 @@ unittest {
 		immutable fragile = componentId!Fragile();
 		restoreAllocations();
 		if (fragile == fp.pointer.notFound) {
-			assert(lookupId(componentName!Fragile.ptr) == fp.pointer.notFound);
+			assert(idOf(componentName!Fragile.ptr) == fp.pointer.notFound);
 			continue;
 		}
-		assert(lookupId(componentName!Fragile.ptr) == fragile);
-		assert(lookupSize(fragile) == Fragile.sizeof);
+		assert(idOf(componentName!Fragile.ptr) == fragile);
+		assert(elementSizeOf(fragile) == Fragile.sizeof);
 		registered = true;
 		break;
 	}
@@ -687,14 +681,14 @@ unittest {
 		bool grown = false;
 		foreach (n; 0 .. 64) {
 			failAllocationsAfter(n);
-			immutable grownId = registerType(name, nextId(), 4);
+			immutable grownId = registerType(name, freshId(), 4);
 			restoreAllocations();
 			if (grownId == fp.pointer.notFound) {
-				assert(lookupId(name.ptr) == fp.pointer.notFound);
+				assert(idOf(name.ptr) == fp.pointer.notFound);
 				continue;
 			}
-			assert(lookupId(name.ptr) == grownId && lookupSize(grownId) == 4);
-			assert(fp.string.equal(lookupName(grownId), name));
+			assert(idOf(name.ptr) == grownId && elementSizeOf(grownId) == 4);
+			assert(fp.string.equal(nameOf(grownId), name));
 			grown = true;
 			break;
 		}

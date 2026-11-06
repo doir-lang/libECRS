@@ -1,10 +1,8 @@
 /// Runs every module's unittests, which `-betterC` has no built-in runner for, by walking them with `__traits(getUnitTests)`. Progress goes to the unbuffered `stderr`, so a test that hangs or aborts still shows how far the run got.
 module runner;
 
-import core.stdc.stdio : fprintf, printf, stderr;
-
 // `ecrs.package` only re-exports, so it has no tests of its own.
-private enum modules = [
+private alias modules = imported!"std.meta".AliasSeq!(
 	"ecrs.registry",
 	"ecrs.storage",
 	"ecrs.relation",
@@ -13,27 +11,12 @@ private enum modules = [
 	"ecrs.datalog",
 	"ecrs.serialization",
 	"datalog_hammer",
-];
+);
 
 private int runEveryTest() {
-	size_t total = 0;
-
-	static foreach (name; modules) {{
-		alias mod = mixin("imported!\"" ~ name ~ "\"");
-		alias tests = __traits(getUnitTests, mod);
-		cast(void) fprintf(stderr, "%s (%d tests)\n", name.ptr, cast(int) tests.length);
-		static foreach (i, test; tests) {
-			cast(void) fprintf(stderr, "  [%d] ", cast(int) i);
-			test();
-			cast(void) fprintf(stderr, "ok\n");
-			++total;
-		}
-	}}
-
+	cast(void) imported!"fp.testing".runTests!modules("libecrs");
 	// Releases the registry's process-lifetime tables, so a leak checker sees nothing outstanding.
 	imported!"ecrs.registry".free();
-
-	cast(void) printf("libecrs: all %d tests passed.\n", cast(int) total);
 	return 0;
 }
 

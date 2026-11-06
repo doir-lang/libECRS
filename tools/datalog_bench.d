@@ -6,14 +6,15 @@ module datalog_bench;
 import core.stdc.stdio : printf;
 import core.stdc.stdlib : abort, atoi;
 import core.stdc.string : strstr;
-import core.sys.posix.time : clock_gettime, timespec, CLOCK_MONOTONIC;
 
+static import bc.thread;
 static import bc.threadpool;
 static import ecrs.context;
 static import ecrs.datalog;
 static import ecrs.registry;
 static import ecrs.relation;
 static import fp.dynarray;
+static import fp.string;
 
 @nogc nothrow:
 
@@ -26,45 +27,43 @@ private void require(bool ok) {
 }
 
 private double now() @trusted {
-	timespec t;
-	clock_gettime(CLOCK_MONOTONIC, &t);
-	return t.tv_sec + t.tv_nsec * 1e-9;
+	return bc.thread.monotonicMicroseconds() * 1e-6;
 }
 
-private alias Edge = ecrs.relation.Relation!(ecrs.relation.dynamicExtent);
+private alias Edge = ecrs.relation.Relation!(ecrs.relation.dynamicArity);
 private enum chainUnique = 201, dagUnique = 202, treeUnique = 203, traitUnique = 204;
 private struct Node {}
 
 private struct Graph {
-	ecrs.context.Context ctx;
+	ecrs.context.Context context;
 	ecrs.registry.EntityId* nodes;
 	size_t edges;
 }
 
 private Graph graph(size_t n) @trusted {
 	Graph g;
-	g.ctx = ecrs.context.create();
+	g.context = ecrs.context.create();
 	foreach (i; 0 .. n) {
-		immutable e = ecrs.context.addEntity(g.ctx);
+		immutable e = ecrs.context.addEntity(g.context);
 		require(e != ecrs.registry.invalidEntity && fp.dynarray.pushBack(g.nodes, e));
-		require(ecrs.context.addComponent!Node(g.ctx, e) !is null);
+		require(ecrs.context.addComponent!Node(g.context, e) !is null);
 	}
 	return g;
 }
 private void link(size_t unique)(ref Graph g, size_t from, size_t to) @trusted {
-	require(fp.dynarray.pushBack(ecrs.context.getOrAddComponent!(Edge, unique)(g.ctx, g.nodes[from]).related, g.nodes[to]));
+	require(fp.dynarray.pushBack(ecrs.context.ensureComponent!(Edge, unique)(g.context, g.nodes[from]).related, g.nodes[to]));
 	++g.edges;
 }
 private void release(ref Graph g) @trusted {
 	fp.dynarray.free(g.nodes);
-	ecrs.context.free(g.ctx);
+	ecrs.context.free(g.context);
 }
 
-private size_t count(ref ecrs.datalog.Program p, ref ecrs.context.Context ctx, size_t relation, size_t arity) @trusted {
+private size_t count(ref ecrs.datalog.Program p, ref ecrs.context.Context context, size_t relation, size_t arity) @trusted {
 	size_t n = 0;
 	ecrs.datalog.Atom[1] q;
 	q[0] = arity == 1 ? ecrs.datalog.atom(relation, ecrs.datalog.variable(0)) : ecrs.datalog.atom(relation, ecrs.datalog.variable(0), ecrs.datalog.variable(1));
-	require(ecrs.datalog.query(p, ctx, q[], (b) { ++n; return true; }) == ecrs.datalog.Status.ok);
+	require(ecrs.datalog.query(p, context, q[], (b) { ++n; return true; }) == ecrs.datalog.Status.ok);
 	return n;
 }
 
@@ -73,10 +72,10 @@ private __gshared const(char)* filter = null;
 
 // Runs `body`, which builds a program, evaluates it and returns the fact count, `repeats` times, and prints the best time.
 private void measure(const(char)* name, const(char)* pool, scope size_t delegate() @nogc nothrow body) @trusted {
-	import core.stdc.stdio : snprintf;
-	char[96] label;
-	cast(void) snprintf(label.ptr, label.length, "%s %s", name, pool);
-	if (filter !is null && strstr(label.ptr, filter) is null) return;
+	char* label = fp.string.format("%s %s", name, pool);
+	require(label !is null);
+	scope(exit) fp.string.free(label);
+	if (filter !is null && strstr(label, filter) is null) return;
 	double best = double.max;
 	size_t facts;
 	foreach (r; 0 .. repeats) {
@@ -117,8 +116,8 @@ extern (C) int main(int argc, char** argv) @trusted {
 				immutable path = ecrs.datalog.derive(p, "bench.chainLeft", 1);
 				require(ecrs.datalog.addRule(p, ecrs.datalog.atom(path, x, y), ecrs.datalog.atom(edge, x, y)) == ecrs.datalog.Status.ok);
 				require(ecrs.datalog.addRule(p, ecrs.datalog.atom(path, x, z), ecrs.datalog.atom(path, x, y), ecrs.datalog.atom(edge, y, z)) == ecrs.datalog.Status.ok);
-				require(ecrs.datalog.evaluate(p, g.ctx, pool) == ecrs.datalog.Status.ok);
-				return count(p, g.ctx, path, 2);
+				require(ecrs.datalog.evaluate(p, g.context, pool) == ecrs.datalog.Status.ok);
+				return count(p, g.context, path, 2);
 			});
 		}
 		foreach (k, pool; pools) {
@@ -128,8 +127,8 @@ extern (C) int main(int argc, char** argv) @trusted {
 				immutable path = ecrs.datalog.derive(p, "bench.chainDoubly", 1);
 				require(ecrs.datalog.addRule(p, ecrs.datalog.atom(path, x, y), ecrs.datalog.atom(edge, x, y)) == ecrs.datalog.Status.ok);
 				require(ecrs.datalog.addRule(p, ecrs.datalog.atom(path, x, z), ecrs.datalog.atom(path, x, y), ecrs.datalog.atom(path, y, z)) == ecrs.datalog.Status.ok);
-				require(ecrs.datalog.evaluate(p, g.ctx, pool) == ecrs.datalog.Status.ok);
-				return count(p, g.ctx, path, 2);
+				require(ecrs.datalog.evaluate(p, g.context, pool) == ecrs.datalog.Status.ok);
+				return count(p, g.context, path, 2);
 			});
 		}
 	}
@@ -154,23 +153,23 @@ extern (C) int main(int argc, char** argv) @trusted {
 				immutable reach = ecrs.datalog.derive(p, "bench.dagReach", 1);
 				require(ecrs.datalog.addRule(p, ecrs.datalog.atom(reach, x, y), ecrs.datalog.atom(edge, x, y)) == ecrs.datalog.Status.ok);
 				require(ecrs.datalog.addRule(p, ecrs.datalog.atom(reach, x, z), ecrs.datalog.atom(edge, x, y), ecrs.datalog.atom(reach, y, z)) == ecrs.datalog.Status.ok);
-				require(ecrs.datalog.evaluate(p, g.ctx, pool) == ecrs.datalog.Status.ok);
-				return count(p, g.ctx, reach, 2);
+				require(ecrs.datalog.evaluate(p, g.context, pool) == ecrs.datalog.Status.ok);
+				return count(p, g.context, reach, 2);
 			});
 		}
 
 		// The same closure read through a trait: no fixpoint, a BFS per source.
 		immutable traitEdge = ecrs.registry.componentId!(Edge, traitUnique)();
 		foreach (i; 0 .. n)
-			if (ecrs.context.hasComponent!(Edge, dagUnique)(g.ctx, g.nodes[i]))
-				foreach (t; fp.dynarray.slice(ecrs.context.getComponent!(Edge, dagUnique)(g.ctx, g.nodes[i]).related))
-					require(fp.dynarray.pushBack(ecrs.context.getOrAddComponent!(Edge, traitUnique)(g.ctx, g.nodes[i]).related, t));
+			if (ecrs.context.hasComponent!(Edge, dagUnique)(g.context, g.nodes[i]))
+				foreach (t; fp.dynarray.slice(ecrs.context.getComponent!(Edge, dagUnique)(g.context, g.nodes[i]).related))
+					require(fp.dynarray.pushBack(ecrs.context.ensureComponent!(Edge, traitUnique)(g.context, g.nodes[i]).related, t));
 		ecrs.registry.setRelationTraits(traitEdge, ecrs.registry.RelationTrait.transitive);
 		scope(exit) ecrs.registry.setRelationTraits(traitEdge, 0);
 		measure("random DAG closure, trait query", "serial", () {
 			ecrs.datalog.Program p;
 			scope(exit) ecrs.datalog.free(p);
-			return count(p, g.ctx, traitEdge, 2);
+			return count(p, g.context, traitEdge, 2);
 		});
 		foreach (k, pool; pools) {
 			measure("random DAG closure, trait derived", poolNames[k], () {
@@ -178,8 +177,8 @@ extern (C) int main(int argc, char** argv) @trusted {
 				scope(exit) ecrs.datalog.free(p);
 				immutable copy = ecrs.datalog.derive(p, "bench.dagTrait", 1);
 				require(ecrs.datalog.addRule(p, ecrs.datalog.atom(copy, x, y), ecrs.datalog.atom(traitEdge, x, y)) == ecrs.datalog.Status.ok);
-				require(ecrs.datalog.evaluate(p, g.ctx, pool) == ecrs.datalog.Status.ok);
-				return count(p, g.ctx, copy, 2);
+				require(ecrs.datalog.evaluate(p, g.context, pool) == ecrs.datalog.Status.ok);
+				return count(p, g.context, copy, 2);
 			});
 		}
 
@@ -193,9 +192,9 @@ extern (C) int main(int argc, char** argv) @trusted {
 				immutable unreached = ecrs.datalog.derive(p, "bench.dagUnreached", 0);
 				require(ecrs.datalog.addRule(p, ecrs.datalog.atom(reach, x, y), ecrs.datalog.atom(edge, x, y)) == ecrs.datalog.Status.ok);
 				require(ecrs.datalog.addRule(p, ecrs.datalog.atom(reach, x, z), ecrs.datalog.atom(edge, x, y), ecrs.datalog.atom(reach, y, z)) == ecrs.datalog.Status.ok);
-				require(ecrs.datalog.addRule(p, ecrs.datalog.atom(unreached, x), ecrs.datalog.atom(node, x), ecrs.datalog.negate(ecrs.datalog.atom(reach, ecrs.datalog.constant(g.nodes[0]), x))) == ecrs.datalog.Status.ok);
-				require(ecrs.datalog.evaluate(p, g.ctx, pool) == ecrs.datalog.Status.ok);
-				return count(p, g.ctx, unreached, 1);
+				require(ecrs.datalog.addRule(p, ecrs.datalog.atom(unreached, x), ecrs.datalog.atom(node, x), ecrs.datalog.negate(ecrs.datalog.atom(reach, ecrs.relation.Term(g.nodes[0]), x))) == ecrs.datalog.Status.ok);
+				require(ecrs.datalog.evaluate(p, g.context, pool) == ecrs.datalog.Status.ok);
+				return count(p, g.context, unreached, 1);
 			});
 		}
 
@@ -206,10 +205,10 @@ extern (C) int main(int argc, char** argv) @trusted {
 			immutable reach = ecrs.datalog.derive(p, "bench.dagReach3", 1);
 			require(ecrs.datalog.addRule(p, ecrs.datalog.atom(reach, x, y), ecrs.datalog.atom(edge, x, y)) == ecrs.datalog.Status.ok);
 			require(ecrs.datalog.addRule(p, ecrs.datalog.atom(reach, x, z), ecrs.datalog.atom(edge, x, y), ecrs.datalog.atom(reach, y, z)) == ecrs.datalog.Status.ok);
-			require(ecrs.datalog.evaluate(p, g.ctx) == ecrs.datalog.Status.ok);
+			require(ecrs.datalog.evaluate(p, g.context) == ecrs.datalog.Status.ok);
 			enum calls = 1_000_000;
 			immutable start = now();
-			foreach (i; 0 .. calls) require(ecrs.datalog.evaluate(p, g.ctx) == ecrs.datalog.Status.ok);
+			foreach (i; 0 .. calls) require(ecrs.datalog.evaluate(p, g.context) == ecrs.datalog.Status.ok);
 			cast(void) printf("%-34s %-8s %10d calls %9.3f ms %8.1f ns/call\n", "up-to-date evaluate".ptr, "serial".ptr,
 				calls, (now() - start) * 1e3, (now() - start) / calls * 1e9);
 		}
@@ -230,8 +229,8 @@ extern (C) int main(int argc, char** argv) @trusted {
 				immutable sg = ecrs.datalog.derive(p, "bench.sg", 1);
 				require(ecrs.datalog.addRule(p, ecrs.datalog.atom(sg, x, y), ecrs.datalog.atom(edge, z, x), ecrs.datalog.atom(edge, z, y)) == ecrs.datalog.Status.ok);
 				require(ecrs.datalog.addRule(p, ecrs.datalog.atom(sg, x, y), ecrs.datalog.atom(edge, a, x), ecrs.datalog.atom(sg, a, b), ecrs.datalog.atom(edge, b, y)) == ecrs.datalog.Status.ok);
-				require(ecrs.datalog.evaluate(p, g.ctx, pool) == ecrs.datalog.Status.ok);
-				return count(p, g.ctx, sg, 2);
+				require(ecrs.datalog.evaluate(p, g.context, pool) == ecrs.datalog.Status.ok);
+				return count(p, g.context, sg, 2);
 			});
 		}
 	}

@@ -9,7 +9,11 @@
     "dependencies": {
         "bc-threads": {
             "repository": "git+https://github.com/doir-lang/bc-threads.git",
-            "version": "fac95861934b4b795e58745f11e8ec4bcd85949a"
+            "version": "df4ce006de5a9f6b7ae3eab319eb0309b1117e5d"
+        },
+        "libfp": {
+            "repository": "git+https://github.com/doir-lang/libfp.git",
+            "version": "fc91923802ce2befa88160b76f411eca29df8ee4"
         }
     },
     "subConfigurations": {

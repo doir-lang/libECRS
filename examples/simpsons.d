@@ -10,7 +10,7 @@ static import fp.dynarray;
 
 struct Name { const(char)* text; }
 struct Person {}
-alias Parents = ecrs.relation.Relation!(ecrs.relation.dynamicExtent);
+alias Parents = ecrs.relation.Relation!(ecrs.relation.dynamicArity);
 alias Spouse = ecrs.relation.Relation!1;
 
 enum : size_t { abraham, mona, clancy, jackie, homer, marge, patty, selma, bart, lisa, maggie, ling, familySize }
@@ -18,10 +18,10 @@ enum : size_t { abraham, mona, clancy, jackie, homer, marge, patty, selma, bart,
 immutable const(char)*[familySize] names = ["Abraham", "Mona", "Clancy", "Jackie", "Homer", "Marge", "Patty", "Selma", "Bart", "Lisa", "Maggie", "Ling"];
 
 // Prints `label`, then the name each solution of `body` binds variable `var` to.
-bool list(const(char)* label, ref ecrs.datalog.Program p, ref ecrs.context.Context ctx, size_t var, const(ecrs.datalog.Atom)[] body...) {
-	const(ecrs.context.Context)* view = &ctx; // a const read is not a change, so the next query need not re-evaluate
+bool list(const(char)* label, ref ecrs.datalog.Program p, ref ecrs.context.Context context, size_t var, const(ecrs.datalog.Atom)[] body...) {
+	const(ecrs.context.Context)* view = &context; // a const read is not a change, so the next query need not re-evaluate
 	cast(void) printf("%s:", label);
-	immutable status = ecrs.datalog.query(p, ctx, body, (b) {
+	immutable status = ecrs.datalog.query(p, context, body, (b) {
 		cast(void) printf(" %s", ecrs.context.getComponent!Name(*view, b[var]).text);
 		return true;
 	});
@@ -31,28 +31,28 @@ bool list(const(char)* label, ref ecrs.datalog.Program p, ref ecrs.context.Conte
 
 extern(C) int main() {
 	scope(exit) ecrs.registry.free();
-	auto ctx = ecrs.context.create();
-	scope(exit) ecrs.context.free(ctx);
+	auto context = ecrs.context.create();
+	scope(exit) ecrs.context.free(context);
 
 	ecrs.registry.EntityId[familySize] family;
 	foreach (i, ref e; family) {
-		e = ecrs.context.addEntity(ctx);
-		if (e == ecrs.registry.invalidEntity || ecrs.context.addComponent!Person(ctx, e) is null) return 1;
-		auto name = ecrs.context.addComponent!Name(ctx, e);
+		e = ecrs.context.addEntity(context);
+		if (e == ecrs.registry.invalidEntity || ecrs.context.addComponent!Person(context, e) is null) return 1;
+		auto name = ecrs.context.addComponent!Name(context, e);
 		if (name is null) return 1;
 		name.text = names[i];
 	}
 
 	// Each step can fail only by running out of memory, which a real program would handle more gracefully.
 	bool parents(size_t child, size_t[] of...) {
-		auto component = ecrs.context.getOrAddComponent!Parents(ctx, family[child]);
+		auto component = ecrs.context.ensureComponent!Parents(context, family[child]);
 		if (component is null) return false;
 		foreach (parent; of)
 			if (!fp.dynarray.pushBack(component.related, family[parent])) return false;
 		return true;
 	}
 	bool marry(size_t a, size_t b) {
-		auto component = ecrs.context.addComponent!Spouse(ctx, family[a]);
+		auto component = ecrs.context.addComponent!Spouse(context, family[a]);
 		if (component is null) return false;
 		component.related[0] = family[b];
 		return true;
@@ -92,13 +92,13 @@ extern(C) int main() {
 	foreach (status; added)
 		if (status != ecrs.datalog.Status.ok) return 1;
 
-	if (!list("Bart's grandparents", p, ctx, 1, ecrs.datalog.atom(grandparent, ecrs.datalog.constant(family[bart]), y))
-		|| !list("Lisa's ancestors", p, ctx, 1, ecrs.datalog.atom(ancestor, ecrs.datalog.constant(family[lisa]), y))
-		|| !list("Jackie's descendants", p, ctx, 0, ecrs.datalog.atom(ancestor, x, ecrs.datalog.constant(family[jackie])))
-		|| !list("Founders", p, ctx, 0, ecrs.datalog.atom(founder, x))
-		|| !list("Marge's spouse", p, ctx, 1, ecrs.datalog.atom(spouse, ecrs.datalog.constant(family[marge]), y))
-		|| !list("Marge's parents-in-law", p, ctx, 1, ecrs.datalog.atom(parentInLaw, ecrs.datalog.constant(family[marge]), y))
-		|| !list("Homer's parents-in-law", p, ctx, 1, ecrs.datalog.atom(parentInLaw, ecrs.datalog.constant(family[homer]), y)))
+	if (!list("Bart's grandparents", p, context, 1, ecrs.datalog.atom(grandparent, ecrs.relation.Term(family[bart]), y))
+		|| !list("Lisa's ancestors", p, context, 1, ecrs.datalog.atom(ancestor, ecrs.relation.Term(family[lisa]), y))
+		|| !list("Jackie's descendants", p, context, 0, ecrs.datalog.atom(ancestor, x, ecrs.relation.Term(family[jackie])))
+		|| !list("Founders", p, context, 0, ecrs.datalog.atom(founder, x))
+		|| !list("Marge's spouse", p, context, 1, ecrs.datalog.atom(spouse, ecrs.relation.Term(family[marge]), y))
+		|| !list("Marge's parents-in-law", p, context, 1, ecrs.datalog.atom(parentInLaw, ecrs.relation.Term(family[marge]), y))
+		|| !list("Homer's parents-in-law", p, context, 1, ecrs.datalog.atom(parentInLaw, ecrs.relation.Term(family[homer]), y)))
 		return 1;
 	return 0;
 }

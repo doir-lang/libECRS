@@ -18,6 +18,7 @@ static import ecrs.storage;
 static import ecrs.schedules;
 static import fp.dynarray;
 static import fp.pointer;
+static import fp.algorithms;
 static import std.algorithm.sorting;
 
 public import ecrs.registry : EntityId, invalidEntity;
@@ -34,17 +35,6 @@ enum Status {
 	invalid, /// A rule or query was malformed: an arity mismatch, a head not derived, or an unsafe variable.
 	unstratifiable, /// The rules recurse through negation.
 	outOfMemory, /// An allocation failed.
-}
-
-// Slice assignment needs druntime under -betterC.
-private void copy(T)(T[] to, const(T)[] from) @trusted {
-	assert(to.length == from.length);
-	if (from.length) memcpy(to.ptr, from.ptr, from.length * T.sizeof);
-}
-
-// `fp.dynarray.concatenate` reports appending nothing to a null dynarray as a failure.
-private bool append(T)(ref T* to, const(T)[] from) {
-	return from.length == 0 || fp.dynarray.concatenate(to, from);
 }
 
 private bool contains(const(size_t)* list, size_t value) @trusted {
@@ -84,15 +74,6 @@ private template variableDeclarations(int id, names...) {
 	else enum string variableDeclarations = (id ? ", " : "") ~ names[0] ~ " = ecrs.datalog.variable(" ~ id.stringof ~ ")" ~ variableDeclarations!(id + 1, names[1 .. $]);
 }
 
-/// The term naming entity `e`.
-///
-/// Examples:
-/// ---
-/// auto c = constant(3);
-/// assert(!c.isVar && c.constant == 3);
-/// ---
-ecrs.relation.Term constant(EntityId e) { return ecrs.relation.Term(e); }
-
 /// `relation(args...)`, possibly negated, as `atom` and `negate` build it. The first argument is the owning entity.
 struct Atom {
 	size_t relation = fp.pointer.notFound; /// The relation's component id.
@@ -105,7 +86,7 @@ struct Atom {
 ///
 /// Examples:
 /// ---
-/// auto a = atom(5, variable(0), constant(2));
+/// auto a = atom(5, variable(0), ecrs.relation.Term(2));
 /// assert(a.relation == 5 && a.arity == 2 && !a.negated);
 /// ---
 Atom atom(size_t relation, const(ecrs.relation.Term)[] args...) {
@@ -155,7 +136,7 @@ struct Program {
 	private size_t* derived = null;
 	private Stratum* strata = null; // dependencies first; current while `stratified`
 	private bc.monitor.Monitor!(Index*) indexes; // parallel joins build indexes lazily
-	private size_t traitsSeen = 0; // `traitsEpoch` when the strata last forgot their runs
+	private size_t traitsSeen = 0; // `traitsGeneration` when the strata last forgot their runs
 	private bool stratified = false;
 	private Status status = Status.ok; // what the last evaluate returned
 }
@@ -201,7 +182,7 @@ void free(ref Program self) @trusted {
 
 
 private bool shapeMatches(const ref Atom a) {
-	return a.relation != fp.pointer.notFound && a.arity == 1 + ecrs.registry.lookupRelationShape(a.relation).columns;
+	return a.relation != fp.pointer.notFound && a.arity == 1 + ecrs.registry.hooksOf(a.relation).shape.columns;
 }
 
 private bool positivelyBound(const(Atom)[] body, size_t var) {
@@ -244,21 +225,21 @@ size_t derive(ref Program self, const(char)[] name, size_t columns) @trusted {
 	assert(columns < maxArity);
 	immutable shape = columns == 0 ? ecrs.registry.RelationShape.init : ecrs.registry.RelationShape(columns, true);
 
-	auto terminated = cast(char*) fp.pointer.allocFunction(null, name.length + 1);
+	auto terminated = cast(char*) fp.pointer.allocator(null, name.length + 1);
 	if (terminated is null) return fp.pointer.notFound;
-	scope(exit) cast(void) fp.pointer.allocFunction(terminated, 0);
-	copy(terminated[0 .. name.length], name);
+	scope(exit) cast(void) fp.pointer.allocator(terminated, 0);
+	fp.pointer.copy(terminated[0 .. name.length], name);
 	terminated[name.length] = '\0';
 
-	size_t id = ecrs.registry.lookupId(terminated);
+	size_t id = ecrs.registry.idOf(terminated);
 	if (id == fp.pointer.notFound) {
-		alias List = ecrs.relation.Relation!(ecrs.relation.dynamicExtent);
+		alias List = ecrs.relation.Relation!(ecrs.relation.dynamicArity);
 		auto hooks = columns == 0 ? ecrs.registry.Hooks.init : ecrs.registry.hooksFor!List();
 		hooks.shape = shape;
-		id = ecrs.registry.registerType(name, ecrs.registry.nextId(), columns == 0 ? 1 : List.sizeof, hooks);
+		id = ecrs.registry.registerType(name, ecrs.registry.freshId(), columns == 0 ? 1 : List.sizeof, hooks);
 		if (id == fp.pointer.notFound) return fp.pointer.notFound;
 	} else {
-		immutable existing = ecrs.registry.lookupRelationShape(id);
+		immutable existing = ecrs.registry.hooksOf(id).shape;
 		if (existing.columns != shape.columns || existing.dynamic != shape.dynamic) return fp.pointer.notFound;
 	}
 
@@ -292,7 +273,7 @@ Status addRule(ref Program self, Atom head, const(Atom)[] body...) @trusted {
 		if (t.isVar && !positivelyBound(body, t.varId)) return Status.invalid;
 
 	Rule rule = Rule(head, null, varCount);
-	if (!append(rule.body, body)) return Status.outOfMemory;
+	if (!fp.dynarray.concatenate(rule.body, body)) return Status.outOfMemory;
 	if (!fp.dynarray.pushBack(self.rules, rule)) {
 		fp.dynarray.free(rule.body);
 		return Status.outOfMemory;
@@ -310,7 +291,7 @@ Status addRule(ref Program self, Atom head, const(Atom)[] body...) @trusted {
 /// Program p;
 /// scope(exit) free(p);
 /// immutable ofTwo = derive(p, "example.childOfTwo", 0);
-/// assert(addRule(p, atom(ofTwo, variable(0)), atom(ecrs.registry.componentId!Parent(), variable(0), constant(2))) == Status.ok);
+/// assert(addRule(p, atom(ofTwo, variable(0)), atom(ecrs.registry.componentId!Parent(), variable(0), ecrs.relation.Term(2))) == Status.ok);
 /// immutable EntityId[3] remap = [0, 2, 1];
 /// remapEntities(p, remap[]);
 /// ---
@@ -328,68 +309,71 @@ void remapEntities(ref Program self, const(EntityId)[] remap) @trusted {
 	forgetRuns(self);
 }
 
+// wrapper: adapts a call to the function-pointer type a hook slot requires
 private void remapHook(void* program, const(EntityId)[] remap) {
 	remapEntities(*cast(Program*) program, remap);
 }
 
-/// Registers `self` as a holder of entity ids, so renumbering `ctx` relabels its rule constants. `self` must not move until `detach`.
+// wrapper: hides the private hook a program registers
+/// Registers `self` as a holder of entity ids, so renumbering `context` relabels its rule constants. `self` must not move until `detach`.
 ///
 /// Returns false if allocation fails, registering nothing.
 ///
 /// Examples:
 /// ---
-/// auto ctx = ecrs.context.create();
-/// scope(exit) ecrs.context.free(ctx);
+/// auto context = ecrs.context.create();
+/// scope(exit) ecrs.context.free(context);
 /// Program p;
 /// scope(exit) free(p);
-/// assert(attach(ctx, p));
-/// assert(detach(ctx, p));
+/// assert(attach(context, p));
+/// assert(detach(context, p));
 /// ---
-bool attach(ref ecrs.context.Context ctx, ref Program self) {
-	return ecrs.context.addRemapHook(ctx, &remapHook, &self);
+bool attach(ref ecrs.context.Context context, ref Program self) {
+	return ecrs.context.addRemapHook(context, &remapHook, &self);
 }
 
-/// Undoes `attach`, returning false if `self` is not attached to `ctx`.
+// wrapper: hides the private hook a program registers
+/// Undoes `attach`, returning false if `self` is not attached to `context`.
 ///
 /// Examples:
 /// ---
-/// auto ctx = ecrs.context.create();
-/// scope(exit) ecrs.context.free(ctx);
+/// auto context = ecrs.context.create();
+/// scope(exit) ecrs.context.free(context);
 /// Program p;
-/// assert(!detach(ctx, p));
+/// assert(!detach(context, p));
 /// ---
-bool detach(ref ecrs.context.Context ctx, ref Program self) {
-	return ecrs.context.removeRemapHook(ctx, &remapHook, &self);
+bool detach(ref ecrs.context.Context context, ref Program self) {
+	return ecrs.context.removeRemapHook(context, &remapHook, &self);
 }
 
 
 private alias TupleFn = void delegate(const(EntityId)[]) @nogc nothrow;
 
-// Calls `fn` with each tuple `e` owns in `relation`, owner first.
-private void forEachTuple(const ref ecrs.context.Context ctx, size_t relation, ecrs.registry.RelationShape shape, EntityId e, scope TupleFn fn) @trusted {
-	if (!ecrs.context.hasComponent(ctx, e, relation)) return;
+// Calls `visit` with each tuple `e` owns in `relation`, owner first.
+private void forEachTuple(const ref ecrs.context.Context context, size_t relation, ecrs.registry.RelationShape shape, EntityId e, scope TupleFn visit) @trusted {
+	if (!ecrs.context.hasComponent(context, e, relation)) return;
 	EntityId[maxArity] tuple;
 	tuple[0] = e;
 	immutable arity = 1 + shape.columns;
-	auto p = ecrs.context.getComponent(ctx, e, relation);
+	auto p = ecrs.context.getComponent(context, e, relation);
 	if (!shape.dynamic) {
-		copy(tuple[1 .. arity], (cast(const(EntityId)*) p)[0 .. shape.columns]);
-		fn(tuple[0 .. arity]);
+		fp.pointer.copy(tuple[1 .. arity], (cast(const(EntityId)*) p)[0 .. shape.columns]);
+		visit(tuple[0 .. arity]);
 		return;
 	}
 	auto list = *cast(const(EntityId*)*) p;
 	immutable n = fp.dynarray.length(list);
 	for (size_t i = 0; i + shape.columns <= n; i += shape.columns) {
-		copy(tuple[1 .. arity], list[i .. i + shape.columns]);
-		fn(tuple[0 .. arity]);
+		fp.pointer.copy(tuple[1 .. arity], list[i .. i + shape.columns]);
+		visit(tuple[0 .. arity]);
 	}
 }
 
 // Ditto, but only tuples whose first column is `first`, found by binary search in a derived relation's sorted list.
-private void forEachTupleStarting(const ref ecrs.context.Context ctx, size_t relation, ecrs.registry.RelationShape shape, EntityId e, EntityId first, scope TupleFn fn) @trusted {
-	if (!shape.dynamic) return forEachTuple(ctx, relation, shape, e, fn);
-	if (!ecrs.context.hasComponent(ctx, e, relation)) return;
-	auto list = *cast(const(EntityId*)*) ecrs.context.getComponent(ctx, e, relation);
+private void forEachTupleStarting(const ref ecrs.context.Context context, size_t relation, ecrs.registry.RelationShape shape, EntityId e, EntityId first, scope TupleFn visit) @trusted {
+	if (!shape.dynamic) return forEachTuple(context, relation, shape, e, visit);
+	if (!ecrs.context.hasComponent(context, e, relation)) return;
+	auto list = *cast(const(EntityId*)*) ecrs.context.getComponent(context, e, relation);
 	immutable k = shape.columns;
 	immutable groups = fp.dynarray.length(list) / k;
 	size_t lo = 0, hi = groups;
@@ -401,14 +385,14 @@ private void forEachTupleStarting(const ref ecrs.context.Context ctx, size_t rel
 	EntityId[maxArity] tuple;
 	tuple[0] = e;
 	for (; lo < groups && list[lo * k] == first; ++lo) {
-		copy(tuple[1 .. 1 + k], list[lo * k .. lo * k + k]);
-		fn(tuple[0 .. 1 + k]);
+		fp.pointer.copy(tuple[1 .. 1 + k], list[lo * k .. lo * k + k]);
+		visit(tuple[0 .. 1 + k]);
 	}
 }
 
-private bool holds(const ref ecrs.context.Context ctx, size_t relation, ecrs.registry.RelationShape shape, const(EntityId)[] tuple) {
+private bool holds(const ref ecrs.context.Context context, size_t relation, ecrs.registry.RelationShape shape, const(EntityId)[] tuple) {
 	bool found = false;
-	forEachTuple(ctx, relation, shape, tuple[0], (t) {
+	forEachTuple(context, relation, shape, tuple[0], (t) {
 		if (t == tuple) found = true;
 	});
 	return found;
@@ -423,35 +407,7 @@ private bool lessTuple(const(EntityId)[] a, const(EntityId)[] b) {
 private enum size_t radixThreshold = 256;
 private enum size_t radixDigitBits = 12;
 
-// LSD radix sort of `keys` below `1 << bits`, in as few passes of at most `radixDigitBits` as cover them, skipping digits all keys share. Returns `keys` or `buffer`, whichever holds the result.
-private ulong[] radixSort(ulong[] keys, ulong[] buffer, size_t bits) {
-	assert(buffer.length == keys.length && bits <= 64);
-	if (bits == 0) return keys;
-	immutable passes = (bits + radixDigitBits - 1) / radixDigitBits;
-	immutable digit = (bits + passes - 1) / passes;
-	immutable size_t mask = (size_t(1) << digit) - 1;
-	size_t[1 << radixDigitBits] counts;
-	auto from = keys, to = buffer;
-	foreach (pass; 0 .. passes) {
-		immutable shift = pass * digit;
-		counts[0 .. mask + 1] = 0;
-		foreach (key; from) ++counts[(key >> shift) & mask];
-		if (counts[(from[0] >> shift) & mask] == from.length) continue;
-		size_t sum = 0;
-		foreach (ref c; counts[0 .. mask + 1]) {
-			immutable count = c;
-			c = sum;
-			sum += count;
-		}
-		foreach (key; from) to[counts[(key >> shift) & mask]++] = key;
-		auto swap = from;
-		from = to;
-		to = swap;
-	}
-	return from;
-}
-
-// Sorts flat `arity`-wide rows and drops repeats; rows of up to two ids sort as integers packed only as wide as the largest id needs. False if allocation fails, leaving `rows` unsorted.
+// Sorts flat `arity`-wide rows, dropping repeats; up to two ids pack as wide as the largest needs. False on allocation failure, leaving `rows` unsorted.
 private bool sortUnique(ref EntityId* rows, size_t arity) @trusted {
 	immutable n = fp.dynarray.length(rows) / arity;
 	if (n <= 1) return true;
@@ -462,13 +418,13 @@ private bool sortUnique(ref EntityId* rows, size_t arity) @trusted {
 		size_t width = 0;
 		while (width < EntityId.sizeof * 8 && (all >> width) != 0) ++width;
 		immutable radix = n >= radixThreshold;
-		auto storage = cast(ulong*) fp.pointer.allocFunction(null, (radix ? 2 * n : n) * ulong.sizeof);
+		auto storage = cast(ulong*) fp.pointer.allocator(null, (radix ? 2 * n : n) * ulong.sizeof);
 		if (storage is null) return false;
-		scope(exit) cast(void) fp.pointer.allocFunction(storage, 0);
+		scope(exit) cast(void) fp.pointer.allocator(storage, 0);
 		foreach (i; 0 .. n)
 			storage[i] = arity == 1 ? rows[i] : (cast(ulong) rows[2 * i] << width) | rows[2 * i + 1];
 		auto keys = storage[0 .. n];
-		if (radix) keys = radixSort(keys, storage[n .. 2 * n], arity * width);
+		if (radix) keys = fp.algorithms.radixSort(keys, storage[n .. 2 * n], arity * width);
 		else std.algorithm.sorting.sort(keys);
 		immutable ulong low = (1UL << width) - 1;
 		foreach (i; 0 .. n) {
@@ -477,20 +433,20 @@ private bool sortUnique(ref EntityId* rows, size_t arity) @trusted {
 			else { rows[2 * kept] = cast(EntityId)(keys[i] >> width); rows[2 * kept + 1] = cast(EntityId)(keys[i] & low); }
 			++kept;
 		}
-		cast(void) fp.dynarray.popBackCount(rows, (n - kept) * arity);
+		cast(void) fp.dynarray.removeLast(rows, (n - kept) * arity);
 		return true;
 	}
 
-	auto order = cast(size_t*) fp.pointer.allocFunction(null, n * size_t.sizeof);
+	auto order = cast(size_t*) fp.pointer.allocator(null, n * size_t.sizeof);
 	if (order is null) return false;
-	scope(exit) cast(void) fp.pointer.allocFunction(order, 0);
+	scope(exit) cast(void) fp.pointer.allocator(order, 0);
 	foreach (i; 0 .. n) order[i] = i;
 	std.algorithm.sorting.sort!((a, b) => lessTuple(rows[a * arity .. a * arity + arity], rows[b * arity .. b * arity + arity]))(order[0 .. n]);
 	EntityId* sorted = null;
 	foreach (i; 0 .. n) {
 		auto row = rows[order[i] * arity .. order[i] * arity + arity];
 		if (kept > 0 && sorted[(kept - 1) * arity .. kept * arity] == row) continue;
-		if (!append(sorted, row)) {
+		if (!fp.dynarray.concatenate(sorted, row)) {
 			fp.dynarray.free(sorted);
 			return false;
 		}
@@ -502,11 +458,11 @@ private bool sortUnique(ref EntityId* rows, size_t arity) @trusted {
 }
 
 // Merges sorted, unique `rows` into a derived relation from the back, appending the new ones to `delta`. False if allocation fails.
-private bool insertFacts(ref ecrs.context.Context ctx, size_t relation, const(EntityId)[] rows, ref EntityId* delta) @trusted {
-	immutable shape = ecrs.registry.lookupRelationShape(relation);
+private bool insertFacts(ref ecrs.context.Context context, size_t relation, const(EntityId)[] rows, ref EntityId* delta) @trusted {
+	immutable shape = ecrs.registry.hooksOf(relation).shape;
 	immutable k = shape.columns, arity = 1 + k;
 	immutable n = rows.length / arity;
-	const(ecrs.context.Context)* view = &ctx;
+	const(ecrs.context.Context)* view = &context;
 	EntityId* fresh = null; // this owner's new rows, without the owner
 	scope(exit) fp.dynarray.free(fresh);
 
@@ -514,8 +470,8 @@ private bool insertFacts(ref ecrs.context.Context ctx, size_t relation, const(En
 		immutable e = rows[start * arity];
 		for (end = start + 1; end < n && rows[end * arity] == e; ++end) {}
 		if (k == 0) {
-			if (ecrs.context.hasComponent(ctx, e, relation)) continue;
-			if (ecrs.context.addComponent(ctx, e, relation) is null || !fp.dynarray.pushBack(delta, e)) return false;
+			if (ecrs.context.hasComponent(context, e, relation)) continue;
+			if (ecrs.context.addComponent(context, e, relation) is null || !fp.dynarray.pushBack(delta, e)) return false;
 			continue;
 		}
 
@@ -541,12 +497,12 @@ private bool insertFacts(ref ecrs.context.Context ctx, size_t relation, const(En
 				else hi = mid;
 			}
 			if (lo < existing && old[lo * k .. lo * k + k] == row) continue;
-			if (!append(fresh, row) || !append(delta, rows[i * arity .. i * arity + arity])) return false;
+			if (!fp.dynarray.concatenate(fresh, row) || !fp.dynarray.concatenate(delta, rows[i * arity .. i * arity + arity])) return false;
 		}
 		immutable added = fp.dynarray.length(fresh) / k;
 		if (added == 0) continue;
 
-		auto list = cast(EntityId**) ecrs.context.getOrAddComponent(ctx, e, relation);
+		auto list = cast(EntityId**) ecrs.context.ensureComponent(context, e, relation);
 		if (list is null) return false;
 		if (fp.dynarray.grow(*list, added * k) is null) return false;
 		auto all = *list;
@@ -555,10 +511,10 @@ private bool insertFacts(ref ecrs.context.Context ctx, size_t relation, const(En
 		while (j > 0) {
 			if (i > 0 && lessTuple(fresh[(j - 1) * k .. j * k], all[(i - 1) * k .. i * k])) {
 				--i;
-				copy(all[(w - 1) * k .. w * k], all[i * k .. i * k + k]);
+				fp.pointer.copy(all[(w - 1) * k .. w * k], all[i * k .. i * k + k]);
 			} else {
 				--j;
-				copy(all[(w - 1) * k .. w * k], fresh[j * k .. j * k + k]);
+				fp.pointer.copy(all[(w - 1) * k .. w * k], fresh[j * k .. j * k + k]);
 			}
 			--w;
 		}
@@ -578,12 +534,12 @@ private void settle(ref IndexEntry* entries) @trusted {
 	size_t kept = 1;
 	foreach (i; 1 .. n)
 		if (entries[i] != entries[kept - 1]) entries[kept++] = entries[i];
-	cast(void) fp.dynarray.popBackCount(entries, n - kept);
+	cast(void) fp.dynarray.removeLast(entries, n - kept);
 }
 
 // Sets `entries` to `relation`'s index on `column`, rebuilt if stale; the store is fixed during a join, so parallel joins share it.
-private bool indexOn(ref Program self, const ref ecrs.context.Context ctx, size_t relation, size_t column, out const(IndexEntry)[] entries) @trusted {
-	immutable generation = ecrs.context.generation(ctx, relation);
+private bool indexOn(ref Program self, const ref ecrs.context.Context context, size_t relation, size_t column, out const(IndexEntry)[] entries) @trusted {
+	immutable generation = ecrs.context.generation(context, relation);
 	inout(Index)* find(inout(Index)* indexes) {
 		foreach (ref candidate; fp.dynarray.slice(indexes))
 			if (candidate.relation == relation && candidate.column == column) return &candidate;
@@ -610,11 +566,11 @@ private bool indexOn(ref Program self, const ref ecrs.context.Context ctx, size_
 		index.generation = size_t.max;
 		if (index.entries !is null) fp.dynarray.clear(index.entries);
 		bool built = true;
-		if (auto storage = ecrs.context.getStorage(ctx, relation)) {
-			immutable shape = ecrs.registry.lookupRelationShape(relation);
-			foreach (o; ecrs.storage.owners(*storage)) {
+		if (auto storage = ecrs.context.getStorage(context, relation)) {
+			immutable shape = ecrs.registry.hooksOf(relation).shape;
+			foreach (o; ecrs.storage.slotOwnersOf(*storage)) {
 				if (o == invalidEntity) continue;
-				forEachTuple(ctx, relation, shape, o, (t) {
+				forEachTuple(context, relation, shape, o, (t) {
 					if (t[column] != invalidEntity) built = built && fp.dynarray.pushBack(index.entries, IndexEntry(t[column], o));
 				});
 			}
@@ -628,8 +584,8 @@ private bool indexOn(ref Program self, const ref ecrs.context.Context ctx, size_
 }
 
 // Folds facts just inserted into `relation` into the indexes current at generation `before`, so a round pays for its delta, not a rebuild.
-private void extendIndexes(ref Program self, const ref ecrs.context.Context ctx, size_t relation, size_t before, const(EntityId)* delta, size_t arity) @trusted {
-	immutable after = ecrs.context.generation(ctx, relation);
+private void extendIndexes(ref Program self, const ref ecrs.context.Context context, size_t relation, size_t before, const(EntityId)* delta, size_t arity) @trusted {
+	immutable after = ecrs.context.generation(context, relation);
 	immutable n = fp.dynarray.length(delta) / arity;
 	auto indexes = bc.monitor.write(self.indexes);
 	foreach (ref index; fp.dynarray.slice(indexes.value)) {
@@ -684,7 +640,7 @@ private struct Memo {
 
 // One rule body being solved, a nested-loop join in `plan` order; `deltaAtom` reads `delta` rather than the store, which is all semi-naive evaluation changes.
 private struct Solver {
-	ecrs.context.Context* ctx;
+	ecrs.context.Context* context;
 	Program* program;
 	const(Atom)[] body;
 	size_t[] plan;
@@ -714,7 +670,7 @@ private const(IndexEntry)[] index(ref Solver s, size_t relation, size_t column) 
 	foreach (ref c; s.indexes[0 .. s.indexCount])
 		if (c.relation == relation && c.column == column) return c.entries;
 	const(IndexEntry)[] entries;
-	if (!indexOn(*s.program, *s.ctx, relation, column, entries)) {
+	if (!indexOn(*s.program, *s.context, relation, column, entries)) {
 		fail(s);
 		return null;
 	}
@@ -728,9 +684,9 @@ private EntityId valueOf(ref Solver s, ecrs.relation.Term t) {
 
 
 private bool[] seenFlags(ref Solver s) @trusted {
-	immutable n = fp.dynarray.length(s.ctx.indexTable);
+	immutable n = fp.dynarray.length(s.context.indexTable);
 	if (s.seenLength < n) {
-		auto grown = cast(bool*) fp.pointer.allocFunction(s.seen, n);
+		auto grown = cast(bool*) fp.pointer.allocator(s.seen, n);
 		if (grown is null) {
 			fail(s);
 			return null;
@@ -743,19 +699,19 @@ private bool[] seenFlags(ref Solver s) @trusted {
 }
 
 // Each entity one edge from `e`: targets going forward, owners going back through the column-1 index, both when symmetric. May repeat.
-private void forEachNeighbor(ref Solver s, size_t relation, ecrs.registry.RelationShape shape, EntityId e, bool forward, scope void delegate(EntityId) @nogc nothrow fn) @trusted {
-	const(ecrs.context.Context)* ctx = s.ctx;
+private void forEachNeighbor(ref Solver s, size_t relation, ecrs.registry.RelationShape shape, EntityId e, bool forward, scope void delegate(EntityId) @nogc nothrow visit) @trusted {
+	const(ecrs.context.Context)* context = s.context;
 	immutable symmetric = (shape.traits & ecrs.registry.RelationTrait.symmetric) != 0;
 	if (forward || symmetric)
-		forEachTuple(*ctx, relation, shape, e, (t) { if (t[1] != invalidEntity) fn(t[1]); });
+		forEachTuple(*context, relation, shape, e, (t) { if (t[1] != invalidEntity) visit(t[1]); });
 	if (!forward || symmetric)
-		foreach (entry; lookup(index(s, relation, 1), e)) fn(entry.owner);
+		foreach (entry; lookup(index(s, relation, 1), e)) visit(entry.owner);
 }
 
 // Whether `e` occurs in `relation` at all: the domain `reflexive` ranges over.
 private bool inField(ref Solver s, size_t relation, ecrs.registry.RelationShape shape, EntityId e) @trusted {
 	bool found = false;
-	forEachTuple(*s.ctx, relation, shape, e, (t) { found |= t[1] != invalidEntity; });
+	forEachTuple(*s.context, relation, shape, e, (t) { found |= t[1] != invalidEntity; });
 	return found || lookup(index(s, relation, 1), e).length > 0;
 }
 
@@ -781,8 +737,8 @@ private EntityId* reach(ref Solver s, size_t relation, ecrs.registry.RelationSha
 	return found;
 }
 
-// Calls `fn` with each closure pair agreeing with `a` and `b`, either possibly unbound; with both unbound, walks from every `parts`-th field entity.
-private void closure(ref Solver s, size_t relation, ecrs.registry.RelationShape shape, EntityId a, EntityId b, scope TupleFn fn, size_t part = 0, size_t parts = 1) @trusted {
+// Calls `visit` with each closure pair agreeing with `a` and `b`, either possibly unbound; with both unbound, walks from every `parts`-th field entity.
+private void closure(ref Solver s, size_t relation, ecrs.registry.RelationShape shape, EntityId a, EntityId b, scope TupleFn visit, size_t part = 0, size_t parts = 1) @trusted {
 	EntityId[2] pair;
 	void walk(EntityId from, bool forward) {
 		auto found = reach(s, relation, shape, from, forward);
@@ -792,7 +748,7 @@ private void closure(ref Solver s, size_t relation, ecrs.registry.RelationShape 
 			if (forward && b != invalidEntity && e != b) continue;
 			pair[0] = forward ? from : e;
 			pair[1] = forward ? e : from;
-			fn(pair[]);
+			visit(pair[]);
 		}
 	}
 	if (a != invalidEntity) return walk(a, true);
@@ -810,19 +766,19 @@ private void closure(ref Solver s, size_t relation, ecrs.registry.RelationShape 
 			}
 		}
 	}
-	if (auto storage = ecrs.context.getStorage(*s.ctx, relation))
-		foreach (o; ecrs.storage.owners(*storage))
+	if (auto storage = ecrs.context.getStorage(*s.context, relation))
+		foreach (o; ecrs.storage.slotOwnersOf(*storage))
 			if (o != invalidEntity)
-				forEachTuple(*s.ctx, relation, shape, o, (t) { if (t[1] != invalidEntity) { note(t[0]); note(t[1]); } });
+				forEachTuple(*s.context, relation, shape, o, (t) { if (t[1] != invalidEntity) { note(t[0]); note(t[1]); } });
 	foreach (e; fp.dynarray.slice(field)) seen[e] = false;
 	foreach (i, e; fp.dynarray.slice(field))
 		if (i % parts == part) walk(e, true);
 }
 
 
-// Matches an atom whose owner is unbound, through an index or a scan. Outer atoms often rebind the same values, so the last key's tuples are replayed.
+// Matches an atom with an unbound owner, through an index or a scan, replaying the last key's tuples since outer atoms rebind the same values.
 private void solveUnowned(ref Solver s, size_t depth, const ref Atom atom, ecrs.registry.RelationShape shape, bool sorted, scope TupleFn match) @trusted {
-	const(ecrs.context.Context)* ctx = s.ctx;
+	const(ecrs.context.Context)* context = s.context;
 	auto memo = &s.memos[depth];
 	EntityId[maxArity] key;
 	foreach (c; 0 .. atom.arity) key[c] = valueOf(s, atom.args[c]);
@@ -838,7 +794,7 @@ private void solveUnowned(ref Solver s, size_t depth, const ref Atom atom, ecrs.
 	memo.key = key;
 	if (memo.tuples !is null) fp.dynarray.clear(memo.tuples);
 	void record(const(EntityId)[] tuple) {
-		if (memo.valid && (fp.dynarray.length(memo.tuples) + tuple.length > memoLimit || !append(memo.tuples, tuple))) memo.valid = false;
+		if (memo.valid && (fp.dynarray.length(memo.tuples) + tuple.length > memoLimit || !fp.dynarray.concatenate(memo.tuples, tuple))) memo.valid = false;
 		match(tuple);
 	}
 	scope(exit) memo.valid &= !s.stopped;
@@ -846,14 +802,14 @@ private void solveUnowned(ref Solver s, size_t depth, const ref Atom atom, ecrs.
 	foreach (c; 1 .. atom.arity) {
 		if (key[c] == invalidEntity) continue;
 		foreach (entry; lookup(index(s, atom.relation, c), key[c]))
-			if (sorted && c == 1) forEachTupleStarting(*ctx, atom.relation, shape, entry.owner, key[c], &record);
-			else forEachTuple(*ctx, atom.relation, shape, entry.owner, &record);
+			if (sorted && c == 1) forEachTupleStarting(*context, atom.relation, shape, entry.owner, key[c], &record);
+			else forEachTuple(*context, atom.relation, shape, entry.owner, &record);
 		return;
 	}
-	if (auto storage = ecrs.context.getStorage(*ctx, atom.relation))
-		foreach (o; ecrs.storage.owners(*storage))
+	if (auto storage = ecrs.context.getStorage(*context, atom.relation))
+		foreach (o; ecrs.storage.slotOwnersOf(*storage))
 			if (o != invalidEntity)
-				forEachTuple(*ctx, atom.relation, shape, o, &record);
+				forEachTuple(*context, atom.relation, shape, o, &record);
 }
 
 private void solve(ref Solver s, size_t depth, scope Emit emit) @trusted {
@@ -863,7 +819,7 @@ private void solve(ref Solver s, size_t depth, scope Emit emit) @trusted {
 		return;
 	}
 	const atom = &s.body[s.plan[depth]];
-	const(ecrs.context.Context)* ctx = s.ctx;
+	const(ecrs.context.Context)* context = s.context;
 	immutable shape = s.shapes[s.plan[depth]];
 
 	if (atom.negated) {
@@ -871,7 +827,7 @@ private void solve(ref Solver s, size_t depth, scope Emit emit) @trusted {
 		foreach (c; 0 .. atom.arity) tuple[c] = valueOf(s, atom.args[c]);
 		bool found = false;
 		if (shape.traits) closure(s, atom.relation, shape, tuple[0], tuple[1], (t) { found = true; });
-		else found = holds(*ctx, atom.relation, shape, tuple[0 .. atom.arity]);
+		else found = holds(*context, atom.relation, shape, tuple[0 .. atom.arity]);
 		if (!found) solve(s, depth + 1, emit);
 		return;
 	}
@@ -917,8 +873,8 @@ private void solve(ref Solver s, size_t depth, scope Emit emit) @trusted {
 	immutable sorted = s.sorted[s.plan[depth]] && atom.arity > 1;
 	immutable first = atom.arity > 1 ? valueOf(s, atom.args[1]) : invalidEntity;
 	if (owner != invalidEntity) {
-		if (sorted && first != invalidEntity) forEachTupleStarting(*ctx, atom.relation, shape, owner, first, &match);
-		else forEachTuple(*ctx, atom.relation, shape, owner, &match);
+		if (sorted && first != invalidEntity) forEachTupleStarting(*context, atom.relation, shape, owner, first, &match);
+		else forEachTuple(*context, atom.relation, shape, owner, &match);
 		return;
 	}
 
@@ -927,13 +883,13 @@ private void solve(ref Solver s, size_t depth, scope Emit emit) @trusted {
 
 // A join order: `first`, then greedily the positive atom with most bound arguments, a bound owner counting most; negations once bound.
 private bool makePlan(const(Atom)[] body, size_t first, size_t varCount, ref size_t* plan) @trusted {
-	auto bound = cast(bool*) fp.pointer.allocFunction(null, varCount + 1);
+	auto bound = cast(bool*) fp.pointer.allocator(null, varCount + 1);
 	if (bound is null) return false;
-	scope(exit) cast(void) fp.pointer.allocFunction(bound, 0);
+	scope(exit) cast(void) fp.pointer.allocator(bound, 0);
 	bound[0 .. varCount + 1] = false;
-	auto used = cast(bool*) fp.pointer.allocFunction(null, body.length + 1);
+	auto used = cast(bool*) fp.pointer.allocator(null, body.length + 1);
 	if (used is null) return false;
-	scope(exit) cast(void) fp.pointer.allocFunction(used, 0);
+	scope(exit) cast(void) fp.pointer.allocator(used, 0);
 	used[0 .. body.length + 1] = false;
 
 	bool planned = true;
@@ -971,25 +927,25 @@ private bool makePlan(const(Atom)[] body, size_t first, size_t varCount, ref siz
 }
 
 // Solves `body`, calling `emit` with each solution's bindings. False if allocation fails, possibly after some solutions were emitted.
-private bool join(ref Program self, ref ecrs.context.Context ctx, const(Atom)[] body, size_t varCount, size_t deltaAtom, const(EntityId)[] delta, scope Emit emit, size_t partition = 0, size_t partitions = 1) @trusted {
+private bool join(ref Program self, ref ecrs.context.Context context, const(Atom)[] body, size_t varCount, size_t deltaAtom, const(EntityId)[] delta, scope Emit emit, size_t partition = 0, size_t partitions = 1) @trusted {
 	size_t* plan = null;
 	scope(exit) fp.dynarray.free(plan);
 	if (!makePlan(body, deltaAtom, varCount, plan)) return false;
-	auto bindings = cast(EntityId*) fp.pointer.allocFunction(null, (varCount + 1) * EntityId.sizeof);
+	auto bindings = cast(EntityId*) fp.pointer.allocator(null, (varCount + 1) * EntityId.sizeof);
 	if (bindings is null) return false;
-	scope(exit) cast(void) fp.pointer.allocFunction(bindings, 0);
+	scope(exit) cast(void) fp.pointer.allocator(bindings, 0);
 	bindings[0 .. varCount] = invalidEntity;
-	auto sorted = cast(bool*) fp.pointer.allocFunction(null, body.length + 1);
+	auto sorted = cast(bool*) fp.pointer.allocator(null, body.length + 1);
 	if (sorted is null) return false;
-	scope(exit) cast(void) fp.pointer.allocFunction(sorted, 0);
+	scope(exit) cast(void) fp.pointer.allocator(sorted, 0);
 	foreach (i, ref a; body) sorted[i] = contains(self.derived, a.relation);
-	auto shapes = cast(ecrs.registry.RelationShape*) fp.pointer.allocFunction(null, (body.length + 1) * ecrs.registry.RelationShape.sizeof);
+	auto shapes = cast(ecrs.registry.RelationShape*) fp.pointer.allocator(null, (body.length + 1) * ecrs.registry.RelationShape.sizeof);
 	if (shapes is null) return false;
-	scope(exit) cast(void) fp.pointer.allocFunction(shapes, 0);
-	foreach (i, ref a; body) shapes[i] = ecrs.registry.lookupRelationShape(a.relation);
+	scope(exit) cast(void) fp.pointer.allocator(shapes, 0);
+	foreach (i, ref a; body) shapes[i] = ecrs.registry.hooksOf(a.relation).shape;
 
 	Solver s;
-	s.ctx = &ctx;
+	s.context = &context;
 	s.program = &self;
 	s.body = body;
 	s.plan = fp.dynarray.slice(plan);
@@ -1000,13 +956,13 @@ private bool join(ref Program self, ref ecrs.context.Context ctx, const(Atom)[] 
 	s.partitions = partitions;
 	s.sorted = sorted[0 .. body.length];
 	s.shapes = shapes[0 .. body.length];
-	auto memos = cast(Memo*) fp.pointer.allocFunction(null, (body.length + 1) * Memo.sizeof);
+	auto memos = cast(Memo*) fp.pointer.allocator(null, (body.length + 1) * Memo.sizeof);
 	if (memos is null) return false;
-	scope(exit) cast(void) fp.pointer.allocFunction(memos, 0);
+	scope(exit) cast(void) fp.pointer.allocator(memos, 0);
 	foreach (ref m; memos[0 .. body.length]) m = Memo.init;
 	scope(exit) foreach (ref m; memos[0 .. body.length]) fp.dynarray.free(m.tuples);
 	s.memos = memos[0 .. body.length];
-	scope(exit) cast(void) fp.pointer.allocFunction(s.seen, 0);
+	scope(exit) cast(void) fp.pointer.allocator(s.seen, 0);
 	solve(s, 0, emit);
 	return !s.failed;
 }
@@ -1020,13 +976,13 @@ private size_t derivedIndex(const ref Program self, size_t relation) @trusted {
 // Tarjan over the derived relations, edges running from a rule's head to its body; `order[start[k] .. start[k + 1]]` is component k, dependencies first.
 private Status stratify(const ref Program self, ref size_t* order, ref size_t* start) @trusted {
 	immutable n = fp.dynarray.length(self.derived);
-	auto scratch = cast(size_t*) fp.pointer.allocFunction(null, 3 * (n + 1) * size_t.sizeof);
+	auto scratch = cast(size_t*) fp.pointer.allocator(null, 3 * (n + 1) * size_t.sizeof);
 	if (scratch is null) return Status.outOfMemory;
-	scope(exit) cast(void) fp.pointer.allocFunction(scratch, 0);
+	scope(exit) cast(void) fp.pointer.allocator(scratch, 0);
 	auto sccOf = scratch, low = scratch + n + 1, visit = scratch + 2 * (n + 1);
-	auto onStack = cast(bool*) fp.pointer.allocFunction(null, n + 1);
+	auto onStack = cast(bool*) fp.pointer.allocator(null, n + 1);
 	if (onStack is null) return Status.outOfMemory;
-	scope(exit) cast(void) fp.pointer.allocFunction(onStack, 0);
+	scope(exit) cast(void) fp.pointer.allocator(onStack, 0);
 	size_t* stack = null;
 	scope(exit) fp.dynarray.free(stack);
 	foreach (i; 0 .. n) { visit[i] = fp.pointer.notFound; onStack[i] = false; }
@@ -1055,7 +1011,7 @@ private Status stratify(const ref Program self, ref size_t* order, ref size_t* s
 		grown = fp.dynarray.pushBack(start, fp.dynarray.length(order));
 		while (grown) {
 			immutable w = *fp.dynarray.back(stack);
-			cast(void) fp.dynarray.popBack(stack);
+			cast(void) fp.dynarray.removeLast(stack);
 			onStack[w] = false;
 			sccOf[w] = sccCount;
 			grown = fp.dynarray.pushBack(order, w);
@@ -1089,7 +1045,7 @@ private Status buildStrata(ref Program self) @trusted {
 		}
 		auto stratum = fp.dynarray.back(self.strata);
 		bool note(size_t relation) { return contains(stratum.inputs, relation) || fp.dynarray.pushBack(stratum.inputs, relation); }
-		bool built = append(stratum.members, members);
+		bool built = fp.dynarray.concatenate(stratum.members, members);
 		foreach (d; members) built = built && note(self.derived[d]);
 		foreach (ref r; fp.dynarray.slice(self.rules))
 			if (contains(stratum.members, derivedIndex(self, r.head.relation)))
@@ -1115,22 +1071,22 @@ private struct Task {
 	bool failed = false;
 }
 
-private bool runTask(ref ecrs.context.Context ctx, ref Task task) @trusted {
+private bool runTask(ref ecrs.context.Context context, ref Task task) @trusted {
 	const head = &task.rule.head;
 	bool buffered = true;
 	// Head tuples reach `output` in batches, sparing each one a dynarray append's checks.
 	EntityId[128 * maxArity] pending;
 	size_t used = 0;
-	immutable joined = join(*task.program, ctx, fp.dynarray.slice(task.rule.body), task.rule.varCount, task.deltaAtom, task.delta, (b) {
+	immutable joined = join(*task.program, context, fp.dynarray.slice(task.rule.body), task.rule.varCount, task.deltaAtom, task.delta, (b) {
 		if (used + head.arity > pending.length) {
-			buffered = append(task.output, pending[0 .. used]);
+			buffered = fp.dynarray.concatenate(task.output, pending[0 .. used]);
 			used = 0;
 		}
 		foreach (c, t; head.args[0 .. head.arity]) pending[used + c] = t.isVar ? b[t.varId] : t.constant;
 		used += head.arity;
 		return buffered;
 	}, task.partition, task.partitions);
-	buffered = buffered && append(task.output, pending[0 .. used]);
+	buffered = buffered && fp.dynarray.concatenate(task.output, pending[0 .. used]);
 	task.failed = !joined || !buffered;
 	return !task.failed;
 }
@@ -1147,19 +1103,20 @@ private struct Bucket {
 }
 
 // Sorts `b`'s rows and counts the lists inserting them will add, which concurrent writes must prepare for.
-private bool sortBucket(ref ecrs.context.Context ctx, ref Bucket b) @trusted {
+private bool sortBucket(ref ecrs.context.Context context, ref Bucket b) @trusted {
 	if (!sortUnique(b.rows, b.arity)) return false;
 	for (size_t j = 0; j < fp.dynarray.length(b.rows); j += b.arity)
-		if ((j == 0 || b.rows[j] != b.rows[j - b.arity]) && !ecrs.context.hasComponent(ctx, b.rows[j], b.relation)) ++b.newOwners;
+		if ((j == 0 || b.rows[j] != b.rows[j - b.arity]) && !ecrs.context.hasComponent(context, b.rows[j], b.relation)) ++b.newOwners;
 	return true;
 }
 
-private bool insertBucket(ref ecrs.context.Context ctx, ref Bucket b) @trusted {
-	return insertFacts(ctx, b.relation, fp.dynarray.slice(b.rows), b.delta);
+// wrapper: the per-item function a parallel schedule needs by name
+private bool insertBucket(ref ecrs.context.Context context, ref Bucket b) @trusted {
+	return insertFacts(context, b.relation, fp.dynarray.slice(b.rows), b.delta);
 }
 
 // `sortUnique` and `insertFacts` across `pool`, buckets holding disjoint owners, so each owner's list is created and written by one thread under concurrent writes.
-private bool insertInParallel(ref ecrs.context.Context ctx, bc.threadpool.ThreadPool* pool, size_t parts, size_t relation, size_t arity, const(Task)* tasks, size_t member, ref EntityId* delta) @trusted {
+private bool insertInParallel(ref ecrs.context.Context context, bc.threadpool.ThreadPool* pool, size_t parts, size_t relation, size_t arity, const(Task)* tasks, size_t member, ref EntityId* delta) @trusted {
 	auto buckets = fp.dynarray.create!Bucket(parts);
 	if (buckets is null) return false;
 	scope(exit) {
@@ -1171,16 +1128,16 @@ private bool insertInParallel(ref ecrs.context.Context ctx, bc.threadpool.Thread
 		if (t.member != member) continue;
 		immutable n = fp.dynarray.length(t.output);
 		for (size_t j = 0; j < n; j += arity)
-			if (!append(buckets[(t.output[j] * 0x9E3779B1u >> 7) % parts].rows, t.output[j .. j + arity])) return false;
+			if (!fp.dynarray.concatenate(buckets[(t.output[j] * 0x9E3779B1u >> 7) % parts].rows, t.output[j .. j + arity])) return false;
 	}
 
-	if (!ecrs.schedules.parallel!sortBucket(ctx, pool, fp.dynarray.slice(buckets))) return false;
+	if (!ecrs.schedules.parallel!sortBucket(context, pool, fp.dynarray.slice(buckets))) return false;
 	size_t newOwners = 0;
 	foreach (ref b; fp.dynarray.slice(buckets)) newOwners += b.newOwners;
-	if (!ecrs.context.prepareConcurrentAdds(ctx, relation, newOwners)) return false;
-	if (!ecrs.schedules.concurrentWrites(ctx, ecrs.schedules.parallel!insertBucket(pool, fp.dynarray.slice(buckets)))) return false;
+	if (!ecrs.context.reserveConcurrentAdds(context, relation, newOwners)) return false;
+	if (!ecrs.schedules.concurrentWrites(context, ecrs.schedules.parallel!insertBucket(pool, fp.dynarray.slice(buckets)))) return false;
 	foreach (ref b; fp.dynarray.slice(buckets))
-		if (!append(delta, fp.dynarray.slice(b.delta))) return false;
+		if (!fp.dynarray.concatenate(delta, fp.dynarray.slice(b.delta))) return false;
 	return true;
 }
 
@@ -1197,7 +1154,7 @@ private struct Rounds {
 
 private void free(ref Rounds self) @trusted {
 	if (self.delta !is null) foreach (i; 0 .. self.members.length) fp.dynarray.free(self.delta[i]);
-	cast(void) fp.pointer.allocFunction(self.delta, 0);
+	cast(void) fp.pointer.allocator(self.delta, 0);
 	foreach (ref t; fp.dynarray.slice(self.tasks)) fp.dynarray.free(t.output);
 	fp.dynarray.free(self.tasks);
 	self.delta = null;
@@ -1218,35 +1175,35 @@ private bool schedule(ref Rounds self, const(Rule)* r, size_t deltaAtom, const(E
 	return true;
 }
 
-private bool dispatch(ref ecrs.context.Context ctx, ref Rounds self) @trusted {
+private bool dispatch(ref ecrs.context.Context context, ref Rounds self) @trusted {
 	scope(exit) self.wide = false;
 	auto all = fp.dynarray.slice(self.tasks);
-	return self.wide ? ecrs.schedules.parallel!runTask(ctx, self.pool, all) : ecrs.schedules.sequential!runTask(ctx, all);
+	return self.wide ? ecrs.schedules.parallel!runTask(context, self.pool, all) : ecrs.schedules.sequential!runTask(context, all);
 }
 
 // Inserts what the round's tasks derived, making it the next round's delta. False if allocation fails.
-private bool commit(ref ecrs.context.Context ctx, ref Rounds self) @trusted {
+private bool commit(ref ecrs.context.Context context, ref Rounds self) @trusted {
 	foreach (i; 0 .. self.members.length) {
 		immutable relation = self.program.derived[self.members[i]];
-		immutable arity = 1 + ecrs.registry.lookupRelationShape(relation).columns;
+		immutable arity = 1 + ecrs.registry.hooksOf(relation).shape.columns;
 		if (self.delta[i] !is null) fp.dynarray.clear(self.delta[i]);
-		immutable before = ecrs.context.generation(ctx, relation);
+		immutable before = ecrs.context.generation(context, relation);
 		size_t total = 0;
 		foreach (ref t; fp.dynarray.slice(self.tasks))
 			if (t.member == i) total += fp.dynarray.length(t.output);
 		bool inserted;
 		if (self.partitions > 1 && total >= parallelThreshold && arity > 1)
-			inserted = insertInParallel(ctx, self.pool, self.partitions, relation, arity, self.tasks, i, self.delta[i]);
+			inserted = insertInParallel(context, self.pool, self.partitions, relation, arity, self.tasks, i, self.delta[i]);
 		else {
 			EntityId* rows = null;
 			scope(exit) fp.dynarray.free(rows);
 			inserted = true;
 			foreach (ref t; fp.dynarray.slice(self.tasks))
-				if (t.member == i) inserted = inserted && append(rows, fp.dynarray.slice(t.output));
-			inserted = inserted && sortUnique(rows, arity) && insertFacts(ctx, relation, fp.dynarray.slice(rows), self.delta[i]);
+				if (t.member == i) inserted = inserted && fp.dynarray.concatenate(rows, fp.dynarray.slice(t.output));
+			inserted = inserted && sortUnique(rows, arity) && insertFacts(context, relation, fp.dynarray.slice(rows), self.delta[i]);
 		}
 		if (!inserted) return false;
-		extendIndexes(*self.program, ctx, relation, before, self.delta[i], arity);
+		extendIndexes(*self.program, context, relation, before, self.delta[i], arity);
 	}
 	foreach (ref t; fp.dynarray.slice(self.tasks)) fp.dynarray.free(t.output);
 	if (self.tasks !is null) fp.dynarray.clear(self.tasks);
@@ -1254,21 +1211,21 @@ private bool commit(ref ecrs.context.Context ctx, ref Rounds self) @trusted {
 }
 
 // Every rule of the stratum, in full.
-private bool firstRound(ref ecrs.context.Context ctx, ref Rounds self) @trusted {
+private bool firstRound(ref ecrs.context.Context context, ref Rounds self) @trusted {
 	foreach (ref r; fp.dynarray.slice(self.program.rules))
 		if (member(self, r.head.relation) != fp.pointer.notFound && !schedule(self, &r, fp.pointer.notFound, null)) return false;
-	return dispatch(ctx, self) && commit(ctx, self);
+	return dispatch(context, self) && commit(context, self);
 }
 
 // Each rule joined against what the last round added to a relation it reads, once per such atom.
-private bool nextRound(ref ecrs.context.Context ctx, ref Rounds self) @trusted {
+private bool nextRound(ref ecrs.context.Context context, ref Rounds self) @trusted {
 	foreach (ref r; fp.dynarray.slice(self.program.rules)) {
 		if (member(self, r.head.relation) == fp.pointer.notFound) continue;
 		// A closure can pair an old fact with a new one, which no delta shows, so rules reading a grown trait relation rerun fully.
 		bool rerun = false;
 		foreach (ref a; fp.dynarray.slice(r.body)) {
 			immutable k = member(self, a.relation);
-			rerun |= !a.negated && k != fp.pointer.notFound && ecrs.registry.lookupRelationShape(a.relation).traits != 0
+			rerun |= !a.negated && k != fp.pointer.notFound && ecrs.registry.hooksOf(a.relation).shape.traits != 0
 				&& fp.dynarray.length(self.delta[k]) > 0;
 		}
 		if (rerun) {
@@ -1281,24 +1238,24 @@ private bool nextRound(ref ecrs.context.Context ctx, ref Rounds self) @trusted {
 			if (!schedule(self, &r, i, fp.dynarray.slice(self.delta[k]))) return false;
 		}
 	}
-	return dispatch(ctx, self) && commit(ctx, self);
+	return dispatch(context, self) && commit(context, self);
 }
 
 // Semi-naive evaluation of one stratum: a first round, then rounds until one leaves the members' generations unchanged. False if allocation fails.
-private bool evaluateStratum(ref Program self, ref ecrs.context.Context ctx, const(size_t)[] members, bc.threadpool.ThreadPool* pool) @trusted {
+private bool evaluateStratum(ref Program self, ref ecrs.context.Context context, const(size_t)[] members, bc.threadpool.ThreadPool* pool) @trusted {
 	immutable m = members.length;
 	Rounds[1] rounds;
 	rounds[0] = Rounds(&self, members, pool, pool is null ? 1 : bc.threadpool.workerCount(pool));
 	scope(exit) free(rounds[0]);
-	auto delta = cast(EntityId**) fp.pointer.allocFunction(null, m * (EntityId*).sizeof);
+	auto delta = cast(EntityId**) fp.pointer.allocator(null, m * (EntityId*).sizeof);
 	if (delta is null) return false;
 	foreach (i; 0 .. m) delta[i] = null;
 	rounds[0].delta = delta;
-	auto watched = cast(size_t*) fp.pointer.allocFunction(null, m * size_t.sizeof);
+	auto watched = cast(size_t*) fp.pointer.allocator(null, m * size_t.sizeof);
 	if (watched is null) return false;
-	scope(exit) cast(void) fp.pointer.allocFunction(watched, 0);
+	scope(exit) cast(void) fp.pointer.allocator(watched, 0);
 	foreach (i; 0 .. m) watched[i] = self.derived[members[i]];
-	return ecrs.schedules.sequential(ctx, ecrs.schedules.sequential!firstRound(rounds[]), ecrs.schedules.untilStable(ecrs.schedules.sequential!nextRound(rounds[]), watched[0 .. m]));
+	return ecrs.schedules.sequential(context, ecrs.schedules.sequential!firstRound(rounds[]), ecrs.schedules.untilStable(ecrs.schedules.sequential!nextRound(rounds[]), watched[0 .. m]));
 }
 
 // A stratum's evaluation as a schedule: its members cleared, then derived afresh.
@@ -1308,20 +1265,20 @@ private struct StratumRun {
 	bc.threadpool.ThreadPool* pool;
 
 	@nogc nothrow:
-	bool opCall(ref ecrs.context.Context ctx) @trusted {
+	bool opCall(ref ecrs.context.Context context) @trusted {
 		const(size_t)[] members = fp.dynarray.slice(stratum.members);
 		foreach (d; members)
-			if (!ecrs.context.clearComponent(ctx, program.derived[d])) return false;
-		return evaluateStratum(*program, ctx, members, pool);
+			if (!ecrs.context.clearComponent(context, program.derived[d])) return false;
+		return evaluateStratum(*program, context, members, pool);
 	}
 }
 
 // `evaluate`'s work, apart from recording the status it returns.
-private Status recompute(ref Program self, ref ecrs.context.Context ctx, bc.threadpool.ThreadPool* pool) @trusted {
-	assert(!ecrs.context.inParallel(ctx), "ecrs: Datalog evaluation writes the store; run it outside parallel schedules");
+private Status recompute(ref Program self, ref ecrs.context.Context context, bc.threadpool.ThreadPool* pool) @trusted {
+	assert(!ecrs.context.inParallel(context), "ecrs: Datalog evaluation writes the store; run it outside parallel schedules");
 	if (!self.stratified)
 		if (immutable status = buildStrata(self)) return status;
-	immutable epoch = ecrs.registry.traitsEpoch();
+	immutable epoch = ecrs.registry.traitsGeneration();
 	if (self.traitsSeen != epoch) {
 		forgetRuns(self);
 		self.traitsSeen = epoch;
@@ -1330,32 +1287,33 @@ private Status recompute(ref Program self, ref ecrs.context.Context ctx, bc.thre
 	bool runStratum(ref ecrs.context.Context c, ref Stratum stratum) {
 		return ecrs.schedules.whenChanged(c, StratumRun(&self, &stratum, pool), stratum.seen, fp.dynarray.slice(stratum.inputs));
 	}
-	return ecrs.schedules.sequential!runStratum(ctx, fp.dynarray.slice(self.strata)) ? Status.ok : Status.outOfMemory;
+	return ecrs.schedules.sequential!runStratum(context, fp.dynarray.slice(self.strata)) ? Status.ok : Status.outOfMemory;
 }
 
-/// Brings every relation `self` derives up to date with `ctx`, stratum by stratum through `ecrs.schedules.whenChanged`: a stratum is recomputed from scratch only if a relation its rules mention, or any trait, changed since it last ran, and what it rewrites counts as a change to the strata reading it. Each round's joins spread over `pool` if one is given. Read results through a `const` context: a mutable access counts as a change, so forces the next call to recompute.
+/// Brings every relation `self` derives up to date with `context`, stratum by stratum through `ecrs.schedules.whenChanged`: a stratum is recomputed from scratch only if a relation its rules mention, or any trait, changed since it last ran, and what it rewrites counts as a change to the strata reading it. Each round's joins spread over `pool` if one is given. Read results through a `const` context: a mutable access counts as a change, so forces the next call to recompute.
 ///
 /// Returns `Status.unstratifiable`, changing nothing, if the rules recurse through negation, or `Status.outOfMemory` if allocation fails, leaving the derived relations partial until a later call succeeds.
 ///
 /// Examples:
 /// ---
 /// alias Parent = ecrs.relation.Relation!1;
-/// auto ctx = ecrs.context.create();
-/// scope(exit) ecrs.context.free(ctx);
-/// EntityId child = ecrs.context.addEntity(ctx), parent = ecrs.context.addEntity(ctx);
-/// ecrs.context.addComponent!Parent(ctx, child).related[0] = parent;
+/// auto context = ecrs.context.create();
+/// scope(exit) ecrs.context.free(context);
+/// EntityId child = ecrs.context.addEntity(context), parent = ecrs.context.addEntity(context);
+/// ecrs.context.addComponent!Parent(context, child).related[0] = parent;
 /// Program p;
 /// scope(exit) free(p);
 /// immutable hasParent = derive(p, "example.hasParent", 0);
 /// assert(addRule(p, atom(hasParent, variable(0)), atom(ecrs.registry.componentId!Parent(), variable(0), variable(1))) == Status.ok);
-/// assert(evaluate(p, ctx) == Status.ok);
-/// assert(ecrs.context.hasComponent(ctx, child, hasParent) && !ecrs.context.hasComponent(ctx, parent, hasParent));
+/// assert(evaluate(p, context) == Status.ok);
+/// assert(ecrs.context.hasComponent(context, child, hasParent) && !ecrs.context.hasComponent(context, parent, hasParent));
 /// ---
-Status evaluate(ref Program self, ref ecrs.context.Context ctx, bc.threadpool.ThreadPool* pool = null) {
-	self.status = recompute(self, ctx, pool);
+Status evaluate(ref Program self, ref ecrs.context.Context context, bc.threadpool.ThreadPool* pool = null) {
+	self.status = recompute(self, context, pool);
 	return self.status;
 }
 
+// wrapper: reads a private field
 /// What the last `evaluate` of `self` returned, directly or through `query` or an `evaluation` schedule, or `Status.ok` if it has never run.
 ///
 /// Examples:
@@ -1366,69 +1324,70 @@ Status evaluate(ref Program self, ref ecrs.context.Context ctx, bc.threadpool.Th
 /// ---
 Status lastStatus(const ref Program self) { return self.status; }
 
-/// Evaluates `self`, on `pool` if given, then calls `onMatch` with the bindings, indexed by variable id, of each solution of `body` against `ctx`, until it returns false. A solution may repeat if a base relation lists a tuple twice. `onMatch` runs on the calling thread and must not change the store.
+/// Evaluates `self`, on `pool` if given, then calls `onMatch` with the bindings, indexed by variable id, of each solution of `body` against `context`, until it returns false. A solution may repeat if a base relation lists a tuple twice. `onMatch` runs on the calling thread and must not change the store.
 ///
 /// Returns `Status.invalid` if `body` is malformed, as `addRule` defines it, or what `evaluate` returns if that fails, calling `onMatch` never either way; `Status.outOfMemory` if the join's allocation fails, possibly after some calls.
 ///
 /// Examples:
 /// ---
 /// alias Parent = ecrs.relation.Relation!1;
-/// auto ctx = ecrs.context.create();
-/// scope(exit) ecrs.context.free(ctx);
-/// EntityId child = ecrs.context.addEntity(ctx), parent = ecrs.context.addEntity(ctx);
-/// ecrs.context.addComponent!Parent(ctx, child).related[0] = parent;
+/// auto context = ecrs.context.create();
+/// scope(exit) ecrs.context.free(context);
+/// EntityId child = ecrs.context.addEntity(context), parent = ecrs.context.addEntity(context);
+/// ecrs.context.addComponent!Parent(context, child).related[0] = parent;
 /// Program p;
 /// scope(exit) free(p);
 /// EntityId found = invalidEntity;
-/// Atom[1] body = [atom(ecrs.registry.componentId!Parent(), constant(child), variable(0))];
-/// assert(query(p, ctx, body[], (b) { found = b[0]; return true; }) == Status.ok);
+/// Atom[1] body = [atom(ecrs.registry.componentId!Parent(), ecrs.relation.Term(child), variable(0))];
+/// assert(query(p, context, body[], (b) { found = b[0]; return true; }) == Status.ok);
 /// assert(found == parent);
 /// ---
-Status query(ref Program self, ref ecrs.context.Context ctx, const(Atom)[] body, scope Emit onMatch, bc.threadpool.ThreadPool* pool = null) @trusted {
+Status query(ref Program self, ref ecrs.context.Context context, const(Atom)[] body, scope Emit onMatch, bc.threadpool.ThreadPool* pool = null) @trusted {
 	size_t varCount;
 	if (!validBody(body, varCount)) return Status.invalid;
-	if (immutable status = evaluate(self, ctx, pool)) return status;
-	return join(self, ctx, body, varCount, fp.pointer.notFound, null, onMatch) ? Status.ok : Status.outOfMemory;
+	if (immutable status = evaluate(self, context, pool)) return status;
+	return join(self, context, body, varCount, fp.pointer.notFound, null, onMatch) ? Status.ok : Status.outOfMemory;
 }
 
 
-/// `evaluate` as an `ecrs.schedules` schedule, from `evaluation(program, pool)`: a copyable struct callable as `bool opCall(ref Context)`, or with any type owning its context as a `ctx` member, so a schedule can bring derived relations up to date between the schedules that write base facts and those that read derived ones. It returns whether `evaluate` succeeded; `lastStatus` says how it failed. The program must not move, nor be freed, while bound. Like `evaluate`, it must not run inside a parallel combinator.
+/// `evaluate` as an `ecrs.schedules` schedule, from `evaluation(program, pool)`: a copyable struct callable as `bool opCall(ref Context)`, or with any type owning its context as a `context` member, so a schedule can bring derived relations up to date between the schedules that write base facts and those that read derived ones. It returns whether `evaluate` succeeded; `lastStatus` says how it failed. The program must not move, nor be freed, while bound. Like `evaluate`, it must not run inside a parallel combinator.
 struct Evaluation {
 	private Program* program;
 	private bc.threadpool.ThreadPool* pool;
 
 	@nogc nothrow:
-	/// Evaluates the program against `ctx`.
+	/// Evaluates the program against `context`.
 	///
 	/// Examples:
 	/// ---
-	/// auto ctx = ecrs.context.create();
-	/// scope(exit) ecrs.context.free(ctx);
+	/// auto context = ecrs.context.create();
+	/// scope(exit) ecrs.context.free(context);
 	/// Program p;
 	/// scope(exit) free(p);
 	/// auto schedule = evaluation(p);
-	/// assert(schedule(ctx) && lastStatus(p) == Status.ok);
+	/// assert(schedule(context) && lastStatus(p) == Status.ok);
 	/// ---
-	bool opCall(ref ecrs.context.Context ctx) { return evaluate(*program, ctx, pool) == Status.ok; }
+	bool opCall(ref ecrs.context.Context context) { return evaluate(*program, context, pool) == Status.ok; }
 
-	/// Ditto, over the context a type owns as a `ctx` member.
+	/// Ditto, over the context a type owns as a `context` member.
 	bool opCall(ContextLike)(ref ContextLike contextLike) if (ecrs.schedules.isContextLike!ContextLike) {
 		return evaluate(*program, ecrs.schedules.contextOf(contextLike), pool) == Status.ok;
 	}
 }
 
+// wrapper: takes the program's address, which Evaluation's private fields hold
 /// Ditto
 ///
 /// Examples:
 /// ---
 /// static bool writeFacts(ref ecrs.context.Context) @nogc nothrow { return true; }
 /// static bool readDerived(ref ecrs.context.Context) @nogc nothrow { return true; }
-/// auto ctx = ecrs.context.create();
-/// scope(exit) ecrs.context.free(ctx);
+/// auto context = ecrs.context.create();
+/// scope(exit) ecrs.context.free(context);
 /// Program p;
 /// scope(exit) free(p);
 /// auto frame = ecrs.schedules.sequential(&writeFacts, evaluation(p), &readDerived);
-/// assert(frame(ctx));
+/// assert(frame(context));
 /// ---
 Evaluation evaluation(ref Program self, bc.threadpool.ThreadPool* pool = null) @trusted {
 	return Evaluation(&self, pool);
@@ -1436,24 +1395,24 @@ Evaluation evaluation(ref Program self, bc.threadpool.ThreadPool* pool = null) @
 
 
 version(unittest) {
-	private alias Parent = ecrs.relation.Relation!(ecrs.relation.dynamicExtent);
+	private alias Parent = ecrs.relation.Relation!(ecrs.relation.dynamicArity);
 	private struct Person {}
 
 	private struct Family {
-		ecrs.context.Context ctx;
+		ecrs.context.Context context;
 		EntityId bart, lisa, homer, marge, abraham, jackie;
 	}
 
 	private Family makeFamily() {
 		Family f;
-		f.ctx = ecrs.context.create();
+		f.context = ecrs.context.create();
 		EntityId*[6] all = [&f.bart, &f.lisa, &f.homer, &f.marge, &f.abraham, &f.jackie];
 		foreach (e; all) {
-			*e = ecrs.context.addEntity(f.ctx);
-			assert(ecrs.context.addComponent!Person(f.ctx, *e) !is null);
+			*e = ecrs.context.addEntity(f.context);
+			assert(ecrs.context.addComponent!Person(f.context, *e) !is null);
 		}
 		void parents(EntityId child, EntityId[] ps...) {
-			foreach (p; ps) assert(fp.dynarray.pushBack(ecrs.context.getOrAddComponent!Parent(f.ctx, child).related, p));
+			foreach (p; ps) assert(fp.dynarray.pushBack(ecrs.context.ensureComponent!Parent(f.context, child).related, p));
 		}
 		parents(f.bart, f.homer, f.marge);
 		parents(f.lisa, f.homer, f.marge);
@@ -1463,9 +1422,9 @@ version(unittest) {
 	}
 
 	// The sorted distinct values of variable `var` over the solutions of `body`.
-	private EntityId* solutions(ref Program p, ref ecrs.context.Context ctx, size_t var, const(Atom)[] body...) @trusted {
+	private EntityId* solutions(ref Program p, ref ecrs.context.Context context, size_t var, const(Atom)[] body...) @trusted {
 		EntityId* found = null;
-		immutable status = query(p, ctx, body, (b) {
+		immutable status = query(p, context, body, (b) {
 			assert(fp.dynarray.pushBack(found, b[var]));
 			return true;
 		});
@@ -1475,29 +1434,29 @@ version(unittest) {
 		std.algorithm.sorting.sort(found[0 .. n]);
 		size_t kept = 1;
 		foreach (i; 1 .. n) if (found[i] != found[kept - 1]) found[kept++] = found[i];
-		cast(void) fp.dynarray.popBackCount(found, n - kept);
+		cast(void) fp.dynarray.removeLast(found, n - kept);
 		return found;
 	}
 
 	private bool sameSet(EntityId* found, const(EntityId)[] expected...) @trusted {
 		scope(exit) fp.dynarray.free(found);
 		EntityId[16] sorted;
-		copy(sorted[0 .. expected.length], expected);
+		fp.pointer.copy(sorted[0 .. expected.length], expected);
 		std.algorithm.sorting.sort(sorted[0 .. expected.length]);
 		return fp.dynarray.slice(found) == sorted[0 .. expected.length];
 	}
 
-	private size_t count(ref Program p, ref ecrs.context.Context ctx, const(Atom)[] body...) {
+	private size_t count(ref Program p, ref ecrs.context.Context context, const(Atom)[] body...) {
 		size_t n = 0;
-		assert(query(p, ctx, body, (b) { ++n; return true; }) == Status.ok);
+		assert(query(p, context, body, (b) { ++n; return true; }) == Status.ok);
 		return n;
 	}
 
 	// Every fact of a binary relation, packed and sorted, since storage order depends on insertion order, which partitioning changes.
-	private ulong* dump(ref Program p, ref ecrs.context.Context ctx, size_t relation, bc.threadpool.ThreadPool* pool) @trusted {
+	private ulong* dump(ref Program p, ref ecrs.context.Context context, size_t relation, bc.threadpool.ThreadPool* pool) @trusted {
 		ulong* out_ = null;
 		Atom[1] all = [atom(relation, variable(0), variable(1))];
-		assert(query(p, ctx, all[], (b) {
+		assert(query(p, context, all[], (b) {
 			assert(fp.dynarray.pushBack(out_, (cast(ulong) b[0] << 32) | b[1]));
 			return true;
 		}, pool) == Status.ok);
@@ -1508,8 +1467,8 @@ version(unittest) {
 
 unittest {
 	// Rejections: recursion through negation, unsafe variables, arity mismatches, heads the program does not derive, and a name reused with another shape.
-	auto ctx = ecrs.context.create();
-	scope(exit) ecrs.context.free(ctx);
+	auto context = ecrs.context.create();
+	scope(exit) ecrs.context.free(context);
 	Program p;
 	scope(exit) free(p);
 
@@ -1522,9 +1481,9 @@ unittest {
 	assert(p.addRule(atom(a, x), atom(person, x), negate(atom(b, x))) == Status.ok);
 	assert(p.addRule(atom(b, x), atom(person, x), negate(atom(a, x))) == Status.ok);
 	assert(lastStatus(p) == Status.ok);
-	assert(p.evaluate(ctx) == Status.unstratifiable);
+	assert(p.evaluate(context) == Status.unstratifiable);
 	assert(lastStatus(p) == Status.unstratifiable);
-	assert(!evaluation(p)(ctx) && lastStatus(p) == Status.unstratifiable);
+	assert(!evaluation(p)(context) && lastStatus(p) == Status.unstratifiable);
 
 	assert(p.addRule(atom(a, y), atom(person, x)) == Status.invalid); // head variable unbound
 	assert(p.addRule(atom(a, x), atom(person, x), negate(atom(b, y))) == Status.invalid); // negated variable unbound
@@ -1549,7 +1508,7 @@ unittest {
 }
 
 unittest {
-	// `sortUnique` agrees with a comparison sort on both sides of `radixThreshold`: narrow ids, ids spanning several bytes, ids needing all 32 bits, and keys all equal.
+	// `sortUnique` agrees with a comparison sort around `radixThreshold`: narrow ids, ids spanning several bytes, ids needing all 32 bits, and equal keys.
 	enum maxRows = radixThreshold * 8;
 	immutable EntityId[4] wide = [0, 1, 1u << 31, invalidEntity];
 	foreach (arity; 1 .. 4)
@@ -1572,7 +1531,7 @@ unittest {
 				foreach (i; 0 .. n) {
 					auto row = rows[order[i] * arity .. order[i] * arity + arity];
 					if (unique > 0 && expected[(unique - 1) * arity .. unique * arity] == row) continue;
-					copy(expected[unique * arity .. unique * arity + arity], row);
+					fp.pointer.copy(expected[unique * arity .. unique * arity + arity], row);
 					++unique;
 				}
 
@@ -1586,7 +1545,7 @@ unittest {
 		scope(exit) fp.dynarray.free(rows);
 		foreach (i; 0 .. 6 * arity) assert(fp.dynarray.pushBack(rows, cast(EntityId) ((i * 7) % 5)));
 		EntityId[18] before;
-		copy(before[0 .. 6 * arity], fp.dynarray.slice(rows));
+		fp.pointer.copy(before[0 .. 6 * arity], fp.dynarray.slice(rows));
 		for (size_t n = 0;; ++n) {
 			ecrs.registry.failAllocationsAfter(n);
 			immutable sorted = sortUnique(rows, arity);
@@ -1597,12 +1556,12 @@ unittest {
 	}
 
 	// Inserting only rows a derived relation already holds leaves its generation alone, which is what ends a stratum's rounds.
-	auto ctx = ecrs.context.create();
-	scope(exit) ecrs.context.free(ctx);
+	auto context = ecrs.context.create();
+	scope(exit) ecrs.context.free(context);
 	Program p;
 	scope(exit) free(p);
 	immutable pairs = p.derive("test.datalog.insertPairs", 1), tags = p.derive("test.datalog.insertTags", 0);
-	immutable a = ecrs.context.addEntity(ctx), b = ecrs.context.addEntity(ctx);
+	immutable a = ecrs.context.addEntity(context), b = ecrs.context.addEntity(context);
 	immutable EntityId[4] pairRows = [a, b, b, a];
 	immutable EntityId[2] tagRows = [a, b];
 	EntityId* delta = null;
@@ -1611,39 +1570,39 @@ unittest {
 		immutable relation = i == 0 ? pairs : tags;
 		const(EntityId)[] rows = i == 0 ? pairRows[] : tagRows[];
 		if (delta !is null) fp.dynarray.clear(delta);
-		assert(insertFacts(ctx, relation, rows, delta) && fp.dynarray.length(delta) == rows.length);
-		immutable g = ecrs.context.generation(ctx, relation);
+		assert(insertFacts(context, relation, rows, delta) && fp.dynarray.length(delta) == rows.length);
+		immutable g = ecrs.context.generation(context, relation);
 		fp.dynarray.clear(delta);
-		assert(insertFacts(ctx, relation, rows, delta) && fp.dynarray.length(delta) == 0);
-		assert(ecrs.context.generation(ctx, relation) == g);
+		assert(insertFacts(context, relation, rows, delta) && fp.dynarray.length(delta) == 0);
+		assert(ecrs.context.generation(context, relation) == g);
 	}
 }
 
 unittest {
 	// Renumbering reaches the rule constants through `attach`, and derived facts are recomputed under the new ids.
 	auto f = makeFamily();
-	scope(exit) ecrs.context.free(f.ctx);
+	scope(exit) ecrs.context.free(f.context);
 	Program p;
 	scope(exit) free(p);
-	assert(attach(f.ctx, p));
+	assert(attach(f.context, p));
 
 	immutable parent = ecrs.registry.componentId!Parent();
 	immutable ofHomer = p.derive("test.datalog.childOfHomer", 0);
 	mixin(createVariables!("x"));
-	assert(p.addRule(atom(ofHomer, x), atom(parent, x, constant(f.homer))) == Status.ok);
-	assert(sameSet(solutions(p, f.ctx, 0, atom(ofHomer, x)), f.bart, f.lisa));
+	assert(p.addRule(atom(ofHomer, x), atom(parent, x, ecrs.relation.Term(f.homer))) == Status.ok);
+	assert(sameSet(solutions(p, f.context, 0, atom(ofHomer, x)), f.bart, f.lisa));
 
-	assert(ecrs.context.swapEntities(f.ctx, f.bart, f.homer));
-	assert(sameSet(solutions(p, f.ctx, 0, atom(ofHomer, x)), f.homer, f.lisa));
+	assert(ecrs.context.swapEntities(f.context, f.bart, f.homer));
+	assert(sameSet(solutions(p, f.context, 0, atom(ofHomer, x)), f.homer, f.lisa));
 
-	assert(detach(f.ctx, p));
-	assert(!detach(f.ctx, p));
+	assert(detach(f.context, p));
+	assert(!detach(f.context, p));
 }
 
 unittest {
 	// Transitive closure over a base dynamic relation, queried from either end: a bound owner reads the store directly, a bound target goes through the index.
 	auto f = makeFamily();
-	scope(exit) ecrs.context.free(f.ctx);
+	scope(exit) ecrs.context.free(f.context);
 	Program p;
 	scope(exit) free(p);
 
@@ -1653,65 +1612,65 @@ unittest {
 	assert(p.addRule(atom(ancestor, x, y), atom(parent, x, y)) == Status.ok);
 	assert(p.addRule(atom(ancestor, x, z), atom(parent, x, y), atom(ancestor, y, z)) == Status.ok);
 
-	assert(sameSet(solutions(p, f.ctx, 1, atom(ancestor, constant(f.bart), y)), f.homer, f.marge, f.abraham, f.jackie));
-	assert(sameSet(solutions(p, f.ctx, 0, atom(ancestor, x, constant(f.abraham))), f.bart, f.lisa, f.homer));
-	assert(sameSet(solutions(p, f.ctx, 0, atom(ancestor, x, constant(f.bart)))));
+	assert(sameSet(solutions(p, f.context, 1, atom(ancestor, ecrs.relation.Term(f.bart), y)), f.homer, f.marge, f.abraham, f.jackie));
+	assert(sameSet(solutions(p, f.context, 0, atom(ancestor, x, ecrs.relation.Term(f.abraham))), f.bart, f.lisa, f.homer));
+	assert(sameSet(solutions(p, f.context, 0, atom(ancestor, x, ecrs.relation.Term(f.bart)))));
 
 	// The derived facts are ordinary components.
-	assert(ecrs.context.hasComponent(f.ctx, f.bart, ancestor));
-	assert(!ecrs.context.hasComponent(f.ctx, f.abraham, ancestor));
+	assert(ecrs.context.hasComponent(f.context, f.bart, ancestor));
+	assert(!ecrs.context.hasComponent(f.context, f.abraham, ancestor));
 
 	// Incremental: an unchanged store is not re-evaluated; a base change is, and retracts what no longer follows.
-	immutable g = ecrs.context.generation(f.ctx, ancestor);
-	assert(p.evaluate(f.ctx) == Status.ok);
-	assert(ecrs.context.generation(f.ctx, ancestor) == g);
+	immutable g = ecrs.context.generation(f.context, ancestor);
+	assert(p.evaluate(f.context) == Status.ok);
+	assert(ecrs.context.generation(f.context, ancestor) == g);
 
-	EntityId adam = ecrs.context.addEntity(f.ctx);
-	assert(fp.dynarray.pushBack(ecrs.context.getOrAddComponent!Parent(f.ctx, f.abraham).related, adam));
-	assert(sameSet(solutions(p, f.ctx, 1, atom(ancestor, constant(f.lisa), y)), f.homer, f.marge, f.abraham, f.jackie, adam));
+	EntityId adam = ecrs.context.addEntity(f.context);
+	assert(fp.dynarray.pushBack(ecrs.context.ensureComponent!Parent(f.context, f.abraham).related, adam));
+	assert(sameSet(solutions(p, f.context, 1, atom(ancestor, ecrs.relation.Term(f.lisa), y)), f.homer, f.marge, f.abraham, f.jackie, adam));
 
-	assert(ecrs.context.removeComponent!Parent(f.ctx, f.homer));
-	assert(sameSet(solutions(p, f.ctx, 1, atom(ancestor, constant(f.lisa), y)), f.homer, f.marge, f.jackie));
+	assert(ecrs.context.removeComponent!Parent(f.context, f.homer));
+	assert(sameSet(solutions(p, f.context, 1, atom(ancestor, ecrs.relation.Term(f.lisa), y)), f.homer, f.marge, f.jackie));
 
 	// Every allocation evaluation makes can fail, reported as such; the next evaluation still derives everything.
-	assert(fp.dynarray.pushBack(ecrs.context.getOrAddComponent!Parent(f.ctx, f.homer).related, f.abraham));
+	assert(fp.dynarray.pushBack(ecrs.context.ensureComponent!Parent(f.context, f.homer).related, f.abraham));
 	bool evaluated = false;
 	foreach (n; 0 .. 1024) {
 		ecrs.registry.failAllocationsAfter(n);
-		immutable status = p.evaluate(f.ctx);
+		immutable status = p.evaluate(f.context);
 		ecrs.registry.restoreAllocations();
 		if (status == Status.ok) { evaluated = true; break; }
 		assert(status == Status.outOfMemory);
 	}
 	assert(evaluated);
-	assert(sameSet(solutions(p, f.ctx, 1, atom(ancestor, constant(f.lisa), y)), f.homer, f.marge, f.abraham, f.jackie, adam));
+	assert(sameSet(solutions(p, f.context, 1, atom(ancestor, ecrs.relation.Term(f.lisa), y)), f.homer, f.marge, f.abraham, f.jackie, adam));
 
 	// A repeated index key whose tuples outgrow `memoLimit` is looked up afresh each time rather than replayed from a partial memo.
 	{
 		alias Outer = ecrs.relation.Relation!1;
-		auto ctx = ecrs.context.create();
-		scope(exit) ecrs.context.free(ctx);
-		immutable hub = ecrs.context.addEntity(ctx);
+		auto context = ecrs.context.create();
+		scope(exit) ecrs.context.free(context);
+		immutable hub = ecrs.context.addEntity(context);
 		foreach (i; 0 .. 3) {
-			immutable e = ecrs.context.addEntity(ctx);
+			immutable e = ecrs.context.addEntity(context);
 			assert(e != invalidEntity);
-			ecrs.context.addComponent!Outer(ctx, e).related[0] = hub;
+			ecrs.context.addComponent!Outer(context, e).related[0] = hub;
 		}
 		enum owners = memoLimit / 2 + 1;
 		foreach (i; 0 .. owners) {
-			immutable e = ecrs.context.addEntity(ctx);
-			assert(e != invalidEntity && fp.dynarray.pushBack(ecrs.context.getOrAddComponent!Parent(ctx, e).related, hub));
+			immutable e = ecrs.context.addEntity(context);
+			assert(e != invalidEntity && fp.dynarray.pushBack(ecrs.context.ensureComponent!Parent(context, e).related, hub));
 		}
 		Program q;
 		scope(exit) free(q);
-		assert(count(q, ctx, atom(ecrs.registry.componentId!Outer(), x, y), atom(parent, z, y)) == 3 * owners);
+		assert(count(q, context, atom(ecrs.registry.componentId!Outer(), x, y), atom(parent, z, y)) == 3 * owners);
 	}
 }
 
 unittest {
 	// Stratified negation over unary relations: a derived tag, and a base tag, `Person`, as the positive guard.
 	auto f = makeFamily();
-	scope(exit) ecrs.context.free(f.ctx);
+	scope(exit) ecrs.context.free(f.context);
 	Program p;
 	scope(exit) free(p);
 
@@ -1723,39 +1682,39 @@ unittest {
 	assert(p.addRule(atom(hasParent, x), atom(parent, x, y)) == Status.ok);
 	assert(p.addRule(atom(root, x), atom(person, x), negate(atom(hasParent, x))) == Status.ok);
 
-	assert(sameSet(solutions(p, f.ctx, 0, atom(root, x)), f.abraham, f.jackie));
-	assert(sameSet(solutions(p, f.ctx, 0, atom(person, x), negate(atom(root, x))), f.bart, f.lisa, f.homer, f.marge));
+	assert(sameSet(solutions(p, f.context, 0, atom(root, x)), f.abraham, f.jackie));
+	assert(sameSet(solutions(p, f.context, 0, atom(person, x), negate(atom(root, x))), f.bart, f.lisa, f.homer, f.marge));
 
 	// As a schedule: one settling a base relation fed by a derived one. Each root adopts a fresh child until no person is a root.
 	static struct Adopt {
 		size_t root;
-		bool opCall(ref ecrs.context.Context ctx) @nogc nothrow @trusted {
-			const(ecrs.context.Context)* view = &ctx;
+		bool opCall(ref ecrs.context.Context context) @nogc nothrow @trusted {
+			const(ecrs.context.Context)* view = &context;
 			EntityId orphan = invalidEntity;
 			foreach (e; ecrs.context.entities(*view))
 				if (ecrs.context.hasComponent(*view, e, root) && ecrs.context.hasComponent!Person(*view, e)) { orphan = e; break; }
 			if (orphan == invalidEntity) return true;
-			immutable adopter = ecrs.context.addEntity(ctx);
-			return adopter != invalidEntity && fp.dynarray.pushBack(ecrs.context.getOrAddComponent!Parent(ctx, orphan).related, adopter);
+			immutable adopter = ecrs.context.addEntity(context);
+			return adopter != invalidEntity && fp.dynarray.pushBack(ecrs.context.ensureComponent!Parent(context, orphan).related, adopter);
 		}
 	}
 	immutable size_t[1] watched = [parent];
 	auto settle = ecrs.schedules.untilStable(ecrs.schedules.sequential(evaluation(p), Adopt(root)), watched[]);
-	assert(settle(f.ctx) && lastStatus(p) == Status.ok);
-	assert(count(p, f.ctx, atom(root, x), atom(person, x)) == 0);
-	assert(sameSet(solutions(p, f.ctx, 0, atom(parent, constant(f.abraham), x)), f.jackie + 1));
-	assert(sameSet(solutions(p, f.ctx, 0, atom(parent, constant(f.jackie), x)), f.jackie + 2));
+	assert(settle(f.context) && lastStatus(p) == Status.ok);
+	assert(count(p, f.context, atom(root, x), atom(person, x)) == 0);
+	assert(sameSet(solutions(p, f.context, 0, atom(parent, ecrs.relation.Term(f.abraham), x)), f.jackie + 1));
+	assert(sameSet(solutions(p, f.context, 0, atom(parent, ecrs.relation.Term(f.jackie), x)), f.jackie + 2));
 
 	// A stratum reruns only when what its rules read changes: a new person reruns `root`'s alone; a new parent reruns `hasParent`'s, then `root`'s.
-	immutable hasParentAt = ecrs.context.generation(f.ctx, hasParent), rootAt = ecrs.context.generation(f.ctx, root);
-	immutable maggie = ecrs.context.addEntity(f.ctx);
-	assert(maggie != invalidEntity && ecrs.context.addComponent!Person(f.ctx, maggie) !is null);
-	assert(sameSet(solutions(p, f.ctx, 0, atom(root, x), atom(person, x)), maggie));
-	assert(ecrs.context.generation(f.ctx, hasParent) == hasParentAt && ecrs.context.generation(f.ctx, root) > rootAt);
+	immutable hasParentAt = ecrs.context.generation(f.context, hasParent), rootAt = ecrs.context.generation(f.context, root);
+	immutable maggie = ecrs.context.addEntity(f.context);
+	assert(maggie != invalidEntity && ecrs.context.addComponent!Person(f.context, maggie) !is null);
+	assert(sameSet(solutions(p, f.context, 0, atom(root, x), atom(person, x)), maggie));
+	assert(ecrs.context.generation(f.context, hasParent) == hasParentAt && ecrs.context.generation(f.context, root) > rootAt);
 
-	assert(fp.dynarray.pushBack(ecrs.context.getOrAddComponent!Parent(f.ctx, maggie).related, f.homer));
-	assert(count(p, f.ctx, atom(root, x), atom(person, x)) == 0);
-	assert(ecrs.context.generation(f.ctx, hasParent) > hasParentAt);
+	assert(fp.dynarray.pushBack(ecrs.context.ensureComponent!Parent(f.context, maggie).related, f.homer));
+	assert(count(p, f.context, atom(root, x), atom(person, x)) == 0);
+	assert(ecrs.context.generation(f.context, hasParent) > hasParentAt);
 }
 
 unittest {
@@ -1763,17 +1722,17 @@ unittest {
 	alias Edge = ecrs.relation.Relation!1;
 	alias Labelled = ecrs.relation.Relation!2;
 
-	auto ctx = ecrs.context.create();
-	scope(exit) ecrs.context.free(ctx);
+	auto context = ecrs.context.create();
+	scope(exit) ecrs.context.free(context);
 	Program p;
 	scope(exit) free(p);
 
 	enum n = 40;
 	EntityId[n] nodes;
-	foreach (i; 0 .. n) nodes[i] = ecrs.context.addEntity(ctx);
-	foreach (i; 0 .. n) ecrs.context.addComponent!Edge(ctx, nodes[i]).related[0] = i + 1 < n ? nodes[i + 1] : invalidEntity;
-	EntityId label = ecrs.context.addEntity(ctx);
-	auto labels = ecrs.context.addComponent!Labelled(ctx, nodes[0]);
+	foreach (i; 0 .. n) nodes[i] = ecrs.context.addEntity(context);
+	foreach (i; 0 .. n) ecrs.context.addComponent!Edge(context, nodes[i]).related[0] = i + 1 < n ? nodes[i + 1] : invalidEntity;
+	EntityId label = ecrs.context.addEntity(context);
+	auto labels = ecrs.context.addComponent!Labelled(context, nodes[0]);
 	labels.related[0] = nodes[5];
 	labels.related[1] = label;
 
@@ -1786,65 +1745,65 @@ unittest {
 	assert(p.addRule(atom(path, x, z), atom(path, x, y), atom(path, y, z)) == Status.ok);
 	assert(p.addRule(atom(tagged, x, z, l), atom(labelled, x, y, l), atom(path, y, z)) == Status.ok);
 
-	assert(count(p, ctx, atom(path, x, y)) == n * (n - 1) / 2);
-	assert(count(p, ctx, atom(tagged, constant(nodes[0]), z, constant(label))) == n - 6);
+	assert(count(p, context, atom(path, x, y)) == n * (n - 1) / 2);
+	assert(count(p, context, atom(tagged, ecrs.relation.Term(nodes[0]), z, ecrs.relation.Term(label))) == n - 6);
 
 	size_t seen = 0;
 	Atom[1] all = [atom(path, x, y)];
-	assert(query(p, ctx, all[], (b) { return ++seen < 3; }) == Status.ok); // stops early
+	assert(query(p, context, all[], (b) { return ++seen < 3; }) == Status.ok); // stops early
 	assert(seen == 3);
 }
 
 unittest {
 	// Transitive and reflexive traits on a base relation, read as closures from either end, with both ends unbound, and under negation.
-	alias IsA = ecrs.relation.Relation!(ecrs.relation.dynamicExtent);
+	alias IsA = ecrs.relation.Relation!(ecrs.relation.dynamicArity);
 	enum unique = 7;
 	immutable isA = ecrs.registry.componentId!(IsA, unique)();
 	ecrs.registry.setRelationTraits(isA, ecrs.registry.RelationTrait.transitive);
 	scope(exit) ecrs.registry.setRelationTraits(isA, 0);
 
-	auto ctx = ecrs.context.create();
-	scope(exit) ecrs.context.free(ctx);
+	auto context = ecrs.context.create();
+	scope(exit) ecrs.context.free(context);
 	Program p;
 	scope(exit) free(p);
 
-	EntityId animal = ecrs.context.addEntity(ctx), mammal = ecrs.context.addEntity(ctx), cat = ecrs.context.addEntity(ctx),
-		dog = ecrs.context.addEntity(ctx), rock = ecrs.context.addEntity(ctx);
-	assert(fp.dynarray.pushBack(ecrs.context.addComponent!(IsA, unique)(ctx, mammal).related, animal));
-	assert(fp.dynarray.pushBack(ecrs.context.addComponent!(IsA, unique)(ctx, cat).related, mammal));
-	assert(fp.dynarray.pushBack(ecrs.context.addComponent!(IsA, unique)(ctx, dog).related, mammal));
+	EntityId animal = ecrs.context.addEntity(context), mammal = ecrs.context.addEntity(context), cat = ecrs.context.addEntity(context),
+		dog = ecrs.context.addEntity(context), rock = ecrs.context.addEntity(context);
+	assert(fp.dynarray.pushBack(ecrs.context.addComponent!(IsA, unique)(context, mammal).related, animal));
+	assert(fp.dynarray.pushBack(ecrs.context.addComponent!(IsA, unique)(context, cat).related, mammal));
+	assert(fp.dynarray.pushBack(ecrs.context.addComponent!(IsA, unique)(context, dog).related, mammal));
 	EntityId[5] everything = [animal, mammal, cat, dog, rock];
-	foreach (e; everything) assert(ecrs.context.addComponent!Person(ctx, e) !is null);
+	foreach (e; everything) assert(ecrs.context.addComponent!Person(context, e) !is null);
 
 	immutable person = ecrs.registry.componentId!Person();
 	mixin(createVariables!("x", "y"));
-	assert(sameSet(solutions(p, ctx, 1, atom(isA, constant(cat), y)), mammal, animal));
-	assert(sameSet(solutions(p, ctx, 0, atom(isA, x, constant(animal))), mammal, cat, dog));
-	assert(sameSet(solutions(p, ctx, 0, atom(isA, x, y)), mammal, cat, dog)); // every owner
-	assert(sameSet(solutions(p, ctx, 0, atom(person, x), negate(atom(isA, x, constant(animal)))), animal, rock));
+	assert(sameSet(solutions(p, context, 1, atom(isA, ecrs.relation.Term(cat), y)), mammal, animal));
+	assert(sameSet(solutions(p, context, 0, atom(isA, x, ecrs.relation.Term(animal))), mammal, cat, dog));
+	assert(sameSet(solutions(p, context, 0, atom(isA, x, y)), mammal, cat, dog)); // every owner
+	assert(sameSet(solutions(p, context, 0, atom(person, x), negate(atom(isA, x, ecrs.relation.Term(animal)))), animal, rock));
 
 	// Reflexive adds R(x, x) over the field only: rock never occurs.
 	ecrs.registry.setRelationTraits(isA, ecrs.registry.RelationTrait.transitive | ecrs.registry.RelationTrait.reflexive);
-	assert(sameSet(solutions(p, ctx, 1, atom(isA, constant(cat), y)), cat, mammal, animal));
-	assert(sameSet(solutions(p, ctx, 0, atom(isA, x, x)), animal, mammal, cat, dog));
-	assert(sameSet(solutions(p, ctx, 1, atom(isA, constant(rock), y))));
+	assert(sameSet(solutions(p, context, 1, atom(isA, ecrs.relation.Term(cat), y)), cat, mammal, animal));
+	assert(sameSet(solutions(p, context, 0, atom(isA, x, x)), animal, mammal, cat, dog));
+	assert(sameSet(solutions(p, context, 1, atom(isA, ecrs.relation.Term(rock), y))));
 
 	// A refused allocation fails a closure read from either end or neither, on a fresh program so nothing is cached; enough allocations find every pair.
 	ecrs.registry.setRelationTraits(isA, ecrs.registry.RelationTrait.transitive | ecrs.registry.RelationTrait.reflexive | ecrs.registry.RelationTrait.symmetric);
-	Atom[1][4] reads = [[atom(isA, constant(cat), y)], [atom(isA, x, constant(animal))], [atom(isA, x, y)], [atom(isA, x, x)]];
+	Atom[1][4] reads = [[atom(isA, ecrs.relation.Term(cat), y)], [atom(isA, x, ecrs.relation.Term(animal))], [atom(isA, x, y)], [atom(isA, x, x)]];
 	foreach (ref read; reads) {
 		size_t expected = 0;
 		{
 			Program fresh;
 			scope(exit) free(fresh);
-			assert(query(fresh, ctx, read[], (b) { ++expected; return true; }) == Status.ok);
+			assert(query(fresh, context, read[], (b) { ++expected; return true; }) == Status.ok);
 		}
 		for (size_t n = 0;; ++n) {
 			Program fresh;
 			scope(exit) free(fresh);
 			size_t found = 0;
 			ecrs.registry.failAllocationsAfter(n);
-			immutable status = query(fresh, ctx, read[], (b) { ++found; return true; });
+			immutable status = query(fresh, context, read[], (b) { ++found; return true; });
 			ecrs.registry.restoreAllocations();
 			if (status == Status.ok) {
 				assert(found == expected);
@@ -1861,20 +1820,20 @@ unittest {
 	immutable sibling = ecrs.registry.componentId!Sibling();
 
 	auto f = makeFamily();
-	scope(exit) ecrs.context.free(f.ctx);
+	scope(exit) ecrs.context.free(f.context);
 	Program p;
 	scope(exit) free(p);
-	ecrs.context.addComponent!Sibling(f.ctx, f.bart).related[0] = f.lisa;
+	ecrs.context.addComponent!Sibling(f.context, f.bart).related[0] = f.lisa;
 
 	immutable hasSibling = p.derive("test.datalog.hasSibling", 0);
 	mixin(createVariables!("x", "y"));
 	assert(p.addRule(atom(hasSibling, x), atom(sibling, x, y)) == Status.ok);
-	assert(sameSet(solutions(p, f.ctx, 0, atom(hasSibling, x)), f.bart));
+	assert(sameSet(solutions(p, f.context, 0, atom(hasSibling, x)), f.bart));
 
 	ecrs.registry.setRelationTraits(sibling, ecrs.registry.RelationTrait.symmetric);
 	scope(exit) ecrs.registry.setRelationTraits(sibling, 0);
-	assert(sameSet(solutions(p, f.ctx, 0, atom(hasSibling, x)), f.bart, f.lisa));
-	assert(sameSet(solutions(p, f.ctx, 1, atom(sibling, constant(f.lisa), y)), f.bart));
+	assert(sameSet(solutions(p, f.context, 0, atom(hasSibling, x)), f.bart, f.lisa));
+	assert(sameSet(solutions(p, f.context, 1, atom(sibling, ecrs.relation.Term(f.lisa), y)), f.bart));
 }
 
 unittest {
@@ -1884,19 +1843,19 @@ unittest {
 	enum bridgeUnique = 3;
 	static struct Start {}
 
-	auto ctx = ecrs.context.create();
-	scope(exit) ecrs.context.free(ctx);
+	auto context = ecrs.context.create();
+	scope(exit) ecrs.context.free(context);
 	Program p;
 	scope(exit) free(p);
 
 	EntityId[6] n;
-	foreach (ref e; n) e = ecrs.context.addEntity(ctx);
-	ecrs.context.addComponent!Edge(ctx, n[0]).related[0] = n[1];
-	ecrs.context.addComponent!Edge(ctx, n[2]).related[0] = n[3];
-	ecrs.context.addComponent!Edge(ctx, n[4]).related[0] = n[5];
-	ecrs.context.addComponent!(Bridge, bridgeUnique)(ctx, n[1]).related[0] = n[2];
-	ecrs.context.addComponent!(Bridge, bridgeUnique)(ctx, n[3]).related[0] = n[4];
-	assert(ecrs.context.addComponent!Start(ctx, n[0]) !is null);
+	foreach (ref e; n) e = ecrs.context.addEntity(context);
+	ecrs.context.addComponent!Edge(context, n[0]).related[0] = n[1];
+	ecrs.context.addComponent!Edge(context, n[2]).related[0] = n[3];
+	ecrs.context.addComponent!Edge(context, n[4]).related[0] = n[5];
+	ecrs.context.addComponent!(Bridge, bridgeUnique)(context, n[1]).related[0] = n[2];
+	ecrs.context.addComponent!(Bridge, bridgeUnique)(context, n[3]).related[0] = n[4];
+	assert(ecrs.context.addComponent!Start(context, n[0]) !is null);
 
 	immutable start = ecrs.registry.componentId!Start();
 	immutable edge = ecrs.registry.componentId!Edge();
@@ -1907,23 +1866,23 @@ unittest {
 	assert(p.addRule(atom(conn, x, y), atom(edge, x, y)) == Status.ok);
 	assert(p.addRule(atom(conn, x, z), atom(start, x), atom(conn, x, y), atom(bridge, y, z)) == Status.ok);
 
-	assert(sameSet(solutions(p, ctx, 1, atom(conn, constant(n[0]), y)), n[1], n[2], n[3], n[4], n[5]));
+	assert(sameSet(solutions(p, context, 1, atom(conn, ecrs.relation.Term(n[0]), y)), n[1], n[2], n[3], n[4], n[5]));
 }
 
 unittest {
 	// Parallel evaluation derives exactly what serial evaluation does: reach over a pseudo-random graph with cycles, and a negated stratum, on pools of 1 and 4.
-	alias Edge = ecrs.relation.Relation!(ecrs.relation.dynamicExtent);
+	alias Edge = ecrs.relation.Relation!(ecrs.relation.dynamicArity);
 	enum unique = 11;
 	immutable edge = ecrs.registry.componentId!(Edge, unique)();
 	immutable person = ecrs.registry.componentId!Person();
 
-	auto ctx = ecrs.context.create();
-	scope(exit) ecrs.context.free(ctx);
+	auto context = ecrs.context.create();
+	scope(exit) ecrs.context.free(context);
 	enum n = 400; // wide enough that rounds pass `parallelThreshold`
 	EntityId[n] nodes;
 	foreach (ref e; nodes) {
-		e = ecrs.context.addEntity(ctx);
-		assert(ecrs.context.addComponent!Person(ctx, e) !is null);
+		e = ecrs.context.addEntity(context);
+		assert(ecrs.context.addComponent!Person(context, e) !is null);
 	}
 	uint seed = 12345;
 	foreach (i; 0 .. 2 * n) {
@@ -1931,7 +1890,7 @@ unittest {
 		immutable from = (seed >> 8) % n;
 		seed = seed * 1103515245 + 12345;
 		immutable to = (seed >> 8) % n;
-		assert(fp.dynarray.pushBack(ecrs.context.getOrAddComponent!(Edge, unique)(ctx, nodes[from]).related, nodes[to]));
+		assert(fp.dynarray.pushBack(ecrs.context.ensureComponent!(Edge, unique)(context, nodes[from]).related, nodes[to]));
 	}
 
 	ulong*[3] results;
@@ -1951,12 +1910,12 @@ unittest {
 		assert(p.addRule(atom(reach, x, z), atom(reach, x, y), atom(edge, y, z)) == Status.ok);
 		assert(p.addRule(atom(cyclic, x), atom(reach, x, x)) == Status.ok);
 		assert(p.addRule(atom(acyclic, x), atom(person, x), negate(atom(cyclic, x))) == Status.ok);
-		assert(p.evaluate(ctx, pool) == Status.ok);
-		assert(!ecrs.context.inParallel(ctx));
+		assert(p.evaluate(context, pool) == Status.ok);
+		assert(!ecrs.context.inParallel(context));
 
-		results[run] = dump(p, ctx, reach, pool);
+		results[run] = dump(p, context, reach, pool);
 		Atom[1] q = [atom(acyclic, x)];
-		assert(query(p, ctx, q[], (b) { ++isolated[run]; return true; }, pool) == Status.ok);
+		assert(query(p, context, q[], (b) { ++isolated[run]; return true; }, pool) == Status.ok);
 	}
 	scope(exit) foreach (r; results) fp.dynarray.free(r);
 

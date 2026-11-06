@@ -6,12 +6,14 @@ module ecrs.context;
 import core.atomic : atomicLoad, atomicOp;
 import core.stdc.string : memcpy, memset;
 
+static import bc.platform;
 static import bc.monitor;
 static import ecrs.registry;
 static import ecrs.storage;
 static import fp.dynarray;
 static import fp.lifecycle;
 static import fp.pointer;
+static import fp.algorithms;
 
 public import ecrs.registry : EntityId, invalidEntity;
 
@@ -22,13 +24,15 @@ public import ecrs.registry : EntityId, invalidEntity;
 alias RemapHookFunction = void function(void* userData, const(EntityId)[] remap) @nogc nothrow;
 
 private struct RemapHook {
-	RemapHookFunction fn;
+	RemapHookFunction hook;
 	void* userData;
 }
 
 private enum JournalKind : ubyte { touchedStorage, removedEntity, removedComponent, replacedComponent }
 
-// One undoable step of a transaction; `saved` is the offset of a replaced component's old bytes in `Journal.saved`. Additions are not journaled one by one: a storage's first is a `touchedStorage` holding its size in `slot` and its hole count in `saved`, and new entities are those from `Context.firstNew`.
+/// One undoable step of a transaction; `saved` is the offset of a replaced component's old bytes in `Journal.saved`.
+///
+/// Additions are not journaled one by one: a storage's first is a `touchedStorage` holding its size in `slot` and its hole count in `saved`, and new entities are those past `Context.firstNew`.
 private struct JournalEntry {
 	JournalKind kind;
 	EntityId e;
@@ -45,7 +49,7 @@ private struct Journal {
 
 /// The entity and component database: one `ecrs.storage.Storage` per component id, and each entity's index list mapping its components to their slots.
 ///
-/// It is plain data, released only by `free`: pair `create` with `scope(exit) free(ctx)`.
+/// It is plain data, released only by `free`: pair `create` with `scope(exit) free(context)`.
 ///
 /// Between `beginTransaction` and `commitTransaction` it journals every change, so `rollbackTransaction` can restore it as it was without allocating. Removals and replacements take an entry each; additions take one per storage, however many there are, so building a large store in one transaction costs no journal to speak of.
 ///
@@ -67,39 +71,34 @@ struct Context {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// assert(!inParallel(ctx));
-/// free(ctx);
+/// Context context = create();
+/// assert(!inParallel(context));
+/// free(context);
 /// ---
 bool inParallel(const ref Context self) @trusted {
-	return atomicLoad(*cast(shared(const(size_t))*) &self.parallelDepth) != 0;
+	return atomicLoad(bc.platform.asShared(self.parallelDepth)) != 0;
 }
 
+// wrapper: names the parallel bookkeeping the schedules keep
 /// Marks `self` as inside a parallel combinator until the matching `exitParallel`.
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// enterParallel(ctx);
-/// assert(inParallel(ctx));
-/// exitParallel(ctx);
-/// assert(!inParallel(ctx));
-/// free(ctx);
+/// Context context = create();
+/// enterParallel(context);
+/// assert(inParallel(context));
+/// exitParallel(context);
+/// assert(!inParallel(context));
+/// free(context);
 /// ---
 package void enterParallel(ref Context self) @trusted {
-	atomicOp!"+="(*cast(shared(size_t)*) &self.parallelDepth, 1);
+	atomicOp!"+="(bc.platform.asShared(self.parallelDepth), 1);
 }
 
+// wrapper: names the parallel bookkeeping the schedules keep
 /// Ditto
 package void exitParallel(ref Context self) @trusted {
-	atomicOp!"-="(*cast(shared(size_t)*) &self.parallelDepth, 1);
-}
-
-// Makes room for `n` more elements of `da`, at least doubling its capacity: `fp.dynarray.reserve` grows to exactly the size asked, so reserving one at a time is quadratic.
-private bool reserveMore(T)(ref T* da, size_t n) @trusted {
-	immutable needed = fp.dynarray.length(da) + n, capacity = fp.dynarray.capacity(da);
-	if (needed <= capacity) return true;
-	return fp.dynarray.reserve(da, needed > 2 * capacity ? needed : 2 * capacity) !is null;
+	atomicOp!"-="(bc.platform.asShared(self.parallelDepth), 1);
 }
 
 private enum string structuralChange = "ecrs: structural change inside a parallel schedule; make it after the pass, or between `beginExclusive` and `endExclusive`";
@@ -108,12 +107,12 @@ private enum string structuralChange = "ecrs: structural change inside a paralle
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// beginExclusive(ctx);
-/// assert(inExclusive(ctx) && addEntity(ctx) != invalidEntity);
-/// endExclusive(ctx);
-/// assert(!inExclusive(ctx));
+/// Context context = create();
+/// scope(exit) free(context);
+/// beginExclusive(context);
+/// assert(inExclusive(context) && addEntity(context) != invalidEntity);
+/// endExclusive(context);
+/// assert(!inExclusive(context));
 /// ---
 void beginExclusive(ref Context self) {
 	++self.exclusiveDepth;
@@ -129,9 +128,9 @@ void endExclusive(ref Context self) {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// assert(!inExclusive(ctx));
-/// free(ctx);
+/// Context context = create();
+/// assert(!inExclusive(context));
+/// free(context);
 /// ---
 bool inExclusive(const ref Context self) {
 	return self.exclusiveDepth != 0;
@@ -142,7 +141,7 @@ private bool structureFree(const ref Context self) {
 	return self.exclusiveDepth != 0 || !inParallel(self);
 }
 private enum string concurrentStructure = "ecrs: an entity or storage added or removed during concurrent writes; make it before `beginConcurrentWrites`";
-private enum string unprepared = "ecrs: a concurrent addition to a storage `prepareConcurrentAdds` did not prepare";
+private enum string unprepared = "ecrs: a concurrent addition to a storage `reserveConcurrentAdds` did not prepare";
 
 
 private bool freelistContains(const(size_t)* freelist, size_t value) @trusted {
@@ -160,9 +159,9 @@ struct EntityRange {
 	///
 	/// Examples:
 	/// ---
-	/// Context ctx = create();
-	/// scope(exit) free(ctx);
-	/// EntityRange range = entities(ctx);
+	/// Context context = create();
+	/// scope(exit) free(context);
+	/// EntityRange range = entities(context);
 	/// assert(!range.empty && range.front == invalidEntity);
 	/// range.popFront();
 	/// assert(range.empty);
@@ -183,11 +182,11 @@ private void skipFreed(ref EntityRange range) @trusted {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
 /// size_t count = 0;
-/// foreach (entity; entities(ctx)) ++count;
+/// foreach (entity; entities(context)) ++count;
 /// assert(count == 2);
 /// ---
 EntityRange entities(const ref Context self) {
@@ -199,20 +198,21 @@ EntityRange entities(const ref Context self) {
 
 private ref ecrs.storage.Storage existingStorage(ref Context self, size_t componentId) @trusted {
 	assert(fp.dynarray.length(self.storages) > componentId);
-	assert(self.storages[componentId].elementSize != ecrs.storage.Storage.invalid);
+	assert(self.storages[componentId].elementSize != ecrs.storage.Storage.unknownSize);
 	return self.storages[componentId];
 }
 private ref const(ecrs.storage.Storage) existingStorage(const ref Context self, size_t componentId) @trusted {
 	assert(fp.dynarray.length(self.storages) > componentId);
-	assert(self.storages[componentId].elementSize != ecrs.storage.Storage.invalid);
+	assert(self.storages[componentId].elementSize != ecrs.storage.Storage.unknownSize);
 	return self.storages[componentId];
 }
 
 private bool hasStorage(const ref Context self, size_t componentId) @trusted {
 	return componentId < fp.dynarray.length(self.storages)
-		&& self.storages[componentId].elementSize != ecrs.storage.Storage.invalid;
+		&& self.storages[componentId].elementSize != ecrs.storage.Storage.unknownSize;
 }
 
+// wrapper: names reserving entity 0, which every context holds
 private bool reserveInvalidEntity(ref Context self) @trusted {
 	return fp.dynarray.pushBack(self.indexTable, cast(ecrs.storage.IndexList) null);
 }
@@ -224,16 +224,17 @@ private enum size_t savedAlignment = 16;
 
 private enum string notInTransaction = "ecrs: renumbering or sorting inside a transaction; commit or roll it back first";
 
+// wrapper: reads a private field
 /// Whether a transaction is open on `self`.
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// assert(!inTransaction(ctx));
-/// beginTransaction(ctx);
-/// assert(inTransaction(ctx));
-/// commitTransaction(ctx);
+/// Context context = create();
+/// scope(exit) free(context);
+/// assert(!inTransaction(context));
+/// beginTransaction(context);
+/// assert(inTransaction(context));
+/// commitTransaction(context);
 /// ---
 bool inTransaction(const ref Context self) { return self.transaction; }
 
@@ -243,12 +244,12 @@ bool inTransaction(const ref Context self) { return self.transaction; }
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// beginTransaction(ctx);
-/// EntityId e = addEntity(ctx);
-/// rollbackTransaction(ctx);
-/// assert(entityCount(ctx) == 1 && e == 1);
+/// Context context = create();
+/// scope(exit) free(context);
+/// beginTransaction(context);
+/// EntityId e = addEntity(context);
+/// rollbackTransaction(context);
+/// assert(entityCount(context) == 1 && e == 1);
 /// ---
 void beginTransaction(ref Context self) {
 	assert(!self.transaction, "ecrs: transactions do not nest");
@@ -258,7 +259,7 @@ void beginTransaction(ref Context self) {
 }
 
 private bool reserveJournal(ref Journal journal, size_t n) @trusted {
-	return reserveMore(journal.entries, n);
+	return fp.dynarray.reserveAtLeast(journal.entries, fp.dynarray.length(journal.entries) + n) !is null;
 }
 
 // Appends an entry; the caller has reserved room for it with `reserveJournal`.
@@ -267,12 +268,12 @@ private void record(ref Journal journal, JournalEntry entry) @trusted {
 	assert(recorded);
 }
 
-// Before the open transaction's first `add` to `storage`, whose lock the caller holds in concurrent writes, records where a rollback restores it to. False if the journal cannot grow.
+// Before the transaction's first `add` to `storage`, whose lock the caller holds, records where a rollback restores it. False if the journal cannot grow.
 private bool journalStorage(ref Context self, ref ecrs.storage.Storage storage, size_t componentId) @trusted {
 	if (storage.journaled) return true;
 	auto journal = bc.monitor.write(self.journal);
 	if (!reserveJournal(journal.value, 1)) return false;
-	record(journal.value, JournalEntry(JournalKind.touchedStorage, invalidEntity, componentId, ecrs.storage.size(storage), ecrs.storage.holeCount(storage)));
+	record(journal.value, JournalEntry(JournalKind.touchedStorage, invalidEntity, componentId, ecrs.storage.slotCount(storage), ecrs.storage.holeCount(storage)));
 	storage.journaled = true;
 	return true;
 }
@@ -290,14 +291,14 @@ private void endTransaction(ref Context self, ref Journal journal) @trusted {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
-/// *addComponent!int(ctx, e) = 1;
-/// beginTransaction(ctx);
-/// assert(setComponent!int(ctx, e, 2));
-/// commitTransaction(ctx);
-/// assert(getComponent!int(ctx, e) == 2 && !inTransaction(ctx));
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
+/// *addComponent!int(context, e) = 1;
+/// beginTransaction(context);
+/// assert(setComponent!int(context, e, 2));
+/// commitTransaction(context);
+/// assert(getComponent!int(context, e) == 2 && !inTransaction(context));
 /// ---
 void commitTransaction(ref Context self) @trusted {
 	assert(self.transaction);
@@ -323,16 +324,16 @@ void commitTransaction(ref Context self) @trusted {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
-/// *addComponent!int(ctx, e) = 1;
-/// beginTransaction(ctx);
-/// assert(setComponent!int(ctx, e, 2));
-/// assert(removeComponent!int(ctx, e));
-/// assert(addComponent!short(ctx, e) !is null);
-/// rollbackTransaction(ctx);
-/// assert(getComponent!int(ctx, e) == 1 && !hasComponent!short(ctx, e));
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
+/// *addComponent!int(context, e) = 1;
+/// beginTransaction(context);
+/// assert(setComponent!int(context, e, 2));
+/// assert(removeComponent!int(context, e));
+/// assert(addComponent!short(context, e) !is null);
+/// rollbackTransaction(context);
+/// assert(getComponent!int(context, e) == 1 && !hasComponent!short(context, e));
 /// ---
 void rollbackTransaction(ref Context self) @trusted {
 	assert(self.transaction);
@@ -343,7 +344,7 @@ void rollbackTransaction(ref Context self) @trusted {
 			break;
 		case JournalKind.removedEntity:
 			assert(*fp.dynarray.back(self.freelist) == entry.e);
-			cast(void) fp.dynarray.popBack(self.freelist);
+			cast(void) fp.dynarray.removeLast(self.freelist);
 			break;
 		case JournalKind.removedComponent:
 			// An addition after the removal gave `e` a new slot, which its storage's `touchedStorage` reclaims further on.
@@ -352,14 +353,14 @@ void rollbackTransaction(ref Context self) @trusted {
 			break;
 		case JournalKind.replacedComponent:
 			auto storage = &existingStorage(self, entry.componentId);
-			void* p = ecrs.storage.get(*storage, entry.slot);
+			void* p = ecrs.storage.getForWriting(*storage, entry.slot);
 			ecrs.storage.finalizeBytes(*storage, p);
 			memcpy(p, journal.value.saved + entry.saved, storage.elementSize);
 			break;
 	}
 	// The entities it added are the tail of the table; restoring their storages has taken every component off them.
 	foreach (e; self.firstNew .. fp.dynarray.length(self.indexTable)) fp.dynarray.free(self.indexTable[e]);
-	cast(void) fp.dynarray.popBackCount(self.indexTable, fp.dynarray.length(self.indexTable) - self.firstNew);
+	cast(void) fp.dynarray.removeLast(self.indexTable, fp.dynarray.length(self.indexTable) - self.firstNew);
 	endTransaction(self, journal.value);
 }
 
@@ -370,16 +371,16 @@ void rollbackTransaction(ref Context self) @trusted {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// assert(prepareConcurrentAdds(ctx, ecrs.registry.componentId!int(), 8, int.sizeof));
-/// beginConcurrentWrites(ctx);
-/// endConcurrentWrites(ctx);
+/// Context context = create();
+/// scope(exit) free(context);
+/// assert(reserveConcurrentAdds(context, ecrs.registry.componentId!int(), 8, int.sizeof));
+/// beginConcurrentWrites(context);
+/// endConcurrentWrites(context);
 /// ---
-bool prepareConcurrentAdds(ref Context self, size_t componentId, size_t n, size_t elementSize = ecrs.storage.Storage.invalid) @trusted {
+bool reserveConcurrentAdds(ref Context self, size_t componentId, size_t n, size_t elementSize = ecrs.storage.Storage.unknownSize) @trusted {
 	assert(structureFree(self), structuralChange);
 	assert(!self.concurrent, concurrentStructure);
-	immutable size = elementSize == ecrs.storage.Storage.invalid ? ecrs.registry.lookupSize(componentId) : elementSize;
+	immutable size = elementSize == ecrs.storage.Storage.unknownSize ? ecrs.registry.elementSizeOf(componentId) : elementSize;
 	auto storage = getStorage(self, componentId, size);
 	return storage !is null && (!self.transaction || journalStorage(self, *storage, componentId)) && ecrs.storage.prepareClaims(*storage, n);
 }
@@ -388,31 +389,31 @@ bool prepareConcurrentAdds(ref Context self, size_t componentId, size_t n, size_
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// assert(prepareConcurrentAdds!int(ctx, 8));
-/// beginConcurrentWrites(ctx);
-/// endConcurrentWrites(ctx);
+/// Context context = create();
+/// scope(exit) free(context);
+/// assert(reserveConcurrentAdds!int(context, 8));
+/// beginConcurrentWrites(context);
+/// endConcurrentWrites(context);
 /// ---
-template prepareConcurrentAdds(T, size_t unique = 0) {
-	bool prepareConcurrentAdds(ref Context self, size_t n) {
+template reserveConcurrentAdds(T, size_t unique = 0) {
+	bool reserveConcurrentAdds(ref Context self, size_t n) {
 		immutable id = ecrs.registry.componentId!(T, unique)();
-		return id != fp.pointer.notFound && .prepareConcurrentAdds(self, id, n, T.sizeof);
+		return id != fp.pointer.notFound && .reserveConcurrentAdds(self, id, n, T.sizeof);
 	}
 }
 
-/// Opens a phase in which several threads may add, set and remove components of existing entities at once, until `endConcurrentWrites`: each entity is changed by one thread at a time, each storage they add to has been readied by `prepareConcurrentAdds`, and removals happen only inside a transaction, which keeps their slots until it ends. Meanwhile no entity or storage may be added or removed, nor anything renumbered or sorted. The phase may enclose `ecrs.schedules` parallel combinators, whose schedules may then make these writes, but must open and close outside them. Inside a transaction the changes are journaled as ever, so a rollback undoes them; the journal is the one lock writers share.
+/// Opens a phase in which several threads may add, set and remove components of existing entities at once, until `endConcurrentWrites`: each entity is changed by one thread at a time, each storage they add to has been readied by `reserveConcurrentAdds`, and removals happen only inside a transaction, which keeps their slots until it ends. Meanwhile no entity or storage may be added or removed, nor anything renumbered or sorted. The phase may enclose `ecrs.schedules` parallel combinators, whose schedules may then make these writes, but must open and close outside them. Inside a transaction the changes are journaled as ever, so a rollback undoes them; the journal is the one lock writers share.
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
-/// assert(prepareConcurrentAdds!int(ctx, 1) && prepareConcurrentAdds!short(ctx, 1));
-/// beginConcurrentWrites(ctx);
-/// assert(setComponent!int(ctx, e, 3) && setComponent!short(ctx, e, 4)); // from any thread, each with its own entities
-/// endConcurrentWrites(ctx);
-/// assert(getComponent!int(ctx, e) == 3);
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
+/// assert(reserveConcurrentAdds!int(context, 1) && reserveConcurrentAdds!short(context, 1));
+/// beginConcurrentWrites(context);
+/// assert(setComponent!int(context, e, 3) && setComponent!short(context, e, 4)); // from any thread, each with its own entities
+/// endConcurrentWrites(context);
+/// assert(getComponent!int(context, e) == 3);
 /// ---
 void beginConcurrentWrites(ref Context self) @trusted {
 	assert(structureFree(self), structuralChange);
@@ -425,10 +426,10 @@ void beginConcurrentWrites(ref Context self) @trusted {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// beginConcurrentWrites(ctx);
-/// endConcurrentWrites(ctx);
+/// Context context = create();
+/// scope(exit) free(context);
+/// beginConcurrentWrites(context);
+/// endConcurrentWrites(context);
 /// ---
 void endConcurrentWrites(ref Context self) @trusted {
 	assert(structureFree(self), structuralChange);
@@ -444,9 +445,9 @@ void endConcurrentWrites(ref Context self) @trusted {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// assert(entityCount(ctx) == 1);
-/// free(ctx);
+/// Context context = create();
+/// assert(entityCount(context) == 1);
+/// free(context);
 /// ---
 Context create() {
 	Context c;
@@ -458,9 +459,9 @@ Context create() {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// free(ctx);
-/// assert(entityCount(ctx) == 0);
+/// Context context = create();
+/// free(context);
+/// assert(entityCount(context) == 0);
 /// ---
 void free(ref Context self) @trusted {
 	if (self.transaction) commitTransaction(self);
@@ -470,7 +471,7 @@ void free(ref Context self) @trusted {
 		fp.dynarray.free(journal.value.saved);
 	}
 	foreach (i; 0 .. fp.dynarray.length(self.storages))
-		if (self.storages[i].elementSize != ecrs.storage.Storage.invalid)
+		if (self.storages[i].elementSize != ecrs.storage.Storage.unknownSize)
 			ecrs.storage.free(self.storages[i]);
 	fp.dynarray.free(self.storages);
 	foreach (i; 0 .. fp.dynarray.length(self.indexTable))
@@ -488,37 +489,37 @@ void free(ref Context self) @trusted {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// auto storage = getStorage(ctx, ecrs.registry.componentId!int(), int.sizeof);
+/// Context context = create();
+/// scope(exit) free(context);
+/// auto storage = getStorage(context, ecrs.registry.componentId!int(), int.sizeof);
 /// assert(storage !is null && ecrs.storage.empty(*storage));
 /// ---
 ecrs.storage.Storage* getStorage(ref Context self, size_t componentId, size_t elementSize) @trusted {
 	if (hasStorage(self, componentId)) return &self.storages[componentId];
 	assert(structureFree(self), structuralChange);
 	assert(!self.concurrent, concurrentStructure);
-	assert(elementSize != ecrs.storage.Storage.invalid, "ecrs: component of unknown size");
+	assert(elementSize != ecrs.storage.Storage.unknownSize, "ecrs: component of unknown size");
 
 	immutable count = fp.dynarray.length(self.storages);
 	if (componentId >= count) {
 		if (fp.dynarray.growToSize(self.storages, componentId + 1) is null) return null;
 		foreach (i; count .. componentId + 1) self.storages[i] = ecrs.storage.Storage.init;
 	}
-	immutable hooks = ecrs.registry.lookupHooks(componentId);
-	self.storages[componentId] = ecrs.storage.create(elementSize, hooks.finalizeFunction, hooks.remapFunction);
+	immutable hooks = ecrs.registry.hooksOf(componentId);
+	self.storages[componentId] = ecrs.storage.create(elementSize, hooks.finalizer, hooks.remapFunction);
 	return &self.storages[componentId];
 }
 
-/// Ditto, for a const context, which cannot create one: returns null if no entity has had the component. `elementSize`, unless `Storage.invalid`, is checked against the storage's.
+/// Ditto, for a const context, which cannot create one: returns null if no entity has had the component. `elementSize`, unless `Storage.unknownSize`, is checked against the storage's.
 ///
 /// Examples:
 /// ---
-/// const Context ctx = create();
-/// assert(getStorage(ctx, ecrs.registry.componentId!int()) is null);
+/// const Context context = create();
+/// assert(getStorage(context, ecrs.registry.componentId!int()) is null);
 /// ---
-const(ecrs.storage.Storage)* getStorage(const ref Context self, size_t componentId, size_t elementSize = ecrs.storage.Storage.invalid) @trusted {
+const(ecrs.storage.Storage)* getStorage(const ref Context self, size_t componentId, size_t elementSize = ecrs.storage.Storage.unknownSize) @trusted {
 	if (!hasStorage(self, componentId)) return null;
-	assert(elementSize == ecrs.storage.Storage.invalid || elementSize == self.storages[componentId].elementSize);
+	assert(elementSize == ecrs.storage.Storage.unknownSize || elementSize == self.storages[componentId].elementSize);
 	return &self.storages[componentId];
 }
 
@@ -526,9 +527,9 @@ const(ecrs.storage.Storage)* getStorage(const ref Context self, size_t component
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// assert(getStorage!int(ctx) !is null);
+/// Context context = create();
+/// scope(exit) free(context);
+/// assert(getStorage!int(context) !is null);
 /// ---
 template getStorage(T, size_t unique = 0) {
 	ecrs.storage.Storage* getStorage(ref Context self) {
@@ -537,15 +538,16 @@ template getStorage(T, size_t unique = 0) {
 	}
 }
 
+// wrapper: reads a private field
 /// One past the highest component id `self` has room for, so `getStorage` over `0 .. storageCount` visits every storage it has.
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
+/// Context context = create();
+/// scope(exit) free(context);
 /// immutable id = ecrs.registry.componentId!int();
-/// assert(getStorage(ctx, id, int.sizeof) !is null);
-/// assert(storageCount(ctx) > id);
+/// assert(getStorage(context, id, int.sizeof) !is null);
+/// assert(storageCount(context) > id);
 /// ---
 size_t storageCount(const ref Context self) @trusted {
 	return fp.dynarray.length(self.storages);
@@ -555,12 +557,12 @@ size_t storageCount(const ref Context self) @trusted {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
+/// Context context = create();
+/// scope(exit) free(context);
 /// immutable id = ecrs.registry.componentId!int();
-/// assert(generation(ctx, id) == 0);
-/// assert(addComponent(ctx, addEntity(ctx), id) !is null);
-/// assert(generation(ctx, id) > 0);
+/// assert(generation(context, id) == 0);
+/// assert(addComponent(context, addEntity(context), id) !is null);
+/// assert(generation(context, id) > 0);
 /// ---
 size_t generation(const ref Context self, size_t componentId) {
 	auto storage = getStorage(self, componentId);
@@ -571,16 +573,16 @@ size_t generation(const ref Context self, size_t componentId) {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// immutable before = generation(ctx);
-/// assert(addComponent!int(ctx, addEntity(ctx)) !is null);
-/// assert(generation(ctx) > before);
+/// Context context = create();
+/// scope(exit) free(context);
+/// immutable before = generation(context);
+/// assert(addComponent!int(context, addEntity(context)) !is null);
+/// assert(generation(context) > before);
 /// ---
 size_t generation(const ref Context self) @trusted {
 	size_t sum = 0;
 	foreach (i; 0 .. fp.dynarray.length(self.storages))
-		if (self.storages[i].elementSize != ecrs.storage.Storage.invalid)
+		if (self.storages[i].elementSize != ecrs.storage.Storage.unknownSize)
 			sum += ecrs.storage.generation(self.storages[i]);
 	return sum;
 }
@@ -590,10 +592,10 @@ size_t generation(const ref Context self) @trusted {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// cast(void) addEntity(ctx);
-/// assert(entityCount(ctx) == 2);
+/// Context context = create();
+/// scope(exit) free(context);
+/// cast(void) addEntity(context);
+/// assert(entityCount(context) == 2);
 /// ---
 size_t entityCount(const ref Context self) @trusted {
 	return fp.dynarray.length(self.indexTable) - fp.dynarray.length(self.freelist);
@@ -605,9 +607,9 @@ size_t entityCount(const ref Context self) @trusted {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
 /// assert(e == 1);
 /// ---
 EntityId addEntity(ref Context self) @trusted {
@@ -615,7 +617,7 @@ EntityId addEntity(ref Context self) @trusted {
 	assert(!self.concurrent, concurrentStructure);
 	if (self.transaction) {
 		// Never a freed id: a rollback removes what the transaction added by cutting the table back to `firstNew`.
-		if (!reserveMore(self.indexTable, 2)) return invalidEntity;
+		if (fp.dynarray.reserveAtLeast(self.indexTable, fp.dynarray.length(self.indexTable) + 2) is null) return invalidEntity;
 		if (fp.dynarray.length(self.indexTable) == 0) cast(void) reserveInvalidEntity(self); // reserved above
 		immutable e = cast(EntityId) fp.dynarray.length(self.indexTable);
 		cast(void) fp.dynarray.pushBack(self.indexTable, cast(ecrs.storage.IndexList) null); // reserved above
@@ -624,7 +626,7 @@ EntityId addEntity(ref Context self) @trusted {
 	if (fp.dynarray.length(self.indexTable) == 0 && !reserveInvalidEntity(self)) return invalidEntity;
 	if (fp.dynarray.length(self.freelist) > 0) {
 		immutable e = *fp.dynarray.back(self.freelist);
-		cast(void) fp.dynarray.popBack(self.freelist);
+		cast(void) fp.dynarray.removeLast(self.freelist);
 		return cast(EntityId) e;
 	}
 	immutable e = cast(EntityId) fp.dynarray.length(self.indexTable);
@@ -638,15 +640,15 @@ EntityId addEntity(ref Context self) @trusted {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// immutable first = addEntities(ctx, 3);
-/// assert(first == 1 && entityCount(ctx) == 4);
+/// Context context = create();
+/// scope(exit) free(context);
+/// immutable first = addEntities(context, 3);
+/// assert(first == 1 && entityCount(context) == 4);
 /// ---
 EntityId addEntities(ref Context self, size_t n) @trusted {
 	assert(structureFree(self), structuralChange);
 	assert(!self.concurrent, concurrentStructure);
-	if (!reserveMore(self.indexTable, n + 1)) return invalidEntity;
+	if (fp.dynarray.reserveAtLeast(self.indexTable, fp.dynarray.length(self.indexTable) + n + 1) is null) return invalidEntity;
 	if (fp.dynarray.length(self.indexTable) == 0) cast(void) reserveInvalidEntity(self); // reserved above
 	immutable first = cast(EntityId) fp.dynarray.length(self.indexTable);
 	foreach (i; 0 .. n) cast(void) fp.dynarray.pushBack(self.indexTable, cast(ecrs.storage.IndexList) null); // reserved above
@@ -659,17 +661,17 @@ EntityId addEntities(ref Context self, size_t n) @trusted {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
-/// assert(removeEntity(ctx, e));
-/// assert(entityCount(ctx) == 1);
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
+/// assert(removeEntity(context, e));
+/// assert(entityCount(context) == 1);
 /// ---
 bool removeEntity(ref Context self, EntityId e) @trusted {
 	assert(structureFree(self), structuralChange);
 	assert(!self.concurrent, concurrentStructure);
 	assert(e != invalidEntity && e < fp.dynarray.length(self.indexTable));
-	if (!reserveMore(self.freelist, 1)) return false;
+	if (fp.dynarray.reserveAtLeast(self.freelist, fp.dynarray.length(self.freelist) + 1) is null) return false;
 
 	auto indices = self.indexTable[e];
 	if (self.transaction) {
@@ -700,10 +702,10 @@ bool removeEntity(ref Context self, EntityId e) @trusted {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
-/// assert(!hasComponent(ctx, e, ecrs.registry.componentId!int()));
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
+/// assert(!hasComponent(context, e, ecrs.registry.componentId!int()));
 /// ---
 bool hasComponent(const ref Context self, EntityId e, size_t componentId) @trusted {
 	return e < fp.dynarray.length(self.indexTable)
@@ -715,11 +717,11 @@ bool hasComponent(const ref Context self, EntityId e, size_t componentId) @trust
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
-/// assert(addComponent!int(ctx, e) !is null);
-/// assert(hasComponent!int(ctx, e));
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
+/// assert(addComponent!int(context, e) !is null);
+/// assert(hasComponent!int(context, e));
 /// ---
 template hasComponent(T, size_t unique = 0) {
 	bool hasComponent(const ref Context self, EntityId e) {
@@ -735,16 +737,16 @@ template hasComponent(T, size_t unique = 0) {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
-/// int* p = cast(int*) addComponent(ctx, e, ecrs.registry.componentId!int());
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
+/// int* p = cast(int*) addComponent(context, e, ecrs.registry.componentId!int());
 /// assert(p !is null && *p == 0);
 /// ---
-void* addComponent(ref Context self, EntityId e, size_t componentId, size_t elementSize = ecrs.storage.Storage.invalid) {
+void* addComponent(ref Context self, EntityId e, size_t componentId, size_t elementSize = ecrs.storage.Storage.unknownSize) {
 	assert(self.concurrent || structureFree(self), structuralChange);
 	assert(!hasComponent(self, e, componentId));
-	immutable size = elementSize == ecrs.storage.Storage.invalid ? ecrs.registry.lookupSize(componentId) : elementSize;
+	immutable size = elementSize == ecrs.storage.Storage.unknownSize ? ecrs.registry.elementSizeOf(componentId) : elementSize;
 	auto storage = getStorage(self, componentId, size);
 	if (storage is null) return null;
 	assert(!self.concurrent || storage.claimLimit, unprepared);
@@ -757,10 +759,10 @@ void* addComponent(ref Context self, EntityId e, size_t componentId, size_t elem
 /// Examples:
 /// ---
 /// static struct Position { float x = 1, y = 2; }
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
-/// Position* p = addComponent!Position(ctx, e);
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
+/// Position* p = addComponent!Position(context, e);
 /// assert(p !is null && p.y == 2);
 /// ---
 template addComponent(T, size_t unique = 0) {
@@ -781,13 +783,13 @@ template addComponent(T, size_t unique = 0) {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
 /// immutable id = ecrs.registry.componentId!int();
-/// assert(addComponent(ctx, e, id) !is null);
-/// assert(removeComponent(ctx, e, id));
-/// assert(!hasComponent(ctx, e, id));
+/// assert(addComponent(context, e, id) !is null);
+/// assert(removeComponent(context, e, id));
+/// assert(!hasComponent(context, e, id));
 /// ---
 bool removeComponent(ref Context self, EntityId e, size_t componentId) {
 	assert(self.concurrent || structureFree(self), structuralChange);
@@ -805,12 +807,12 @@ bool removeComponent(ref Context self, EntityId e, size_t componentId) {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
-/// assert(addComponent!int(ctx, e) !is null);
-/// assert(removeComponent!int(ctx, e));
-/// assert(!hasComponent!int(ctx, e));
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
+/// assert(addComponent!int(context, e) !is null);
+/// assert(removeComponent!int(context, e));
+/// assert(!hasComponent!int(context, e));
 /// ---
 template removeComponent(T, size_t unique = 0) {
 	bool removeComponent(ref Context self, EntityId e) {
@@ -823,13 +825,13 @@ template removeComponent(T, size_t unique = 0) {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
 /// immutable id = ecrs.registry.componentId!int();
-/// assert(addComponent(ctx, e, id) !is null);
-/// assert(clearComponent(ctx, id));
-/// assert(!hasComponent(ctx, e, id));
+/// assert(addComponent(context, e, id) !is null);
+/// assert(clearComponent(context, id));
+/// assert(!hasComponent(context, e, id));
 /// ---
 bool clearComponent(ref Context self, size_t componentId) @trusted {
 	assert(structureFree(self), structuralChange);
@@ -839,7 +841,7 @@ bool clearComponent(ref Context self, size_t componentId) @trusted {
 	if (self.transaction) {
 		auto journal = bc.monitor.write(self.journal);
 		if (!reserveJournal(journal.value, ecrs.storage.liveCount(*storage))) return false;
-		foreach (slot; 0 .. ecrs.storage.size(*storage)) {
+		foreach (slot; 0 .. ecrs.storage.slotCount(*storage)) {
 			immutable slotOwner = ecrs.storage.owner(*storage, slot);
 			if (slotOwner != invalidEntity)
 				record(journal.value, JournalEntry(JournalKind.removedComponent, slotOwner, componentId, ecrs.storage.detach(*storage, componentId, self.indexTable, slotOwner)));
@@ -847,7 +849,7 @@ bool clearComponent(ref Context self, size_t componentId) @trusted {
 		return true;
 	}
 	// Descending, so popping the last slot never skips an owner.
-	foreach_reverse (slot; 0 .. ecrs.storage.size(*storage)) {
+	foreach_reverse (slot; 0 .. ecrs.storage.slotCount(*storage)) {
 		immutable slotOwner = ecrs.storage.owner(*storage, slot);
 		if (slotOwner != invalidEntity)
 			cast(void) ecrs.storage.remove(*storage, componentId, self.indexTable, slotOwner);
@@ -855,29 +857,21 @@ bool clearComponent(ref Context self, size_t componentId) @trusted {
 	return true;
 }
 
-/// Entity `e`'s component `componentId`, which it must have. `elementSize`, unless `Storage.invalid`, is checked against the storage's.
+/// Entity `e`'s component `componentId`, which it must have, for reading; reading counts no change. `elementSize`, unless `Storage.unknownSize`, is checked against the storage's. Write through `getForWriting` or `setComponent`.
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
 /// immutable id = ecrs.registry.componentId!int();
-/// void* added = addComponent(ctx, e, id);
-/// assert(getComponent(ctx, e, id) is added);
+/// void* added = addComponent(context, e, id);
+/// assert(getComponent(context, e, id) is added);
 /// ---
-void* getComponent(ref Context self, EntityId e, size_t componentId, size_t elementSize = ecrs.storage.Storage.invalid) @trusted {
+const(void)* getComponent(const ref Context self, EntityId e, size_t componentId, size_t elementSize = ecrs.storage.Storage.unknownSize) @trusted {
 	assert(hasComponent(self, e, componentId));
 	auto storage = &existingStorage(self, componentId);
-	assert(elementSize == ecrs.storage.Storage.invalid || elementSize == storage.elementSize);
-	return ecrs.storage.get(*storage, self.indexTable[e][componentId]);
-}
-
-/// Ditto
-const(void)* getComponent(const ref Context self, EntityId e, size_t componentId, size_t elementSize = ecrs.storage.Storage.invalid) @trusted {
-	assert(hasComponent(self, e, componentId));
-	auto storage = &existingStorage(self, componentId);
-	assert(elementSize == ecrs.storage.Storage.invalid || elementSize == storage.elementSize);
+	assert(elementSize == ecrs.storage.Storage.unknownSize || elementSize == storage.elementSize);
 	return ecrs.storage.get(*storage, self.indexTable[e][componentId]);
 }
 
@@ -885,40 +879,31 @@ const(void)* getComponent(const ref Context self, EntityId e, size_t componentId
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
-/// *addComponent!int(ctx, e) = 3;
-/// assert(getComponent!int(ctx, e) == 3);
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
+/// *addComponent!int(context, e) = 3;
+/// assert(getComponent!int(context, e) == 3);
 /// ---
 template getComponent(T, size_t unique = 0) {
-	ref T getComponent(ref Context self, EntityId e) @trusted {
-		return *cast(T*) .getComponent(self, e, ecrs.registry.componentId!(T, unique)(), T.sizeof);
-	}
 	ref const(T) getComponent(const ref Context self, EntityId e) @trusted {
 		return *cast(const(T)*) .getComponent(self, e, ecrs.registry.componentId!(T, unique)(), T.sizeof);
 	}
 }
 
-/// Entity `e`'s component `componentId`, or null if `e` lacks it. `elementSize`, unless `Storage.invalid`, is checked against the storage's. The address is stable on the terms `addComponent` gives.
+/// Entity `e`'s component `componentId`, or null if `e` lacks it, for reading; reading counts no change. `elementSize`, unless `Storage.unknownSize`, is checked against the storage's. The address is stable on the terms `addComponent` gives.
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
 /// immutable id = ecrs.registry.componentId!int();
-/// assert(findComponent(ctx, e, id) is null);
-/// void* added = addComponent(ctx, e, id);
-/// assert(findComponent(ctx, e, id) is added);
+/// assert(findComponent(context, e, id) is null);
+/// void* added = addComponent(context, e, id);
+/// assert(findComponent(context, e, id) is added);
 /// ---
-void* findComponent(ref Context self, EntityId e, size_t componentId, size_t elementSize = ecrs.storage.Storage.invalid) @trusted {
-	if (!hasComponent(self, e, componentId)) return null;
-	return getComponent(self, e, componentId, elementSize);
-}
-
-/// Ditto
-const(void)* findComponent(const ref Context self, EntityId e, size_t componentId, size_t elementSize = ecrs.storage.Storage.invalid) @trusted {
+const(void)* findComponent(const ref Context self, EntityId e, size_t componentId, size_t elementSize = ecrs.storage.Storage.unknownSize) @trusted {
 	if (!hasComponent(self, e, componentId)) return null;
 	return getComponent(self, e, componentId, elementSize);
 }
@@ -927,37 +912,104 @@ const(void)* findComponent(const ref Context self, EntityId e, size_t componentI
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
-/// assert(findComponent!int(ctx, e) is null);
-/// *addComponent!int(ctx, e) = 3;
-/// if (auto p = findComponent!int(ctx, e)) assert(*p == 3);
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
+/// assert(findComponent!int(context, e) is null);
+/// *addComponent!int(context, e) = 3;
+/// if (auto p = findComponent!int(context, e)) assert(*p == 3);
 /// ---
 template findComponent(T, size_t unique = 0) {
-	T* findComponent(ref Context self, EntityId e) @trusted {
-		return cast(T*) .findComponent(self, e, ecrs.registry.componentId!(T, unique)(), T.sizeof);
-	}
 	const(T)* findComponent(const ref Context self, EntityId e) @trusted {
 		return cast(const(T)*) .findComponent(self, e, ecrs.registry.componentId!(T, unique)(), T.sizeof);
 	}
 }
 
-/// Entity `e`'s component `componentId`, added as `addComponent` would if `e` lacks it.
+/// Entity `e`'s component `componentId`, which it must have, for writing in place: counts a change in its storage, so `untilStable` and `whenChanged` see it. Inside a transaction an in-place write is not journaled, so a rollback keeps a write to a component that predates the transaction; replace such a component with `setComponent`, which is journaled. `elementSize`, unless `Storage.unknownSize`, is checked against the storage's.
+///
+/// Examples:
+/// ---
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
+/// immutable id = ecrs.registry.componentId!int();
+/// void* added = addComponent(context, e, id);
+/// assert(getForWriting(context, e, id) is added);
+/// ---
+void* getForWriting(ref Context self, EntityId e, size_t componentId, size_t elementSize = ecrs.storage.Storage.unknownSize) @trusted {
+	assert(hasComponent(self, e, componentId));
+	auto storage = &existingStorage(self, componentId);
+	assert(elementSize == ecrs.storage.Storage.unknownSize || elementSize == storage.elementSize);
+	return ecrs.storage.getForWriting(*storage, self.indexTable[e][componentId]);
+}
+
+/// Ditto, for component `(T, unique)`.
+///
+/// Examples:
+/// ---
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
+/// *addComponent!int(context, e) = 3;
+/// getForWriting!int(context, e) += 1;
+/// assert(getComponent!int(context, e) == 4);
+/// ---
+template getForWriting(T, size_t unique = 0) {
+	ref T getForWriting(ref Context self, EntityId e) @trusted {
+		return *cast(T*) .getForWriting(self, e, ecrs.registry.componentId!(T, unique)(), T.sizeof);
+	}
+}
+
+/// Entity `e`'s component `componentId`, or null if `e` lacks it, for writing in place, on the terms `getForWriting` gives.
+///
+/// Examples:
+/// ---
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
+/// immutable id = ecrs.registry.componentId!int();
+/// assert(findForWriting(context, e, id) is null);
+/// void* added = addComponent(context, e, id);
+/// assert(findForWriting(context, e, id) is added);
+/// ---
+void* findForWriting(ref Context self, EntityId e, size_t componentId, size_t elementSize = ecrs.storage.Storage.unknownSize) @trusted {
+	if (!hasComponent(self, e, componentId)) return null;
+	return getForWriting(self, e, componentId, elementSize);
+}
+
+/// Ditto, for component `(T, unique)`.
+///
+/// Examples:
+/// ---
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
+/// assert(findForWriting!int(context, e) is null);
+/// *addComponent!int(context, e) = 3;
+/// if (auto p = findForWriting!int(context, e)) *p = 4;
+/// assert(getComponent!int(context, e) == 4);
+/// ---
+template findForWriting(T, size_t unique = 0) {
+	T* findForWriting(ref Context self, EntityId e) @trusted {
+		return cast(T*) .findForWriting(self, e, ecrs.registry.componentId!(T, unique)(), T.sizeof);
+	}
+}
+
+/// Entity `e`'s component `componentId` for writing, as `findForWriting` gives it, added as `addComponent` would if `e` lacks it.
 ///
 /// Returns null if adding fails, leaving `e` without the component.
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
 /// immutable id = ecrs.registry.componentId!int();
-/// void* p = getOrAddComponent(ctx, e, id);
-/// assert(p !is null && getOrAddComponent(ctx, e, id) is p);
+/// void* p = ensureComponent(context, e, id);
+/// assert(p !is null && ensureComponent(context, e, id) is p);
 /// ---
-void* getOrAddComponent(ref Context self, EntityId e, size_t componentId, size_t elementSize = ecrs.storage.Storage.invalid) {
-	if (auto p = findComponent(self, e, componentId, elementSize)) return p;
+void* ensureComponent(ref Context self, EntityId e, size_t componentId, size_t elementSize = ecrs.storage.Storage.unknownSize) {
+	if (auto p = findForWriting(self, e, componentId, elementSize)) return p;
 	return addComponent(self, e, componentId, elementSize);
 }
 
@@ -965,16 +1017,79 @@ void* getOrAddComponent(ref Context self, EntityId e, size_t componentId, size_t
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
-/// int* p = getOrAddComponent!int(ctx, e);
-/// assert(p !is null && getOrAddComponent!int(ctx, e) is p);
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
+/// int* p = ensureComponent!int(context, e);
+/// assert(p !is null && ensureComponent!int(context, e) is p);
 /// ---
-template getOrAddComponent(T, size_t unique = 0) {
-	T* getOrAddComponent(ref Context self, EntityId e) {
-		if (auto p = .findComponent!(T, unique)(self, e)) return p;
+template ensureComponent(T, size_t unique = 0) {
+	T* ensureComponent(ref Context self, EntityId e) {
+		if (auto p = .findForWriting!(T, unique)(self, e)) return p;
 		return .addComponent!(T, unique)(self, e);
+	}
+}
+
+/// The component `(T, unique)` of the one entity holding it, for a component kept once per store, such as an index or a system's state; null if no entity holds it. It reads through a `const` store, so it never creates the storage, and any thread may call it while others read. With several holders it gives the first in slot order.
+///
+/// Examples:
+/// ---
+/// Context context = create();
+/// scope(exit) free(context);
+/// assert(findSingleton!int(context) is null);
+/// *addSingleton!int(context) = 4;
+/// assert(*findSingleton!int(context) == 4);
+/// ---
+template findSingleton(T, size_t unique = 0) {
+	const(T)* findSingleton(const ref Context self) @trusted {
+		auto storage = getStorage(self, ecrs.registry.componentId!(T, unique)());
+		if (storage is null) return null;
+		foreach (slot; 0 .. ecrs.storage.slotCount(*storage))
+			if (ecrs.storage.owner(*storage, slot) != invalidEntity) return &ecrs.storage.get!T(*storage, slot);
+		return null;
+	}
+}
+
+/// The component `(T, unique)` kept once per store, as `findSingleton` finds it, for writing in place on the terms `getForWriting` gives, or null if there is none. Like `findSingleton`, it never adds a storage, so a thread may call it while others read the store.
+///
+/// Examples:
+/// ---
+/// Context context = create();
+/// scope(exit) free(context);
+/// assert(findSingletonForWriting!int(context) is null);
+/// cast(void) addSingleton!int(context);
+/// *findSingletonForWriting!int(context) = 5;
+/// assert(*findSingleton!int(context) == 5);
+/// ---
+template findSingletonForWriting(T, size_t unique = 0) {
+	T* findSingletonForWriting(ref Context self) @trusted {
+		auto storage = cast(ecrs.storage.Storage*) getStorage(*cast(const(Context)*) &self, ecrs.registry.componentId!(T, unique)());
+		if (storage is null) return null;
+		foreach (slot; 0 .. ecrs.storage.slotCount(*storage))
+			if (ecrs.storage.owner(*storage, slot) != invalidEntity) return &ecrs.storage.getForWriting!T(*storage, slot);
+		return null;
+	}
+}
+
+/// Adds an entity holding a new, empty component `(T, unique)`, for a component kept once per store, and returns the component for writing; `findSingleton` finds it from then on.
+///
+/// Returns null if allocation fails, having removed the new entity again, or, if that too was refused, left it empty.
+///
+/// Examples:
+/// ---
+/// Context context = create();
+/// scope(exit) free(context);
+/// int* state = addSingleton!int(context);
+/// assert(state !is null && *state == 0 && findSingleton!int(context) is state);
+/// ---
+template addSingleton(T, size_t unique = 0) {
+	T* addSingleton(ref Context self) {
+		immutable holder = addEntity(self);
+		if (holder == invalidEntity) return null;
+		auto component = .addComponent!(T, unique)(self, holder);
+		// If even the removal is refused, an empty entity remains that nothing reaches.
+		if (component is null) cast(void) removeEntity(self, holder);
+		return component;
 	}
 }
 
@@ -984,17 +1099,17 @@ template getOrAddComponent(T, size_t unique = 0) {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId e = addEntity(ctx);
-/// assert(setComponent!int(ctx, e, 1));
-/// int* p = &getComponent!int(ctx, e);
-/// assert(setComponent!int(ctx, e, 2));
-/// assert(&getComponent!int(ctx, e) is p && *p == 2);
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId e = addEntity(context);
+/// assert(setComponent!int(context, e, 1));
+/// const(int)* p = &getComponent!int(context, e);
+/// assert(setComponent!int(context, e, 2));
+/// assert(&getComponent!int(context, e) is p && *p == 2);
 /// ---
 template setComponent(T, size_t unique = 0) {
 	bool setComponent(ref Context self, EntityId e, T value) @trusted {
-		auto existing = .findComponent!(T, unique)(self, e);
+		auto existing = .findForWriting!(T, unique)(self, e);
 		if (existing is null) {
 			auto p = .addComponent!(T, unique)(self, e);
 			if (p is null) {
@@ -1013,7 +1128,7 @@ template setComponent(T, size_t unique = 0) {
 		auto journal = bc.monitor.write(self.journal);
 		auto saved = &journal.value.saved;
 		immutable offset = (fp.dynarray.length(*saved) + savedAlignment - 1) / savedAlignment * savedAlignment;
-		if (!reserveJournal(journal.value, 1) || !reserveMore(*saved, offset + T.sizeof - fp.dynarray.length(*saved)) || fp.dynarray.growToSize(*saved, offset + T.sizeof) is null) {
+		if (!reserveJournal(journal.value, 1) || fp.dynarray.reserveAtLeast(*saved, offset + T.sizeof) is null || fp.dynarray.growToSize(*saved, offset + T.sizeof) is null) {
 			fp.lifecycle.endLifetime(value);
 			return false;
 		}
@@ -1026,37 +1141,37 @@ template setComponent(T, size_t unique = 0) {
 }
 
 
-/// Registers a holder of entity ids outside the store, so every renumbering rewrites it too. `userData` is passed back to `fn` unchanged.
+/// Registers a holder of entity ids outside the store, so every renumbering rewrites it too. `userData` is passed back to `hook` unchanged.
 ///
 /// Returns false if allocation fails, registering nothing.
 ///
 /// Examples:
 /// ---
 /// static void onRemap(void*, const(EntityId)[]) @nogc nothrow {}
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// assert(addRemapHook(ctx, &onRemap, null));
+/// Context context = create();
+/// scope(exit) free(context);
+/// assert(addRemapHook(context, &onRemap, null));
 /// ---
-bool addRemapHook(ref Context self, RemapHookFunction fn, void* userData) @trusted {
+bool addRemapHook(ref Context self, RemapHookFunction hook, void* userData) @trusted {
 	assert(structureFree(self), structuralChange);
-	return fp.dynarray.pushBack(self.remapHooks, RemapHook(fn, userData));
+	return fp.dynarray.pushBack(self.remapHooks, RemapHook(hook, userData));
 }
 
-/// Unregisters the hook added with exactly `fn` and `userData`, returning false if there is none.
+/// Unregisters the hook added with exactly `hook` and `userData`, returning false if there is none.
 ///
 /// Examples:
 /// ---
 /// static void onRemap(void*, const(EntityId)[]) @nogc nothrow {}
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// assert(addRemapHook(ctx, &onRemap, null));
-/// assert(removeRemapHook(ctx, &onRemap, null));
-/// assert(!removeRemapHook(ctx, &onRemap, null));
+/// Context context = create();
+/// scope(exit) free(context);
+/// assert(addRemapHook(context, &onRemap, null));
+/// assert(removeRemapHook(context, &onRemap, null));
+/// assert(!removeRemapHook(context, &onRemap, null));
 /// ---
-bool removeRemapHook(ref Context self, RemapHookFunction fn, void* userData) @trusted {
+bool removeRemapHook(ref Context self, RemapHookFunction hook, void* userData) @trusted {
 	assert(structureFree(self), structuralChange);
 	foreach (i; 0 .. fp.dynarray.length(self.remapHooks))
-		if (self.remapHooks[i].fn is fn && self.remapHooks[i].userData is userData) {
+		if (self.remapHooks[i].hook is hook && self.remapHooks[i].userData is userData) {
 			cast(void) fp.dynarray.removeAt(self.remapHooks, i);
 			return true;
 		}
@@ -1070,19 +1185,19 @@ private bool renumber(ref Context self, const(size_t)[] order, const(EntityId)[]
 	assert(!self.transaction, notInTransaction);
 	auto table = self.indexTable;
 	// The only step that can fail goes first, so a failure leaves every holder untouched.
-	if (!ecrs.storage.applyPermutation(order, (a, b) {
+	if (!fp.algorithms.applyPermutation(order, (a, b) {
 		auto t = table[a];
 		table[a] = table[b];
 		table[b] = t;
 	})) return false;
 
 	foreach (id; 0 .. fp.dynarray.length(self.storages))
-		if (self.storages[id].elementSize != ecrs.storage.Storage.invalid)
+		if (self.storages[id].elementSize != ecrs.storage.Storage.unknownSize)
 			ecrs.storage.relabel(self.storages[id], remap);
 	foreach (i; 0 .. fp.dynarray.length(self.freelist))
 		self.freelist[i] = remap[self.freelist[i]];
 	foreach (i; 0 .. fp.dynarray.length(self.remapHooks))
-		self.remapHooks[i].fn(self.remapHooks[i].userData, remap);
+		self.remapHooks[i].hook(self.remapHooks[i].userData, remap);
 	return true;
 }
 
@@ -1092,20 +1207,20 @@ private bool renumber(ref Context self, const(size_t)[] order, const(EntityId)[]
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId a = addEntity(ctx), b = addEntity(ctx);
-/// *addComponent!int(ctx, a) = 10;
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId a = addEntity(context), b = addEntity(context);
+/// *addComponent!int(context, a) = 10;
 /// immutable size_t[3] order = [0, 2, 1];
-/// assert(reorderEntities(ctx, order[]));
-/// assert(getComponent!int(ctx, b) == 10);
+/// assert(reorderEntities(context, order[]));
+/// assert(getComponent!int(context, b) == 10);
 /// ---
 bool reorderEntities(ref Context self, const(size_t)[] order) @trusted {
 	assert(order.length == fp.dynarray.length(self.indexTable));
 	assert(order.length == 0 || order[0] == invalidEntity);
 	auto remap = ecrs.storage.buildRemap(order);
 	if (remap is null) return false;
-	scope(exit) cast(void) fp.pointer.allocFunction(remap, 0);
+	scope(exit) cast(void) fp.pointer.allocator(remap, 0);
 	return renumber(self, order, remap[0 .. order.length]);
 }
 
@@ -1115,20 +1230,20 @@ bool reorderEntities(ref Context self, const(size_t)[] order) @trusted {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId a = addEntity(ctx), b = addEntity(ctx);
-/// *addComponent!int(ctx, a) = 10;
-/// assert(swapEntities(ctx, a, b));
-/// assert(getComponent!int(ctx, b) == 10);
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId a = addEntity(context), b = addEntity(context);
+/// *addComponent!int(context, a) = 10;
+/// assert(swapEntities(context, a, b));
+/// assert(getComponent!int(context, b) == 10);
 /// ---
 bool swapEntities(ref Context self, EntityId a, EntityId b = EntityId.max) @trusted {
 	immutable n = fp.dynarray.length(self.indexTable);
 	immutable resolvedB = b == EntityId.max ? cast(EntityId)(n - 1) : b;
 	assert(a < n && resolvedB < n);
-	auto order = cast(size_t*) fp.pointer.allocFunction(null, n * size_t.sizeof);
+	auto order = cast(size_t*) fp.pointer.allocator(null, n * size_t.sizeof);
 	if (order is null) return false;
-	scope(exit) cast(void) fp.pointer.allocFunction(order, 0);
+	scope(exit) cast(void) fp.pointer.allocator(order, 0);
 	foreach (i; 0 .. n) order[i] = i;
 	order[a] = resolvedB;
 	order[resolvedB] = a;
@@ -1141,13 +1256,13 @@ bool swapEntities(ref Context self, EntityId a, EntityId b = EntityId.max) @trus
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId a = addEntity(ctx), b = addEntity(ctx);
-/// *addComponent!int(ctx, b) = 10;
-/// assert(removeEntity(ctx, a));
-/// assert(compact(ctx));
-/// assert(getComponent!int(ctx, 1) == 10);
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId a = addEntity(context), b = addEntity(context);
+/// *addComponent!int(context, b) = 10;
+/// assert(removeEntity(context, a));
+/// assert(compact(context));
+/// assert(getComponent!int(context, 1) == 10);
 /// ---
 bool compact(ref Context self) @trusted {
 	assert(!self.transaction, notInTransaction);
@@ -1155,15 +1270,15 @@ bool compact(ref Context self) @trusted {
 	immutable freedCount = fp.dynarray.length(self.freelist);
 	if (freedCount == 0) return true;
 
-	auto freed = cast(bool*) fp.pointer.allocFunction(null, n * bool.sizeof);
+	auto freed = cast(bool*) fp.pointer.allocator(null, n * bool.sizeof);
 	if (freed is null) return false;
-	scope(exit) cast(void) fp.pointer.allocFunction(freed, 0);
+	scope(exit) cast(void) fp.pointer.allocator(freed, 0);
 	foreach (e; 0 .. n) freed[e] = false;
 	foreach (i; 0 .. freedCount) freed[self.freelist[i]] = true;
 
-	auto order = cast(size_t*) fp.pointer.allocFunction(null, n * size_t.sizeof);
+	auto order = cast(size_t*) fp.pointer.allocator(null, n * size_t.sizeof);
 	if (order is null) return false;
-	scope(exit) cast(void) fp.pointer.allocFunction(order, 0);
+	scope(exit) cast(void) fp.pointer.allocator(order, 0);
 	size_t live = 0, dead = n - freedCount;
 	foreach (e; 0 .. n)
 		order[freed[e] ? dead++ : live++] = e;
@@ -1171,13 +1286,13 @@ bool compact(ref Context self) @trusted {
 
 	auto remap = ecrs.storage.buildRemap(order[0 .. n]);
 	if (remap is null) return false;
-	scope(exit) cast(void) fp.pointer.allocFunction(remap, 0);
+	scope(exit) cast(void) fp.pointer.allocator(remap, 0);
 	foreach (e; 0 .. n)
 		if (freed[e]) remap[e] = invalidEntity;
 
 	if (!renumber(self, order[0 .. n], remap[0 .. n])) return false;
 	// The tail now holds the freed ids, whose index lists removeEntity released.
-	cast(void) fp.dynarray.popBackCount(self.indexTable, freedCount);
+	cast(void) fp.dynarray.removeLast(self.indexTable, freedCount);
 	fp.dynarray.clear(self.freelist);
 	return true;
 }
@@ -1189,22 +1304,22 @@ bool compact(ref Context self) @trusted {
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// EntityId a = addEntity(ctx), b = addEntity(ctx);
-/// *addComponent!int(ctx, b) = 2;
-/// *addComponent!int(ctx, a) = 1;
-/// assert(makeMonotonic!(int, short)(ctx));
-/// assert(ecrs.storage.owners(*getStorage!int(ctx)) == [a, b]);
+/// Context context = create();
+/// scope(exit) free(context);
+/// EntityId a = addEntity(context), b = addEntity(context);
+/// *addComponent!int(context, b) = 2;
+/// *addComponent!int(context, a) = 1;
+/// assert(sortByOwner!(int, short)(context));
+/// assert(ecrs.storage.slotOwnersOf(*getStorage!int(context)) == [a, b]);
 /// ---
-template makeMonotonic(Ts...) if (Ts.length != 1 || !is(typeof(Ts[0]) : size_t)) {
-	bool makeMonotonic(ref Context self) {
+template sortByOwner(Ts...) if (Ts.length != 1 || !is(typeof(Ts[0]) : size_t)) {
+	bool sortByOwner(ref Context self) {
 		assert(structureFree(self), structuralChange);
 		assert(!self.transaction, notInTransaction);
 		bool sorted = true;
 		static foreach (T; Ts) {{
 			auto storage = .getStorage!T(self);
-			sorted &= storage !is null && ecrs.storage.sortMonotonic!T(*storage, self.indexTable);
+			sorted &= storage !is null && ecrs.storage.sortByOwner!T(*storage, self.indexTable);
 		}}
 		return sorted;
 	}
@@ -1214,52 +1329,52 @@ template makeMonotonic(Ts...) if (Ts.length != 1 || !is(typeof(Ts[0]) : size_t))
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// assert(makeMonotonic!(int, 1)(ctx));
+/// Context context = create();
+/// scope(exit) free(context);
+/// assert(sortByOwner!(int, 1)(context));
 /// ---
-template makeMonotonic(T, size_t unique = 0) {
-	bool makeMonotonic(ref Context self) {
+template sortByOwner(T, size_t unique = 0) {
+	bool sortByOwner(ref Context self) {
 		assert(structureFree(self), structuralChange);
 		assert(!self.transaction, notInTransaction);
 		auto storage = .getStorage!(T, unique)(self);
-		return storage !is null && ecrs.storage.sortMonotonic!(T, unique)(*storage, self.indexTable);
+		return storage !is null && ecrs.storage.sortByOwner!(T, unique)(*storage, self.indexTable);
 	}
 }
 
-/// Ditto, for component `componentId`; one no entity ever had has nothing to sort. `elementSize`, unless `Storage.invalid`, is checked against the storage's.
+/// Ditto, for component `componentId`; one no entity ever had has nothing to sort. `elementSize`, unless `Storage.unknownSize`, is checked against the storage's.
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// assert(makeMonotonic(ctx, ecrs.registry.componentId!int()));
+/// Context context = create();
+/// scope(exit) free(context);
+/// assert(sortByOwner(context, ecrs.registry.componentId!int()));
 /// ---
-bool makeMonotonic(ref Context self, size_t componentId, size_t elementSize = ecrs.storage.Storage.invalid) @trusted {
+bool sortByOwner(ref Context self, size_t componentId, size_t elementSize = ecrs.storage.Storage.unknownSize) @trusted {
 	assert(structureFree(self), structuralChange);
 	assert(!self.transaction, notInTransaction);
 	if (!hasStorage(self, componentId)) return true;
-	assert(elementSize == ecrs.storage.Storage.invalid || elementSize == self.storages[componentId].elementSize);
-	return ecrs.storage.sortMonotonic(self.storages[componentId], componentId, self.indexTable);
+	assert(elementSize == ecrs.storage.Storage.unknownSize || elementSize == self.storages[componentId].elementSize);
+	return ecrs.storage.sortByOwner(self.storages[componentId], componentId, self.indexTable);
 }
 
-/// Sorts every component storage into entity order, as `makeMonotonic` does.
+/// Sorts every component storage into entity order, as `sortByOwner` does.
 ///
 /// Returns false if allocation fails for any storage; each one it could not sort is left as it was.
 ///
 /// Examples:
 /// ---
-/// Context ctx = create();
-/// scope(exit) free(ctx);
-/// assert(makeAllMonotonic(ctx));
+/// Context context = create();
+/// scope(exit) free(context);
+/// assert(sortAllByOwner(context));
 /// ---
-bool makeAllMonotonic(ref Context self) @trusted {
+bool sortAllByOwner(ref Context self) @trusted {
 	assert(structureFree(self), structuralChange);
 	assert(!self.transaction, notInTransaction);
 	bool sorted = true;
 	foreach (id; 0 .. fp.dynarray.length(self.storages))
-		if (self.storages[id].elementSize != ecrs.storage.Storage.invalid)
-			sorted &= ecrs.storage.sortMonotonic(self.storages[id], id, self.indexTable);
+		if (self.storages[id].elementSize != ecrs.storage.Storage.unknownSize)
+			sorted &= ecrs.storage.sortByOwner(self.storages[id], id, self.indexTable);
 	return sorted;
 }
 
@@ -1275,29 +1390,29 @@ version(unittest) {
 	}
 
 	// Every kind of change a transaction journals; false at the first refused one.
-	private bool transactionScript(ref Context ctx, EntityId kept, EntityId doomed) @trusted {
+	private bool transactionScript(ref Context context, EntityId kept, EntityId doomed) @trusted {
 		static import ecrs.relation;
-		alias Many = ecrs.relation.Relation!(ecrs.relation.dynamicExtent);
-		EntityId fresh = addEntity(ctx);
-		if (fresh == invalidEntity || addComponent!Tracked(ctx, fresh) is null) return false;
-		getComponent!Tracked(ctx, fresh).value = 7;
+		alias Many = ecrs.relation.Relation!(ecrs.relation.dynamicArity);
+		EntityId fresh = addEntity(context);
+		if (fresh == invalidEntity || addComponent!Tracked(context, fresh) is null) return false;
+		getForWriting!Tracked(context, fresh).value = 7;
 		Many list;
 		if (!fp.dynarray.pushBack(list.related, fresh)) return false;
-		if (!setComponent!Many(ctx, kept, list)) return false;
-		if (!setComponent!int(ctx, kept, 11) || !setComponent!int(ctx, kept, 12)) return false;
-		if (!removeComponent!Tracked(ctx, kept) || addComponent!Tracked(ctx, kept) is null) return false;
-		getComponent!Tracked(ctx, kept).value = 9;
-		if (!removeEntity(ctx, doomed)) return false;
-		EntityId brief = addEntity(ctx);
-		if (brief == invalidEntity || !setComponent!int(ctx, brief, 3) || !removeEntity(ctx, brief)) return false;
+		if (!setComponent!Many(context, kept, list)) return false;
+		if (!setComponent!int(context, kept, 11) || !setComponent!int(context, kept, 12)) return false;
+		if (!removeComponent!Tracked(context, kept) || addComponent!Tracked(context, kept) is null) return false;
+		getForWriting!Tracked(context, kept).value = 9;
+		if (!removeEntity(context, doomed)) return false;
+		EntityId brief = addEntity(context);
+		if (brief == invalidEntity || !setComponent!int(context, brief, 3) || !removeEntity(context, brief)) return false;
 		// A component cleared in a transaction is journaled owner by owner, so a rollback brings each back.
-		if (!setComponent!short(ctx, kept, 6)) return false;
-		return clearComponent(ctx, componentId!short());
+		if (!setComponent!short(context, kept, 6)) return false;
+		return clearComponent(context, componentId!short());
 	}
 
-	private ubyte* snapshot(ref Context ctx) {
+	private ubyte* snapshot(ref Context context) {
 		static import ecrs.serialization;
-		auto bytes = ecrs.serialization.serialize(ctx);
+		auto bytes = ecrs.serialization.serialize(context);
 		assert(bytes !is null);
 		return bytes;
 	}
@@ -1308,60 +1423,60 @@ version(unittest) {
 unittest {
 	// Transactions: a rollback restores the store exactly, even after any refused allocation, and allocates nothing itself; a commit keeps the changes.
 	static import ecrs.relation;
-	alias Many = ecrs.relation.Relation!(ecrs.relation.dynamicExtent);
+	alias Many = ecrs.relation.Relation!(ecrs.relation.dynamicArity);
 
 	size_t refusals = 0;
 	foreach (commit; [false, true])
 		for (size_t budget = 0;; ++budget) {
 			Tracked.finalized = 0;
-			auto ctx = create();
-			scope(exit) free(ctx);
-			EntityId kept = addEntity(ctx), doomed = addEntity(ctx), freed = addEntity(ctx);
+			auto context = create();
+			scope(exit) free(context);
+			EntityId kept = addEntity(context), doomed = addEntity(context), freed = addEntity(context);
 			// `freed`'s components leave holes, which the transaction's additions reuse and a rollback must give back in order.
-			addComponent!Tracked(ctx, freed).value = 3;
-			assert(setComponent!int(ctx, freed, 5));
-			assert(setComponent!int(ctx, kept, 10) && setComponent!short(ctx, doomed, 4));
+			addComponent!Tracked(context, freed).value = 3;
+			assert(setComponent!int(context, freed, 5));
+			assert(setComponent!int(context, kept, 10) && setComponent!short(context, doomed, 4));
 			Many list;
 			assert(fp.dynarray.pushBack(list.related, doomed));
-			assert(setComponent!Many(ctx, kept, list));
-			addComponent!Tracked(ctx, kept).value = 1;
-			addComponent!Tracked(ctx, doomed).value = 2;
-			assert(removeEntity(ctx, freed));
+			assert(setComponent!Many(context, kept, list));
+			addComponent!Tracked(context, kept).value = 1;
+			addComponent!Tracked(context, doomed).value = 2;
+			assert(removeEntity(context, freed));
 			Tracked.finalized = 0;
-			int* held = &getComponent!int(ctx, kept);
-			auto before = snapshot(ctx);
+			int* held = &getForWriting!int(context, kept);
+			auto before = snapshot(context);
 			scope(exit) fp.dynarray.free(before);
 
-			assert(!inTransaction(ctx));
-			beginTransaction(ctx);
-			assert(inTransaction(ctx));
+			assert(!inTransaction(context));
+			beginTransaction(context);
+			assert(inTransaction(context));
 			ecrs.registry.failAllocationsAfter(budget);
-			immutable done = transactionScript(ctx, kept, doomed);
+			immutable done = transactionScript(context, kept, doomed);
 			if (!done) ++refusals;
 			if (!done || !commit) {
 				// Nothing is left to allocate with: the rollback must manage without.
 				ecrs.registry.failAllocationsAfter(0);
-				rollbackTransaction(ctx);
+				rollbackTransaction(context);
 				ecrs.registry.restoreAllocations();
-				auto after = snapshot(ctx);
+				auto after = snapshot(context);
 				scope(exit) fp.dynarray.free(after);
 				assert(fp.dynarray.slice(after) == fp.dynarray.slice(before));
 				if (done) assert(Tracked.finalized == 2); // fresh's and kept's new Tracked, once each
-				assert(getComponent!Tracked(ctx, kept).value == 1 && getComponent!Tracked(ctx, doomed).value == 2);
-				assert(&getComponent!int(ctx, kept) is held && *held == 10);
-				assert(addEntity(ctx) == freed); // the freelist is back too
+				assert(getComponent!Tracked(context, kept).value == 1 && getComponent!Tracked(context, doomed).value == 2);
+				assert(&getComponent!int(context, kept) is held && *held == 10);
+				assert(addEntity(context) == freed); // the freelist is back too
 				if (done) break;
 				continue;
 			}
 			ecrs.registry.restoreAllocations();
 			assert(Tracked.finalized == 0);
-			commitTransaction(ctx);
-			assert(!inTransaction(ctx) && !hasComponent!short(ctx, kept));
+			commitTransaction(context);
+			assert(!inTransaction(context) && !hasComponent!short(context, kept));
 			assert(Tracked.finalized == 2); // kept's old Tracked and doomed's
-			assert(&getComponent!int(ctx, kept) is held && *held == 12);
-			assert(getComponent!Tracked(ctx, kept).value == 9 && getComponent!Many(ctx, kept).related[0] == 4);
-			assert(!hasComponent!short(ctx, doomed) && ctx.indexTable[doomed] is null);
-			assert(entityCount(ctx) == 3 && fp.dynarray.length(ctx.indexTable) == 6);
+			assert(&getComponent!int(context, kept) is held && *held == 12);
+			assert(getComponent!Tracked(context, kept).value == 9 && getComponent!Many(context, kept).related[0] == 4);
+			assert(!hasComponent!short(context, doomed) && context.indexTable[doomed] is null);
+			assert(entityCount(context) == 3 && fp.dynarray.length(context.indexTable) == 6);
 			break;
 		}
 	assert(refusals >= 20); // every allocation in the script, refused in turn, once per mode
@@ -1369,12 +1484,12 @@ unittest {
 	// Freeing a context with a transaction open keeps its changes and ends every lifetime once.
 	Tracked.finalized = 0;
 	{
-		auto ctx = create();
-		scope(exit) free(ctx);
-		EntityId e = addEntity(ctx);
-		addComponent!Tracked(ctx, e).value = 1;
-		beginTransaction(ctx);
-		assert(removeComponent!Tracked(ctx, e));
+		auto context = create();
+		scope(exit) free(context);
+		EntityId e = addEntity(context);
+		addComponent!Tracked(context, e).value = 1;
+		beginTransaction(context);
+		assert(removeComponent!Tracked(context, e));
 		assert(Tracked.finalized == 0);
 	}
 	assert(Tracked.finalized == 1);
@@ -1382,24 +1497,24 @@ unittest {
 
 unittest {
 	// Entities: creation, the reserved entity 0, freelist reuse and iteration.
-	auto ctx = create();
-	scope(exit) free(ctx);
-	assert(entityCount(ctx) == 1);
+	auto context = create();
+	scope(exit) free(context);
+	assert(entityCount(context) == 1);
 
-	EntityId a = addEntity(ctx);
-	EntityId b = addEntity(ctx);
+	EntityId a = addEntity(context);
+	EntityId b = addEntity(context);
 	size_t count = 0;
-	foreach (e; entities(ctx)) ++count;
+	foreach (e; entities(context)) ++count;
 	assert(count == 3);
 
-	assert(removeEntity(ctx, a));
+	assert(removeEntity(context, a));
 	count = 0;
-	foreach (e; entities(ctx)) {
+	foreach (e; entities(context)) {
 		assert(e != a);
 		++count;
 	}
-	assert(count == 2 && entityCount(ctx) == 2);
-	assert(addEntity(ctx) == a);
+	assert(count == 2 && entityCount(context) == 2);
+	assert(addEntity(context) == a);
 
 	// A context whose creation could not allocate reserves entity 0 on first use.
 	Context empty;
@@ -1415,106 +1530,106 @@ unittest {
 	struct Vec2 { float x = 0, y = 0; }
 	struct Counter { int value; }
 
-	auto ctx = create();
-	scope(exit) free(ctx);
+	auto context = create();
+	scope(exit) free(context);
 
-	EntityId e1 = addEntity(ctx);
-	*addComponent!Vec2(ctx, e1) = Vec2(1, 2);
-	EntityId e2 = addEntity(ctx);
-	*addComponent!Vec2(ctx, e2) = Vec2(3, 4);
-	EntityId e3 = addEntity(ctx);
-	*addComponent!Vec2(ctx, e3) = Vec2(5, 6);
-	assert(entityCount(ctx) == 4);
-	assert(hasComponent!Vec2(ctx, e1));
+	EntityId e1 = addEntity(context);
+	*addComponent!Vec2(context, e1) = Vec2(1, 2);
+	EntityId e2 = addEntity(context);
+	*addComponent!Vec2(context, e2) = Vec2(3, 4);
+	EntityId e3 = addEntity(context);
+	*addComponent!Vec2(context, e3) = Vec2(5, 6);
+	assert(entityCount(context) == 4);
+	assert(hasComponent!Vec2(context, e1));
 
-	assert(removeEntity(ctx, e2));
-	assert(entityCount(ctx) == 3);
+	assert(removeEntity(context, e2));
+	assert(entityCount(context) == 3);
 
 	size_t seen = 0;
 	float xsum = 0;
-	foreach (e; entities(ctx))
-		if (hasComponent!Vec2(ctx, e)) {
-			xsum += getComponent!Vec2(ctx, e).x;
+	foreach (e; entities(context))
+		if (hasComponent!Vec2(context, e)) {
+			xsum += getComponent!Vec2(context, e).x;
 			++seen;
 		}
 	assert(seen == 2);
 	assert(xsum == 1 + 5);
 
-	assert(!hasComponent!Counter(ctx, e1));
-	assert(findComponent!Counter(ctx, e1) is null);
-	assert(findComponent!Counter(ctx, invalidEntity) is null);
-	assert(findComponent!Vec2(ctx, e1) is &getComponent!Vec2(ctx, e1));
-	const(Context)* view = &ctx;
+	assert(!hasComponent!Counter(context, e1));
+	assert(findComponent!Counter(context, e1) is null);
+	assert(findComponent!Counter(context, invalidEntity) is null);
+	assert(findComponent!Vec2(context, e1) is &getComponent!Vec2(context, e1));
+	const(Context)* view = &context;
 	assert(findComponent!Vec2(*view, e3).x == 5);
-	auto c = getOrAddComponent!Counter(ctx, e1);
+	auto c = ensureComponent!Counter(context, e1);
 	c.value = 5;
-	assert(getOrAddComponent!Counter(ctx, e1) is c);
-	assert(getComponent!Counter(ctx, e1).value == 5);
-	assert(removeComponent!Counter(ctx, e1));
-	assert(!hasComponent!Counter(ctx, e1));
-	assert(findComponent!Counter(ctx, e1) is null);
+	assert(ensureComponent!Counter(context, e1) is c);
+	assert(getComponent!Counter(context, e1).value == 5);
+	assert(removeComponent!Counter(context, e1));
+	assert(!hasComponent!Counter(context, e1));
+	assert(findComponent!Counter(context, e1) is null);
 }
 
 unittest {
 	// Components through the runtime-id forms.
 	struct Flag { int v; }
 
-	auto ctx = create();
-	scope(exit) free(ctx);
+	auto context = create();
+	scope(exit) free(context);
 
-	EntityId e = addEntity(ctx);
+	EntityId e = addEntity(context);
 	immutable id = ecrs.registry.componentId!Flag();
 
-	assert(!hasComponent(ctx, e, id));
-	assert(findComponent(ctx, e, id) is null);
-	auto p = getOrAddComponent(ctx, e, id);
+	assert(!hasComponent(context, e, id));
+	assert(findComponent(context, e, id) is null);
+	auto p = ensureComponent(context, e, id);
 	(cast(Flag*) p).v = 42;
-	assert(hasComponent(ctx, e, id));
-	assert(getOrAddComponent(ctx, e, id) is p);
-	assert((cast(Flag*) getComponent(ctx, e, id)).v == 42);
-	assert(findComponent(ctx, e, id, Flag.sizeof) is p);
-	assert(findComponent(*cast(const(Context)*) &ctx, e, id) is p);
+	assert(hasComponent(context, e, id));
+	assert(ensureComponent(context, e, id) is p);
+	assert((cast(Flag*) getComponent(context, e, id)).v == 42);
+	assert(findComponent(context, e, id, Flag.sizeof) is p);
+	assert(findComponent(*cast(const(Context)*) &context, e, id) is p);
 
-	assert(removeComponent(ctx, e, id));
-	assert(!hasComponent(ctx, e, id));
-	auto p3 = addComponent(ctx, e, id, Flag.sizeof);
+	assert(removeComponent(context, e, id));
+	assert(!hasComponent(context, e, id));
+	auto p3 = addComponent(context, e, id, Flag.sizeof);
 	assert((cast(Flag*) p3).v == 0);
 
-	const(Context)* constCtx = &ctx;
+	const(Context)* constCtx = &context;
 	assert(getStorage(*constCtx, id, Flag.sizeof) !is null);
 	assert(getStorage(*constCtx, ecrs.registry.componentId!(Flag, 1)()) is null);
 
 	// clearComponent empties one storage, past a hole, and leaves other components alone; generation advances.
 	struct Other { int v; }
 	immutable other = ecrs.registry.componentId!Other();
-	assert(generation(ctx, other) == 0);
-	assert(clearComponent(ctx, other)); // no storage yet: nothing to clear
+	assert(generation(context, other) == 0);
+	assert(clearComponent(context, other)); // no storage yet: nothing to clear
 	EntityId[4] marked;
 	foreach (ref m; marked) {
-		m = addEntity(ctx);
-		assert(addComponent(ctx, m, id) !is null && addComponent!Other(ctx, m) !is null);
+		m = addEntity(context);
+		assert(addComponent(context, m, id) !is null && addComponent!Other(context, m) !is null);
 	}
-	assert(removeComponent(ctx, marked[1], id));
-	immutable g = generation(ctx, id), whole = generation(ctx);
-	assert(clearComponent(ctx, id));
-	assert(generation(ctx, id) > g && generation(ctx) > whole);
+	assert(removeComponent(context, marked[1], id));
+	immutable g = generation(context, id), whole = generation(context);
+	assert(clearComponent(context, id));
+	assert(generation(context, id) > g && generation(context) > whole);
 	assert(ecrs.storage.empty(*getStorage(*constCtx, id)));
 	foreach (m; marked)
-		assert(!hasComponent(ctx, m, id) && hasComponent!Other(ctx, m));
+		assert(!hasComponent(context, m, id) && hasComponent!Other(context, m));
 
 	// The whole context's generation moves with any one storage's, and holds still under const access.
-	immutable settled = generation(ctx);
+	immutable settled = generation(context);
 	cast(void) getComponent!Other(*constCtx, marked[0]);
-	assert(generation(ctx) == settled);
-	++getComponent!Other(ctx, marked[0]).v;
-	assert(generation(ctx) > settled);
+	assert(generation(context) == settled);
+	++getForWriting!Other(context, marked[0]).v;
+	assert(generation(context) > settled);
 }
 
 unittest {
 	// Every allocation failure leaves the context as it was.
 	struct Payload { int value; }
-	auto ctx = create();
-	scope(exit) free(ctx);
+	auto context = create();
+	scope(exit) free(context);
 
 	Context unreserved;
 	ecrs.registry.failAllocationsAfter(0);
@@ -1522,91 +1637,91 @@ unittest {
 	ecrs.registry.restoreAllocations();
 	assert(entityCount(unreserved) == 0);
 
-	EntityId e = addEntity(ctx);
+	EntityId e = addEntity(context);
 	immutable id = ecrs.registry.componentId!Payload();
 	foreach (n; 0 .. 16) {
 		ecrs.registry.failAllocationsAfter(n);
-		auto p = addComponent!Payload(ctx, e);
+		auto p = addComponent!Payload(context, e);
 		ecrs.registry.restoreAllocations();
 		if (p !is null) break;
-		assert(!hasComponent(ctx, e, id));
+		assert(!hasComponent(context, e, id));
 	}
-	assert(hasComponent(ctx, e, id));
+	assert(hasComponent(context, e, id));
 
-	EntityId other = addEntity(ctx);
+	EntityId other = addEntity(context);
 	ecrs.registry.failAllocationsAfter(0);
-	assert(!removeEntity(ctx, e));
-	assert(!swapEntities(ctx, e, other));
+	assert(!removeEntity(context, e));
+	assert(!swapEntities(context, e, other));
 	ecrs.registry.restoreAllocations();
-	assert(hasComponent(ctx, e, id) && entityCount(ctx) == 3);
+	assert(hasComponent(context, e, id) && entityCount(context) == 3);
 
-	assert(removeEntity(ctx, other));
+	assert(removeEntity(context, other));
 	ecrs.registry.failAllocationsAfter(0);
-	assert(!compact(ctx));
+	assert(!compact(context));
 	ecrs.registry.restoreAllocations();
-	assert(fp.dynarray.length(ctx.freelist) == 1);
-	assert(compact(ctx));
-	assert(fp.dynarray.length(ctx.freelist) == 0);
+	assert(fp.dynarray.length(context.freelist) == 1);
+	assert(compact(context));
+	assert(fp.dynarray.length(context.freelist) == 0);
 
 	// The remap allocates first, so the second allocation failing reaches the permutation itself.
-	assert(fp.dynarray.length(ctx.indexTable) == 2);
+	assert(fp.dynarray.length(context.indexTable) == 2);
 	immutable size_t[2] order = [0, 1];
 	ecrs.registry.failAllocationsAfter(1);
-	assert(!reorderEntities(ctx, order[]));
+	assert(!reorderEntities(context, order[]));
 	ecrs.registry.restoreAllocations();
-	assert(hasComponent(ctx, e, id));
+	assert(hasComponent(context, e, id));
 }
 
 unittest {
-	// Const access, swapEntities, reorderEntities and makeMonotonic.
+	// Const access, swapEntities, reorderEntities and sortByOwner.
 	struct Val { int v; }
 
-	auto ctx = create();
-	scope(exit) free(ctx);
+	auto context = create();
+	scope(exit) free(context);
 
-	EntityId e1 = addEntity(ctx);
-	*addComponent!Val(ctx, e1) = Val(30);
-	EntityId e2 = addEntity(ctx);
-	*addComponent!Val(ctx, e2) = Val(10);
-	EntityId e3 = addEntity(ctx);
-	*addComponent!Val(ctx, e3) = Val(20);
+	EntityId e1 = addEntity(context);
+	*addComponent!Val(context, e1) = Val(30);
+	EntityId e2 = addEntity(context);
+	*addComponent!Val(context, e2) = Val(10);
+	EntityId e3 = addEntity(context);
+	*addComponent!Val(context, e3) = Val(20);
 
-	const(Context)* constCtx = &ctx;
+	const(Context)* constCtx = &context;
 	assert(getComponent!Val(*constCtx, e1).v == 30);
 
-	assert(swapEntities(ctx, e1, e3));
-	assert(getComponent!Val(ctx, e1).v == 20);
-	assert(getComponent!Val(ctx, e3).v == 30);
-	assert(swapEntities(ctx, e1, e3));
+	assert(swapEntities(context, e1, e3));
+	assert(getComponent!Val(context, e1).v == 20);
+	assert(getComponent!Val(context, e3).v == 30);
+	assert(swapEntities(context, e1, e3));
 
 	// With one entity named, the other is the last slot.
-	immutable lastId = cast(EntityId)(fp.dynarray.length(ctx.indexTable) - 1);
+	immutable lastId = cast(EntityId)(fp.dynarray.length(context.indexTable) - 1);
 	assert(lastId == e3);
-	assert(swapEntities(ctx, e1));
-	assert(getComponent!Val(ctx, lastId).v == 30);
-	assert(swapEntities(ctx, e1));
+	assert(swapEntities(context, e1));
+	assert(getComponent!Val(context, lastId).v == 30);
+	assert(swapEntities(context, e1));
 
 	immutable size_t[4] order = [0, 3, 2, 1];
-	assert(reorderEntities(ctx, order[]));
-	assert(getComponent!Val(ctx, 1).v == 20);
-	assert(getComponent!Val(ctx, 2).v == 10);
-	assert(getComponent!Val(ctx, 3).v == 30);
+	assert(reorderEntities(context, order[]));
+	assert(getComponent!Val(context, 1).v == 20);
+	assert(getComponent!Val(context, 2).v == 10);
+	assert(getComponent!Val(context, 3).v == 30);
 
 	// A 3-cycle pins down that `order[i]` is the entity ending up at i, not where i goes.
 	immutable size_t[4] cycle = [0, 3, 1, 2];
-	assert(reorderEntities(ctx, cycle[]));
-	assert(getComponent!Val(ctx, 1).v == 30);
-	assert(getComponent!Val(ctx, 2).v == 20);
-	assert(getComponent!Val(ctx, 3).v == 10);
+	assert(reorderEntities(context, cycle[]));
+	assert(getComponent!Val(context, 1).v == 30);
+	assert(getComponent!Val(context, 2).v == 20);
+	assert(getComponent!Val(context, 3).v == 10);
 
 	assert(ecrs.storage.liveCount(*getStorage(*constCtx, ecrs.registry.componentId!Val(), Val.sizeof)) == 3);
 
 	struct NeverAdded { int v; }
-	assert(makeMonotonic(ctx, ecrs.registry.componentId!NeverAdded()));
-	assert(makeMonotonic(ctx, ecrs.registry.componentId!Val()));
-	assert(makeAllMonotonic(ctx));
-	auto storage = getStorage!Val(ctx);
-	assert(ecrs.storage.owners(*storage) == [1, 2, 3]);
+	assert(sortByOwner(context, ecrs.registry.componentId!NeverAdded()));
+	assert(sortByOwner(context, ecrs.registry.componentId!Val()));
+	assert(sortAllByOwner(context));
+	auto storage = getStorage!Val(context);
+	assert(ecrs.storage.slotOwnersOf(*storage) == [1, 2, 3]);
 }
 
 unittest {
@@ -1621,19 +1736,19 @@ unittest {
 	}
 	Owned.finalized = 0;
 	{
-		auto ctx = create();
-		scope(exit) free(ctx);
+		auto context = create();
+		scope(exit) free(context);
 
-		EntityId e1 = addEntity(ctx);
-		EntityId e2 = addEntity(ctx);
-		EntityId e3 = addEntity(ctx);
-		addComponent!Owned(ctx, e1).value = 1;
-		addComponent!Owned(ctx, e2).value = 1;
-		addComponent!Owned(ctx, e3).value = 1;
+		EntityId e1 = addEntity(context);
+		EntityId e2 = addEntity(context);
+		EntityId e3 = addEntity(context);
+		addComponent!Owned(context, e1).value = 1;
+		addComponent!Owned(context, e2).value = 1;
+		addComponent!Owned(context, e3).value = 1;
 
-		assert(removeComponent!Owned(ctx, e1));
+		assert(removeComponent!Owned(context, e1));
 		assert(Owned.finalized == 1);
-		assert(removeEntity(ctx, e2));
+		assert(removeEntity(context, e2));
 		assert(Owned.finalized == 2);
 	}
 	assert(Owned.finalized == 3);
@@ -1643,7 +1758,7 @@ unittest {
 	// A renumbering reaches every holder without the caller naming any, past a freed entity in the table.
 	static import ecrs.relation;
 	alias Next = ecrs.relation.Relation!1;
-	alias Many = ecrs.relation.Relation!(ecrs.relation.dynamicExtent);
+	alias Many = ecrs.relation.Relation!(ecrs.relation.dynamicArity);
 	alias Typed = ecrs.relation.Relation!(1, true);
 
 	static struct Memo {
@@ -1654,42 +1769,42 @@ unittest {
 		}
 	}
 
-	auto ctx = create();
-	scope(exit) free(ctx);
+	auto context = create();
+	scope(exit) free(context);
 
-	EntityId e1 = addEntity(ctx);
-	EntityId e2 = addEntity(ctx);
-	EntityId e3 = addEntity(ctx);
-	EntityId gone = addEntity(ctx);
-	assert(removeEntity(ctx, gone));
+	EntityId e1 = addEntity(context);
+	EntityId e2 = addEntity(context);
+	EntityId e3 = addEntity(context);
+	EntityId gone = addEntity(context);
+	assert(removeEntity(context, gone));
 
-	addComponent!Next(ctx, e1).related[0] = e2;
-	addComponent!Next(ctx, e2).related[0] = e3;
-	addComponent!Next(ctx, e3).related[0] = invalidEntity;
-	assert(fp.dynarray.pushBack(addComponent!Many(ctx, e1).related, e3));
-	addComponent!Typed(ctx, e2).related[0] = ecrs.relation.Term(e1);
+	addComponent!Next(context, e1).related[0] = e2;
+	addComponent!Next(context, e2).related[0] = e3;
+	addComponent!Next(context, e3).related[0] = invalidEntity;
+	assert(fp.dynarray.pushBack(addComponent!Many(context, e1).related, e3));
+	addComponent!Typed(context, e2).related[0] = ecrs.relation.Term(e1);
 
 	Memo memo = Memo(e3);
-	assert(addRemapHook(ctx, &Memo.remap, &memo));
+	assert(addRemapHook(context, &Memo.remap, &memo));
 
 	// 1 -> 3, 2 -> 1, 3 -> 2; the freed 4 stays where it is.
 	immutable size_t[5] order = [0, 2, 3, 1, 4];
-	assert(reorderEntities(ctx, order[]));
+	assert(reorderEntities(context, order[]));
 
-	assert(getComponent!Next(ctx, 3).related[0] == 1);
-	assert(getComponent!Next(ctx, 1).related[0] == 2);
-	assert(getComponent!Next(ctx, 2).related[0] == invalidEntity);
-	assert(getComponent!Many(ctx, 3).related[0] == 2);
-	assert(getComponent!Typed(ctx, 1).related[0].constant == 3);
-	assert(ecrs.storage.owner(*getStorage!Next(ctx), ctx.indexTable[3][ecrs.registry.componentId!Next()]) == 3);
+	assert(getComponent!Next(context, 3).related[0] == 1);
+	assert(getComponent!Next(context, 1).related[0] == 2);
+	assert(getComponent!Next(context, 2).related[0] == invalidEntity);
+	assert(getComponent!Many(context, 3).related[0] == 2);
+	assert(getComponent!Typed(context, 1).related[0].constant == 3);
+	assert(ecrs.storage.owner(*getStorage!Next(context), context.indexTable[3][ecrs.registry.componentId!Next()]) == 3);
 	assert(memo.cached == 2);
-	assert(ctx.freelist[0] == 4);
+	assert(context.freelist[0] == 4);
 
-	assert(removeRemapHook(ctx, &Memo.remap, &memo));
-	assert(!removeRemapHook(ctx, &Memo.remap, &memo));
-	assert(swapEntities(ctx, 1, 2));
+	assert(removeRemapHook(context, &Memo.remap, &memo));
+	assert(!removeRemapHook(context, &Memo.remap, &memo));
+	assert(swapEntities(context, 1, 2));
 	assert(memo.cached == 2);
-	assert(getComponent!Next(ctx, 3).related[0] == 2);
+	assert(getComponent!Next(context, 3).related[0] == 2);
 }
 
 unittest {
@@ -1698,31 +1813,31 @@ unittest {
 	alias Next = ecrs.relation.Relation!1;
 	struct Val { int v; }
 
-	auto ctx = create();
-	scope(exit) free(ctx);
+	auto context = create();
+	scope(exit) free(context);
 
 	foreach (i; 1 .. 6) {
-		EntityId e = addEntity(ctx);
-		*addComponent!Val(ctx, e) = Val(i * 10);
+		EntityId e = addEntity(context);
+		*addComponent!Val(context, e) = Val(i * 10);
 	}
-	addComponent!Next(ctx, 5).related[0] = 3;
-	addComponent!Next(ctx, 1).related[0] = 4;
-	assert(removeEntity(ctx, 2));
-	assert(removeEntity(ctx, 4));
+	addComponent!Next(context, 5).related[0] = 3;
+	addComponent!Next(context, 1).related[0] = 4;
+	assert(removeEntity(context, 2));
+	assert(removeEntity(context, 4));
 
-	assert(compact(ctx));
-	assert(fp.dynarray.length(ctx.indexTable) == 4);
-	assert(fp.dynarray.length(ctx.freelist) == 0);
-	assert(entityCount(ctx) == 4);
-	assert(getComponent!Val(ctx, 1).v == 10);
-	assert(getComponent!Val(ctx, 2).v == 30);
-	assert(getComponent!Val(ctx, 3).v == 50);
-	assert(getComponent!Next(ctx, 3).related[0] == 2);
-	assert(getComponent!Next(ctx, 1).related[0] == invalidEntity);
-	assert(addEntity(ctx) == 4);
+	assert(compact(context));
+	assert(fp.dynarray.length(context.indexTable) == 4);
+	assert(fp.dynarray.length(context.freelist) == 0);
+	assert(entityCount(context) == 4);
+	assert(getComponent!Val(context, 1).v == 10);
+	assert(getComponent!Val(context, 2).v == 30);
+	assert(getComponent!Val(context, 3).v == 50);
+	assert(getComponent!Next(context, 3).related[0] == 2);
+	assert(getComponent!Next(context, 1).related[0] == invalidEntity);
+	assert(addEntity(context) == 4);
 
-	assert(compact(ctx)); // nothing freed: a no-op
-	assert(fp.dynarray.length(ctx.indexTable) == 5);
+	assert(compact(context)); // nothing freed: a no-op
+	assert(fp.dynarray.length(context.indexTable) == 5);
 }
 
 unittest {
@@ -1731,86 +1846,116 @@ unittest {
 	struct LateA { int x; }
 	struct LateB { long y; }
 
-	auto ctx = create();
-	scope(exit) free(ctx);
+	auto context = create();
+	scope(exit) free(context);
 
-	EntityId first = addEntity(ctx);
-	Payload* held = addComponent!Payload(ctx, first);
+	EntityId first = addEntity(context);
+	Payload* held = addComponent!Payload(context, first);
 	held.value = 7;
 
 	foreach (i; 0 .. 3000) {
-		EntityId e = addEntity(ctx);
-		addComponent!Payload(ctx, e).value = i;
-		if (i == 1000) assert(addComponent!LateA(ctx, e) !is null);
-		if (i == 2000) assert(addComponent!LateB(ctx, e) !is null);
-		if (i % 3 == 0) removeComponent!Payload(ctx, e);
+		EntityId e = addEntity(context);
+		addComponent!Payload(context, e).value = i;
+		if (i == 1000) assert(addComponent!LateA(context, e) !is null);
+		if (i == 2000) assert(addComponent!LateB(context, e) !is null);
+		if (i % 3 == 0) removeComponent!Payload(context, e);
 	}
-	assert(&getComponent!Payload(ctx, first) is held);
+	assert(&getComponent!Payload(context, first) is held);
 	assert(held.value == 7);
 }
 
 unittest {
 	// Concurrent writes: threads change components of their own entities inside a transaction, which a rollback undoes exactly and a commit keeps.
 	static import bc.threadpool;
-	static struct Job { Context* ctx; EntityId first; size_t count; bool ok; }
+	static struct Job { Context* context; EntityId first; size_t count; bool ok; }
 	static void write(void* arg) @nogc nothrow {
 		auto job = cast(Job*) arg;
 		job.ok = true;
 		foreach (i; 0 .. job.count) {
 			immutable e = cast(EntityId) (job.first + i);
-			job.ok &= setComponent!int(*job.ctx, e, cast(int) e) && setComponent!short(*job.ctx, e, 7) && setComponent!int(*job.ctx, e, cast(int) e * 2);
-			if (e % 3 == 0) job.ok &= removeComponent!short(*job.ctx, e);
+			job.ok &= setComponent!int(*job.context, e, cast(int) e) && setComponent!short(*job.context, e, 7) && setComponent!int(*job.context, e, cast(int) e * 2);
+			if (e % 3 == 0) job.ok &= removeComponent!short(*job.context, e);
 		}
 	}
 	auto pool = bc.threadpool.create(4);
 	assert(pool !is null);
 	scope(exit) bc.threadpool.free(pool);
 	foreach (commit; [false, true]) {
-		auto ctx = create();
-		scope(exit) free(ctx);
-		EntityId kept = addEntity(ctx);
-		assert(setComponent!int(ctx, kept, 1));
-		auto before = snapshot(ctx);
+		auto context = create();
+		scope(exit) free(context);
+		EntityId kept = addEntity(context);
+		assert(setComponent!int(context, kept, 1));
+		auto before = snapshot(context);
 		scope(exit) fp.dynarray.free(before);
-		beginTransaction(ctx);
-		immutable first = addEntities(ctx, 400);
+		beginTransaction(context);
+		immutable first = addEntities(context, 400);
 		assert(first != invalidEntity);
 		Job[8] jobs;
 		bc.threadpool.Job[8] work;
 		foreach (i, ref job; jobs) {
-			job = Job(&ctx, cast(EntityId) (first + i * 50), 50);
+			job = Job(&context, cast(EntityId) (first + i * 50), 50);
 			work[i] = bc.threadpool.Job(&write, &job);
 		}
-		assert(prepareConcurrentAdds!int(ctx, 400) && prepareConcurrentAdds!short(ctx, 400));
-		beginConcurrentWrites(ctx);
+		assert(reserveConcurrentAdds!int(context, 400) && reserveConcurrentAdds!short(context, 400));
+		beginConcurrentWrites(context);
 		assert(bc.threadpool.run(pool, work[]));
-		endConcurrentWrites(ctx);
+		endConcurrentWrites(context);
 		foreach (ref job; jobs) assert(job.ok);
 		if (!commit) {
-			rollbackTransaction(ctx);
-			auto after = snapshot(ctx);
+			rollbackTransaction(context);
+			auto after = snapshot(context);
 			scope(exit) fp.dynarray.free(after);
 			assert(fp.dynarray.slice(after) == fp.dynarray.slice(before));
 			continue;
 		}
-		commitTransaction(ctx);
+		commitTransaction(context);
 		foreach (i; 0 .. 400) {
 			immutable e = cast(EntityId) (first + i);
-			assert(getComponent!int(ctx, e) == e * 2 && hasComponent!short(ctx, e) == (e % 3 != 0));
+			assert(getComponent!int(context, e) == e * 2 && hasComponent!short(context, e) == (e % 3 != 0));
 		}
 
 		// A storage only written in place, never prepared, still counts the phase as a change; one only read does not.
-		immutable written = generation(ctx, ecrs.registry.componentId!int()), read = generation(ctx, ecrs.registry.componentId!short());
-		beginConcurrentWrites(ctx);
-		getComponent!int(ctx, first) = 9;
-		cast(void) getComponent!short(cast(const) ctx, first % 3 ? first : cast(EntityId) (first + 1));
-		endConcurrentWrites(ctx);
-		assert(generation(ctx, ecrs.registry.componentId!int()) > written && generation(ctx, ecrs.registry.componentId!short()) == read);
+		immutable written = generation(context, ecrs.registry.componentId!int()), read = generation(context, ecrs.registry.componentId!short());
+		beginConcurrentWrites(context);
+		getForWriting!int(context, first) = 9;
+		cast(void) getComponent!short(cast(const) context, first % 3 ? first : cast(EntityId) (first + 1));
+		endConcurrentWrites(context);
+		assert(generation(context, ecrs.registry.componentId!int()) > written && generation(context, ecrs.registry.componentId!short()) == read);
 
 		// Slots prepared and never claimed are given back when the phase ends.
-		assert(prepareConcurrentAdds!long(ctx, 5));
-		beginConcurrentWrites(ctx);
-		endConcurrentWrites(ctx);
-		assert(ecrs.storage.size(ctx.storages[ecrs.registry.componentId!long()]) == 0);
+		assert(reserveConcurrentAdds!long(context, 5));
+		beginConcurrentWrites(context);
+		endConcurrentWrites(context);
+		assert(ecrs.storage.slotCount(context.storages[ecrs.registry.componentId!long()]) == 0);
 	}
+}
+
+unittest { // reads count no change; writes through getForWriting, findForWriting, ensureComponent and setComponent each do
+	Context context = create();
+	scope(exit) free(context);
+	immutable e = addEntity(context);
+	*addComponent!int(context, e) = 1;
+	immutable id = ecrs.registry.componentId!int();
+	auto g = generation(context, id);
+	assert(getComponent!int(context, e) == 1 && *findComponent!int(context, e) == 1 && findComponent!short(context, e) is null);
+	assert(generation(context, id) == g);
+	static assert(!__traits(compiles, getComponent!int(context, e) = 2));
+	getForWriting!int(context, e) = 2;
+	assert(generation(context, id) > g);
+	g = generation(context, id);
+	*findForWriting!int(context, e) = 3;
+	assert(generation(context, id) > g);
+	g = generation(context, id);
+	*ensureComponent!int(context, e) = 4;
+	assert(generation(context, id) > g);
+	g = generation(context, id);
+	assert(setComponent!int(context, e, 5) && generation(context, id) > g && getComponent!int(context, e) == 5);
+
+	// A singleton likewise: found for reading it counts nothing, found for writing it counts the write.
+	assert(findSingletonForWriting!long(context) is null && addSingleton!long(context) !is null);
+	immutable singleton = ecrs.registry.componentId!long();
+	g = generation(context, singleton);
+	assert(*findSingleton!long(context) == 0 && generation(context, singleton) == g);
+	*findSingletonForWriting!long(context) = 6;
+	assert(generation(context, singleton) > g && *findSingleton!long(context) == 6);
 }

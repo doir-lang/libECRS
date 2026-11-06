@@ -15,6 +15,9 @@ static import fp.pointer;
 @nogc nothrow:
 
 
+// `restrict` leaves a row or column unrestricted when given this, which is never a node index.
+private enum size_t anyNode = fp.pointer.notFound;
+
 private struct Rng {
 	ulong state;
 	uint next() @nogc nothrow {
@@ -34,13 +37,13 @@ private struct Matrix {
 }
 
 private Matrix matrix(size_t n) @trusted {
-	auto m = Matrix(n, cast(bool*) fp.pointer.allocFunction(null, n * n + 1));
+	auto m = Matrix(n, cast(bool*) fp.pointer.allocator(null, n * n + 1));
 	assert(m.cells !is null);
 	memset(m.cells, 0, n * n + 1);
 	return m;
 }
 
-private void release(ref Matrix m) @trusted { cast(void) fp.pointer.allocFunction(m.cells, 0); m.cells = null; }
+private void release(ref Matrix m) @trusted { cast(void) fp.pointer.allocator(m.cells, 0); m.cells = null; }
 private bool equal(ref Matrix a, ref Matrix b) @trusted { return a.cells[0 .. a.n * a.n] == b.cells[0 .. b.n * b.n]; }
 
 // Every pair joined by a path of one or more edges.
@@ -102,23 +105,23 @@ private Matrix parity(ref Matrix adj, bool even) {
 }
 
 
-private alias Edge = ecrs.relation.Relation!(ecrs.relation.dynamicExtent);
+private alias Edge = ecrs.relation.Relation!(ecrs.relation.dynamicArity);
 private enum edgeUnique = 101, traitUnique = 102;
 private struct Node {}
 
 // One random graph held twice in the store: under `Edge`, which rules read plainly, and under the trait-bearing copy.
 private struct Case {
-	ecrs.context.Context ctx;
+	ecrs.context.Context context;
 	size_t n;
 	ecrs.registry.EntityId[64] nodes;
 	Matrix adj;
-	size_t* indexOf; // entity id -> node index, or size_t.max
+	size_t* indexOf; // entity id -> node index, or fp.pointer.notFound
 }
 
 private void setEdge(ref Case c, size_t i, size_t j, bool present) @trusted {
 	size_t[2] ids = [ecrs.registry.componentId!(Edge, edgeUnique)(), ecrs.registry.componentId!(Edge, traitUnique)()];
 	foreach (id; ids) {
-		auto list = &(cast(Edge*) ecrs.context.getOrAddComponent(c.ctx, c.nodes[i], id)).related;
+		auto list = &(cast(Edge*) ecrs.context.ensureComponent(c.context, c.nodes[i], id)).related;
 		if (present) assert(fp.dynarray.pushBack(*list, c.nodes[j]));
 		else
 			for (size_t k = fp.dynarray.length(*list); k-- > 0;)
@@ -128,23 +131,23 @@ private void setEdge(ref Case c, size_t i, size_t j, bool present) @trusted {
 }
 
 private void rebuildIndex(ref Case c) @trusted {
-	immutable slots = fp.dynarray.length(c.ctx.indexTable);
-	c.indexOf = cast(size_t*) fp.pointer.allocFunction(c.indexOf, slots * size_t.sizeof);
+	immutable slots = fp.dynarray.length(c.context.indexTable);
+	c.indexOf = cast(size_t*) fp.pointer.allocator(c.indexOf, slots * size_t.sizeof);
 	assert(c.indexOf !is null);
-	foreach (k; 0 .. slots) c.indexOf[k] = size_t.max;
+	foreach (k; 0 .. slots) c.indexOf[k] = fp.pointer.notFound;
 	foreach (i; 0 .. c.n) c.indexOf[c.nodes[i]] = i;
 }
 
 private Case makeCase(ref Rng rng) @trusted {
 	Case c;
-	c.ctx = ecrs.context.create();
+	c.context = ecrs.context.create();
 	c.n = 2 + rng.below(38);
 	c.adj = matrix(c.n);
 	// Spare entities around the nodes, so ids and node indices differ.
 	foreach (i; 0 .. c.n) {
-		if (rng.below(4) == 0) assert(ecrs.context.addEntity(c.ctx) != ecrs.registry.invalidEntity);
-		c.nodes[i] = ecrs.context.addEntity(c.ctx);
-		assert(ecrs.context.addComponent!Node(c.ctx, c.nodes[i]) !is null);
+		if (rng.below(4) == 0) assert(ecrs.context.addEntity(c.context) != ecrs.registry.invalidEntity);
+		c.nodes[i] = ecrs.context.addEntity(c.context);
+		assert(ecrs.context.addComponent!Node(c.context, c.nodes[i]) !is null);
 	}
 	immutable edges = rng.below(3 * c.n + 1);
 	foreach (k; 0 .. edges) {
@@ -152,24 +155,24 @@ private Case makeCase(ref Rng rng) @trusted {
 		setEdge(c, i, j, true); // duplicates and self-loops included
 	}
 	// Empty slots are not facts.
-	assert(fp.dynarray.pushBack(ecrs.context.getOrAddComponent!(Edge, edgeUnique)(c.ctx, c.nodes[0]).related, ecrs.registry.invalidEntity));
+	assert(fp.dynarray.pushBack(ecrs.context.ensureComponent!(Edge, edgeUnique)(c.context, c.nodes[0]).related, ecrs.registry.invalidEntity));
 	rebuildIndex(c);
 	return c;
 }
 
 private void release(ref Case c) @trusted {
 	release(c.adj);
-	cast(void) fp.pointer.allocFunction(c.indexOf, 0);
-	ecrs.context.free(c.ctx);
+	cast(void) fp.pointer.allocator(c.indexOf, 0);
+	ecrs.context.free(c.context);
 }
 
 // The answers to `relation(x, y)` as a matrix.
 private Matrix answers(ref ecrs.datalog.Program p, ref Case c, size_t relation, bc.threadpool.ThreadPool* pool, ecrs.registry.EntityId x = ecrs.registry.invalidEntity, ecrs.registry.EntityId y = ecrs.registry.invalidEntity) @trusted {
 	auto m = matrix(c.n);
-	ecrs.datalog.Atom[1] q = [ecrs.datalog.atom(relation, x == ecrs.registry.invalidEntity ? ecrs.datalog.variable(0) : ecrs.datalog.constant(x), y == ecrs.registry.invalidEntity ? ecrs.datalog.variable(1) : ecrs.datalog.constant(y))];
-	immutable status = ecrs.datalog.query(p, c.ctx, q[], (b) {
+	ecrs.datalog.Atom[1] q = [ecrs.datalog.atom(relation, x == ecrs.registry.invalidEntity ? ecrs.datalog.variable(0) : ecrs.relation.Term(x), y == ecrs.registry.invalidEntity ? ecrs.datalog.variable(1) : ecrs.relation.Term(y))];
+	immutable status = ecrs.datalog.query(p, c.context, q[], (b) {
 		immutable from = x == ecrs.registry.invalidEntity ? b[0] : x, to = y == ecrs.registry.invalidEntity ? b[1] : y;
-		assert(c.indexOf[from] != size_t.max && c.indexOf[to] != size_t.max, "answer outside the graph");
+		assert(c.indexOf[from] != fp.pointer.notFound && c.indexOf[to] != fp.pointer.notFound, "answer outside the graph");
 		m[c.indexOf[from], c.indexOf[to]] = true;
 		return true;
 	}, pool);
@@ -181,7 +184,7 @@ private Matrix answers(ref ecrs.datalog.Program p, ref Case c, size_t relation, 
 private Matrix restrict(ref Matrix expected, size_t x, size_t y) {
 	auto m = matrix(expected.n);
 	foreach (i; 0 .. m.n) foreach (j; 0 .. m.n)
-		m[i, j] = expected[i, j] && (x == size_t.max || i == x) && (y == size_t.max || j == y);
+		m[i, j] = expected[i, j] && (x == anyNode || i == x) && (y == anyNode || j == y);
 	return m;
 }
 
@@ -218,7 +221,7 @@ private Relations declare(ref ecrs.datalog.Program p, size_t root) {
 	s[k++] = ecrs.datalog.addRule(p, ecrs.datalog.atom(r.odd, x, y), ecrs.datalog.atom(r.edge, x, y));
 	s[k++] = ecrs.datalog.addRule(p, ecrs.datalog.atom(r.even, x, y), ecrs.datalog.atom(r.odd, x, z), ecrs.datalog.atom(r.edge, z, y));
 	s[k++] = ecrs.datalog.addRule(p, ecrs.datalog.atom(r.odd, x, y), ecrs.datalog.atom(r.even, x, z), ecrs.datalog.atom(r.edge, z, y));
-	s[k++] = ecrs.datalog.addRule(p, ecrs.datalog.atom(r.unreached, x), ecrs.datalog.atom(r.node, x), ecrs.datalog.negate(ecrs.datalog.atom(r.left, ecrs.datalog.constant(cast(ecrs.registry.EntityId) root), x)));
+	s[k++] = ecrs.datalog.addRule(p, ecrs.datalog.atom(r.unreached, x), ecrs.datalog.atom(r.node, x), ecrs.datalog.negate(ecrs.datalog.atom(r.left, ecrs.relation.Term(cast(ecrs.registry.EntityId) root), x)));
 	s[k++] = ecrs.datalog.addRule(p, ecrs.datalog.atom(r.viaTrait, x, y), ecrs.datalog.atom(r.edgeT, x, y));
 	foreach (status; s[0 .. k]) assert(status == ecrs.datalog.Status.ok);
 	return r;
@@ -242,9 +245,9 @@ private void check(ref ecrs.datalog.Program p, ref Case c, ref Relations r, uint
 	void expectAll(size_t relation, Matrix want, const(char)* what) {
 		scope(exit) release(want);
 		immutable i = rng.below(c.n), j = rng.below(c.n);
-		expect(answers(p, c, relation, pool), restrict(want, size_t.max, size_t.max), what);
-		expect(answers(p, c, relation, pool, c.nodes[i]), restrict(want, i, size_t.max), what);
-		expect(answers(p, c, relation, pool, ecrs.registry.invalidEntity, c.nodes[j]), restrict(want, size_t.max, j), what);
+		expect(answers(p, c, relation, pool), restrict(want, anyNode, anyNode), what);
+		expect(answers(p, c, relation, pool, c.nodes[i]), restrict(want, i, anyNode), what);
+		expect(answers(p, c, relation, pool, ecrs.registry.invalidEntity, c.nodes[j]), restrict(want, anyNode, j), what);
 		expect(answers(p, c, relation, pool, c.nodes[i], c.nodes[j]), restrict(want, i, j), what);
 	}
 	expectAll(r.left, copy(), "left-linear closure");
@@ -256,33 +259,33 @@ private void check(ref ecrs.datalog.Program p, ref Case c, ref Relations r, uint
 
 	auto unreached = matrix(c.n);
 	ecrs.datalog.Atom[1] q = [ecrs.datalog.atom(r.unreached, ecrs.datalog.variable(0))];
-	assert(ecrs.datalog.query(p, c.ctx, q[], (b) { unreached[c.indexOf[b[0]], 0] = true; return true; }, pool) == ecrs.datalog.Status.ok);
+	assert(ecrs.datalog.query(p, c.context, q[], (b) { unreached[c.indexOf[b[0]], 0] = true; return true; }, pool) == ecrs.datalog.Status.ok);
 	auto wantUnreached = matrix(c.n);
 	foreach (i; 0 .. c.n) wantUnreached[i, 0] = !closure[0, i];
 	expect(unreached, wantUnreached, "negation");
 
 	auto traited = withTraits(c.adj, traits);
 	scope(exit) release(traited);
-	expect(answers(p, c, r.viaTrait, pool), restrict(traited, size_t.max, size_t.max), "trait closure (derived copy)");
-	expect(answers(p, c, r.edgeT, pool), restrict(traited, size_t.max, size_t.max), "trait closure (unbound)");
+	expect(answers(p, c, r.viaTrait, pool), restrict(traited, anyNode, anyNode), "trait closure (derived copy)");
+	expect(answers(p, c, r.edgeT, pool), restrict(traited, anyNode, anyNode), "trait closure (unbound)");
 	immutable i = rng.below(c.n), j = rng.below(c.n);
-	expect(answers(p, c, r.edgeT, pool, c.nodes[i]), restrict(traited, i, size_t.max), "trait closure (owner bound)");
-	expect(answers(p, c, r.edgeT, pool, ecrs.registry.invalidEntity, c.nodes[j]), restrict(traited, size_t.max, j), "trait closure (target bound)");
+	expect(answers(p, c, r.edgeT, pool, c.nodes[i]), restrict(traited, i, anyNode), "trait closure (owner bound)");
+	expect(answers(p, c, r.edgeT, pool, ecrs.registry.invalidEntity, c.nodes[j]), restrict(traited, anyNode, j), "trait closure (target bound)");
 	expect(answers(p, c, r.edgeT, pool, c.nodes[i], c.nodes[j]), restrict(traited, i, j), "trait closure (both bound)");
 }
 
 // Renumbers every entity but 0 by a random permutation.
 private void shuffle(ref Case c, ref Rng rng) @trusted {
-	immutable slots = fp.dynarray.length(c.ctx.indexTable);
-	auto order = cast(size_t*) fp.pointer.allocFunction(null, slots * size_t.sizeof);
+	immutable slots = fp.dynarray.length(c.context.indexTable);
+	auto order = cast(size_t*) fp.pointer.allocator(null, slots * size_t.sizeof);
 	assert(order !is null);
-	scope(exit) cast(void) fp.pointer.allocFunction(order, 0);
+	scope(exit) cast(void) fp.pointer.allocator(order, 0);
 	foreach (k; 0 .. slots) order[k] = k;
 	foreach_reverse (k; 2 .. slots) {
 		immutable other = 1 + rng.below(k);
 		immutable t = order[k]; order[k] = order[other]; order[other] = t;
 	}
-	assert(ecrs.context.reorderEntities(c.ctx, order[0 .. slots]));
+	assert(ecrs.context.reorderEntities(c.context, order[0 .. slots]));
 	// order[new] = old, so each node's new id is the k with order[k] == it.
 	foreach (i; 0 .. c.n)
 		foreach (k; 0 .. slots)
@@ -305,8 +308,8 @@ unittest {
 		scope(exit) release(c);
 		ecrs.datalog.Program p;
 		scope(exit) ecrs.datalog.free(p);
-		assert(ecrs.datalog.attach(c.ctx, p)); // the negation rule names node 0 as a constant
-		scope(exit) assert(ecrs.datalog.detach(c.ctx, p));
+		assert(ecrs.datalog.attach(c.context, p)); // the negation rule names node 0 as a constant
+		scope(exit) assert(ecrs.datalog.detach(c.context, p));
 		auto r = declare(p, c.nodes[0]);
 
 		immutable traits = rng.below(8);

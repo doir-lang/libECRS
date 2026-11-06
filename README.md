@@ -8,8 +8,8 @@ An entity-component-relation-system library for `-betterC` D. Entities are ids, 
 
 - `ecrs.registry`: gives every component type a stable numeric id, with name, size and hook tables for callers that only have an id or a name.
 - `ecrs.storage`: per-type component storage, whose components never move while they exist.
-- `ecrs.context`: the entity and component database, `Context`, with transactions that journal changes so a rollback restores it without allocating.
-- `ecrs.relation`: fixed- or dynamic-arity relation components, `Relation!n`, and the `Relates` mixin that makes a struct of your own one.
+- `ecrs.context`: the entity and component database, `Context`, with transactions that journal changes so a rollback restores it without allocating. Reads (`getComponent`, `findComponent`) give `const` access and count no change; writes go through `getForWriting`, `findForWriting`, `ensureComponent` or `setComponent`, which count one, so `untilStable` and `whenChanged` see only real changes. `findSingleton` and `addSingleton` keep a component once per store.
+- `ecrs.relation`: fixed- or dynamic-arity relation components, `Relation!n`, the `Relates` mixin that makes a struct of your own one, and `RelatesEach`, a list of elements holding ids through `Relates` fields, renumbered by `remapHeldIds`.
 - `ecrs.schedules`: schedules over a `Context`, or a type owning one alongside state of its own, and the combinators that build them: systems that run a function per entity or per element of a slice, and schedules of schedules, run in sequence or concurrently on a `bc.threadpool`, repeated until the store settles, or rerun only when what they watch changes.
 - `ecrs.datalog`: stratified, semi-naive Datalog whose relations are components, evaluated directly or as a schedule.
 - `ecrs.serialization`: saves a `Context` by copying out its components, or through encoding hooks for those holding pointers such as dynamic relations, and loads it back with every entity id intact.
@@ -29,7 +29,7 @@ dub build --config=datalog-bench --compiler=ldc2 --build=release
 ./bin/datalog-bench 1                                      # Datalog throughput; arguments are a size scale and an optional filter
 ```
 
-`-betterC` has no unittest runner, so `tests/runner.d` walks each module's tests itself; a new module has to be added to its list.
+`-betterC` has no unittest runner, so `tests/runner.d` hands its module list to libfp's `fp.testing.runTests`; a new module has to be added to the list.
 
 ## WebAssembly
 
@@ -45,6 +45,7 @@ The script, and the page and worker scripts in `tests/wasi`, follow bc-threads' 
 
 ```sh
 python3 tools/doctest.py   # compile and run every DDoc example, and report undocumented public definitions
+python3 tools/lint.py      # check the layering, naming and wrapper rules of AGENTS.md
 python3 tools/coverage.py  # per-module unittest coverage; -v lists uncovered lines
 ```
 
