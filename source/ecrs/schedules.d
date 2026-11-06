@@ -971,14 +971,16 @@ unittest {
 	assert(valueOf!A(ctx, e) == 16);
 
 	// A schedule taking the owner receives it however deeply nested, beside ones taking a `Context`, as do the systems among them.
-	static struct Game { ecrs.context.Context ctx; int ticks; }
-	static bool tick(ref Game game) @nogc nothrow { ++game.ticks; return true; }
-	static bool tickPer(ref Game game, ecrs.registry.EntityId) @nogc nothrow { ++game.ticks; return true; }
+	// Atomic, since `parallel(game, pool, &tick, &tick)` ticks from two threads at once.
+	import core.atomic : atomicLoad, atomicOp;
+	static struct Game { ecrs.context.Context ctx; shared int ticks; }
+	static bool tick(ref Game game) @nogc nothrow { game.ticks.atomicOp!"+="(1); return true; }
+	static bool tickPer(ref Game game, ecrs.registry.EntityId) @nogc nothrow { game.ticks.atomicOp!"+="(1); return true; }
 	auto game = Game(ctx);
 	assert(sequential(game, &tick, sequential(&tick, sequential!tickPer(), sequential!(bump!A)()), parallel(pool, &tick)));
-	assert(game.ticks == 3 + ecrs.context.entityCount(ctx) && valueOf!A(ctx, e) == 17);
+	assert(game.ticks.atomicLoad() == 3 + ecrs.context.entityCount(ctx) && valueOf!A(ctx, e) == 17);
 	assert(parallel(game, pool, &tick, &tick) && sequential(&tick, twice)(game));
-	assert(game.ticks == 6 + ecrs.context.entityCount(ctx) && valueOf!A(ctx, e) == 19);
+	assert(game.ticks.atomicLoad() == 6 + ecrs.context.entityCount(ctx) && valueOf!A(ctx, e) == 19);
 }
 
 unittest {

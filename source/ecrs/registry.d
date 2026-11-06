@@ -1,13 +1,13 @@
 /// The runtime component-type registry: gives every component type a stable numeric id, and keeps name, size and hook tables for callers that only have an id or a name, such as scripting or serialization.
 ///
-/// Thread-safe: lookups share a reader-writer spinlock that registration takes exclusively, and `componentId` publishes its cached id with release/acquire ordering, so racing first uses of a type agree on one id. `free` is the exception.
+/// Thread-safe: the tables sit in a `bc.monitor` whose reader-writer spinlock lookups share and registration takes exclusively, and `componentId` publishes its cached id with release/acquire ordering, so racing first uses of a type agree on one id. `free` is the exception.
 ///
 /// `EntityId` lives here rather than in `ecrs.storage` because the hook signatures need it and storage imports this module; a cycle would trip druntime's module-constructor check in the `-cov` build.
 module ecrs.registry;
 
 import core.atomic : atomicLoad, atomicOp, atomicStore, MemoryOrder;
 
-static import bc.spinlock;
+static import bc.monitor;
 static import core.stdc.string;
 static import fp.dynarray;
 static import fp.hash;
@@ -180,33 +180,36 @@ private void finalizeForwardEntry(inout(ubyte)[] data) @trusted {
 private shared size_t idCounter = 0;
 // Bumped by `free` so every id `componentId` cached is registered afresh; starting at 1 means a fresh cache never matches.
 private shared size_t epoch = 1;
-// A spinlock rather than `bc.mutex`, which `create` allocates and so would itself need a race-free lazy initialization.
-private __gshared bc.spinlock.SpinLock registryLock;
-// fp.hashtable's inserts may reallocate a table, so these globals, never local copies, must be what every insert is handed.
-private __gshared ForwardEntry* forwardMap = null;
-private __gshared ReverseEntry* reverseMap = null;
-private __gshared SizeEntry* sizeMap = null;
-private __gshared Hooks* hooksTable = null; // dynarray indexed by component id
-
-// Lookups treat a table that does not exist yet as empty, so the tables are created on first registration.
-private bool ensureTables() @trusted {
-	if (forwardMap is null) {
-		fp.hashtable.Config config = fp.hashtable.Config(&nameHash, &nameEqual);
-		config.finalizeFunction = &finalizeForwardEntry;
-		forwardMap = fp.hashtable.create!ForwardEntry(config);
-	}
-	if (reverseMap is null)
-		reverseMap = fp.hashtable.create!ReverseEntry(fp.hashtable.Config(&idHash, &idEqual));
-	if (sizeMap is null)
-		sizeMap = fp.hashtable.create!SizeEntry(fp.hashtable.Config(&idHash, &idEqual));
-	return forwardMap !is null && reverseMap !is null && sizeMap !is null;
+// fp.hashtable's inserts may reallocate a table, so these fields, never local copies, must be what every insert is handed.
+private struct Tables {
+	ForwardEntry* forwardMap = null;
+	ReverseEntry* reverseMap = null;
+	SizeEntry* sizeMap = null;
+	Hooks* hooksTable = null; // dynarray indexed by component id
 }
 
-private bool reserveHooks(size_t componentId) @trusted {
-	immutable oldLength = fp.dynarray.length(hooksTable);
+// Behind a spinlock rather than `bc.mutex`, which `create` allocates and so would itself need a race-free lazy initialization.
+private __gshared bc.monitor.Monitor!Tables registry;
+
+// Lookups treat a table that does not exist yet as empty, so the tables are created on first registration.
+private bool ensureTables(ref Tables t) @trusted {
+	if (t.forwardMap is null) {
+		fp.hashtable.Config config = fp.hashtable.Config(&nameHash, &nameEqual);
+		config.finalizeFunction = &finalizeForwardEntry;
+		t.forwardMap = fp.hashtable.create!ForwardEntry(config);
+	}
+	if (t.reverseMap is null)
+		t.reverseMap = fp.hashtable.create!ReverseEntry(fp.hashtable.Config(&idHash, &idEqual));
+	if (t.sizeMap is null)
+		t.sizeMap = fp.hashtable.create!SizeEntry(fp.hashtable.Config(&idHash, &idEqual));
+	return t.forwardMap !is null && t.reverseMap !is null && t.sizeMap !is null;
+}
+
+private bool reserveHooks(ref Tables t, size_t componentId) @trusted {
+	immutable oldLength = fp.dynarray.length(t.hooksTable);
 	if (oldLength > componentId) return true;
-	if (fp.dynarray.growToSize(hooksTable, componentId + 1) is null) return false;
-	foreach (i; oldLength .. componentId + 1) hooksTable[i] = Hooks.init;
+	if (fp.dynarray.growToSize(t.hooksTable, componentId + 1) is null) return false;
+	foreach (i; oldLength .. componentId + 1) t.hooksTable[i] = Hooks.init;
 	return true;
 }
 
@@ -222,28 +225,28 @@ size_t nextId() {
 	return atomicOp!"+="(idCounter, 1) - 1;
 }
 
-private size_t registerTypeLocked(const(char)[] name, size_t componentId, size_t typeSize, Hooks hooks) @trusted {
+private size_t registerTypeLocked(ref Tables t, const(char)[] name, size_t componentId, size_t typeSize, Hooks hooks) @trusted {
 	assert(name.length > 0);
-	if (!ensureTables() || !reserveHooks(componentId)) return fp.pointer.notFound;
+	if (!ensureTables(t) || !reserveHooks(t, componentId)) return fp.pointer.notFound;
 	char* owned = fp.string.makeDynamic(name);
 	if (owned is null) return fp.pointer.notFound;
 
-	assert(fp.hashtable.find(forwardMap, ForwardEntry(owned, 0)) is null, "ecrs: component name registered twice");
-	if (fp.hashtable.insertAssumeUnique(forwardMap, ForwardEntry(owned, componentId)) is null) {
+	assert(fp.hashtable.find(t.forwardMap, ForwardEntry(owned, 0)) is null, "ecrs: component name registered twice");
+	if (fp.hashtable.insertAssumeUnique(t.forwardMap, ForwardEntry(owned, componentId)) is null) {
 		fp.string.free(owned);
 		return fp.pointer.notFound;
 	}
 	// From here on, removing the forward entry frees `owned` too.
-	if (fp.hashtable.insertAssumeUnique(reverseMap, ReverseEntry(componentId, owned)) is null) {
-		fp.hashtable.remove(forwardMap, ForwardEntry(owned, 0));
+	if (fp.hashtable.insertAssumeUnique(t.reverseMap, ReverseEntry(componentId, owned)) is null) {
+		fp.hashtable.remove(t.forwardMap, ForwardEntry(owned, 0));
 		return fp.pointer.notFound;
 	}
-	if (fp.hashtable.insertAssumeUnique(sizeMap, SizeEntry(componentId, typeSize)) is null) {
-		fp.hashtable.remove(reverseMap, ReverseEntry(componentId, null));
-		fp.hashtable.remove(forwardMap, ForwardEntry(owned, 0));
+	if (fp.hashtable.insertAssumeUnique(t.sizeMap, SizeEntry(componentId, typeSize)) is null) {
+		fp.hashtable.remove(t.reverseMap, ReverseEntry(componentId, null));
+		fp.hashtable.remove(t.forwardMap, ForwardEntry(owned, 0));
 		return fp.pointer.notFound;
 	}
-	hooksTable[componentId] = hooks;
+	t.hooksTable[componentId] = hooks;
 	return componentId;
 }
 
@@ -259,9 +262,7 @@ private size_t registerTypeLocked(const(char)[] name, size_t componentId, size_t
 /// assert(lookupSize(id) == 8);
 /// ---
 size_t registerType(const(char)[] name, size_t componentId, size_t typeSize, Hooks hooks = Hooks.init) @trusted {
-	bc.spinlock.writeLock(registryLock);
-	scope(exit) bc.spinlock.writeUnlock(registryLock);
-	return registerTypeLocked(name, componentId, typeSize, hooks);
+	return registerTypeLocked(bc.monitor.write(registry).value, name, componentId, typeSize, hooks);
 }
 
 private template decimal(size_t v) {
@@ -299,11 +300,10 @@ size_t componentId(T, size_t unique = 0)() @trusted {
 	if (atomicLoad!(MemoryOrder.acq)(cachedEpoch) == atomicLoad!(MemoryOrder.acq)(epoch))
 		return atomicLoad!(MemoryOrder.raw)(id);
 
-	bc.spinlock.writeLock(registryLock);
-	scope(exit) bc.spinlock.writeUnlock(registryLock);
+	auto tables = bc.monitor.write(registry);
 	immutable current = atomicLoad!(MemoryOrder.raw)(epoch);
 	if (atomicLoad!(MemoryOrder.raw)(cachedEpoch) != current) {
-		immutable registered = registerTypeLocked(componentName!(T, unique), nextId(), T.sizeof, hooksFor!T());
+		immutable registered = registerTypeLocked(tables.value, componentName!(T, unique), nextId(), T.sizeof, hooksFor!T());
 		if (registered == fp.pointer.notFound) return fp.pointer.notFound;
 		atomicStore!(MemoryOrder.raw)(id, registered);
 		atomicStore!(MemoryOrder.rel)(cachedEpoch, current);
@@ -336,11 +336,10 @@ bool register(Ts...)() {
 /// assert(lookupId("LookupComponentIdMissing") == fp.pointer.notFound);
 /// ---
 size_t lookupId(const(char)* name) @trusted {
-	bc.spinlock.readLock(registryLock);
-	scope(exit) bc.spinlock.readUnlock(registryLock);
-	if (forwardMap is null) return fp.pointer.notFound;
-	auto found = fp.hashtable.find(forwardMap, ForwardEntry(cast(char*) name, probeId));
-	return found is null ? fp.pointer.notFound : found.id;
+	auto tables = bc.monitor.read(registry);
+	if (tables.value.forwardMap is null) return fp.pointer.notFound;
+	immutable at = fp.hashtable.findPosition(tables.value.forwardMap, ForwardEntry(cast(char*) name, probeId));
+	return at == fp.pointer.notFound ? fp.pointer.notFound : tables.value.forwardMap[at].id;
 }
 
 /// The size in bytes registered for `componentId`, or `fp.pointer.notFound` for an unknown id.
@@ -351,11 +350,10 @@ size_t lookupId(const(char)* name) @trusted {
 /// assert(lookupSize(fp.pointer.notFound) == fp.pointer.notFound);
 /// ---
 size_t lookupSize(size_t componentId) @trusted {
-	bc.spinlock.readLock(registryLock);
-	scope(exit) bc.spinlock.readUnlock(registryLock);
-	if (sizeMap is null) return fp.pointer.notFound;
-	auto found = fp.hashtable.find(sizeMap, SizeEntry(componentId, 0));
-	return found is null ? fp.pointer.notFound : found.size;
+	auto tables = bc.monitor.read(registry);
+	if (tables.value.sizeMap is null) return fp.pointer.notFound;
+	immutable at = fp.hashtable.findPosition(tables.value.sizeMap, SizeEntry(componentId, 0));
+	return at == fp.pointer.notFound ? fp.pointer.notFound : tables.value.sizeMap[at].size;
 }
 
 /// The hooks registered for `componentId`, or `Hooks.init`, no hooks, for an unknown id.
@@ -366,9 +364,8 @@ size_t lookupSize(size_t componentId) @trusted {
 /// assert(lookupHooks(fp.pointer.notFound) == Hooks.init);
 /// ---
 Hooks lookupHooks(size_t componentId) @trusted {
-	bc.spinlock.readLock(registryLock);
-	scope(exit) bc.spinlock.readUnlock(registryLock);
-	return componentId < fp.dynarray.length(hooksTable) ? hooksTable[componentId] : Hooks.init;
+	auto tables = bc.monitor.read(registry);
+	return componentId < fp.dynarray.length(tables.value.hooksTable) ? tables.value.hooksTable[componentId] : Hooks.init;
 }
 
 /// The relation shape registered for `componentId`, or `RelationShape.init`, a unary predicate, for an unknown id.
@@ -396,8 +393,8 @@ private shared size_t traitChanges = 0;
 /// setRelationTraits(id, 0);
 /// ---
 void setRelationTraits(size_t componentId, uint traits) @trusted {
-	bc.spinlock.writeLock(registryLock);
-	scope(exit) bc.spinlock.writeUnlock(registryLock);
+	auto tables = bc.monitor.write(registry);
+	auto hooksTable = tables.value.hooksTable;
 	assert(componentId < fp.dynarray.length(hooksTable), "ecrs: traits on an unregistered component");
 	assert(traits == 0 || hooksTable[componentId].shape.columns == 1, "ecrs: traits need a binary relation");
 	hooksTable[componentId].shape.traits = traits;
@@ -423,11 +420,10 @@ size_t traitsEpoch() { return atomicLoad(traitChanges); }
 /// assert(lookupName(fp.pointer.notFound) is null);
 /// ---
 const(char)* lookupName(size_t componentId) @trusted {
-	bc.spinlock.readLock(registryLock);
-	scope(exit) bc.spinlock.readUnlock(registryLock);
-	if (reverseMap is null) return null;
-	auto found = fp.hashtable.find(reverseMap, ReverseEntry(componentId, null));
-	return found is null ? null : found.name;
+	auto tables = bc.monitor.read(registry);
+	if (tables.value.reverseMap is null) return null;
+	immutable at = fp.hashtable.findPosition(tables.value.reverseMap, ReverseEntry(componentId, null));
+	return at == fp.pointer.notFound ? null : tables.value.reverseMap[at].name;
 }
 
 
@@ -441,12 +437,11 @@ const(char)* lookupName(size_t componentId) @trusted {
 /// assert(componentId!dchar() == 0);
 /// ---
 void free() @trusted {
-	bc.spinlock.writeLock(registryLock);
-	scope(exit) bc.spinlock.writeUnlock(registryLock);
-	fp.hashtable.free(forwardMap); // frees the names, which reverseMap only aliases
-	fp.hashtable.free(reverseMap);
-	fp.hashtable.free(sizeMap);
-	fp.dynarray.free(hooksTable);
+	auto tables = bc.monitor.write(registry);
+	fp.hashtable.free(tables.value.forwardMap); // frees the names, which reverseMap only aliases
+	fp.hashtable.free(tables.value.reverseMap);
+	fp.hashtable.free(tables.value.sizeMap);
+	fp.dynarray.free(tables.value.hooksTable);
 	atomicStore(idCounter, 0);
 	atomicOp!"+="(epoch, 1);
 }

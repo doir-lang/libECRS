@@ -9,7 +9,7 @@ module ecrs.datalog;
 
 import core.stdc.string : memcpy;
 
-static import bc.spinlock;
+static import bc.monitor;
 static import bc.threadpool;
 static import ecrs.context;
 static import ecrs.registry;
@@ -154,16 +154,16 @@ struct Program {
 	private Rule* rules = null;
 	private size_t* derived = null;
 	private Stratum* strata = null; // dependencies first; current while `stratified`
-	private Index* indexes = null;
-	private bc.spinlock.SpinLock indexLock; // parallel joins build indexes lazily
+	private bc.monitor.Monitor!(Index*) indexes; // parallel joins build indexes lazily
 	private size_t traitsSeen = 0; // `traitsEpoch` when the strata last forgot their runs
 	private bool stratified = false;
 	private Status status = Status.ok; // what the last evaluate returned
 }
 
 private void dropIndexes(ref Program self) @trusted {
-	foreach (ref index; fp.dynarray.slice(self.indexes)) fp.dynarray.free(index.entries);
-	if (self.indexes !is null) fp.dynarray.clear(self.indexes);
+	auto indexes = bc.monitor.write(self.indexes);
+	foreach (ref index; fp.dynarray.slice(indexes.value)) fp.dynarray.free(index.entries);
+	if (indexes.value !is null) fp.dynarray.clear(indexes.value);
 }
 
 private void dropStrata(ref Program self) @trusted {
@@ -195,7 +195,7 @@ void free(ref Program self) @trusted {
 	dropStrata(self);
 	fp.dynarray.free(self.strata);
 	dropIndexes(self);
-	fp.dynarray.free(self.indexes);
+	fp.dynarray.free(bc.monitor.write(self.indexes).value);
 	self = Program.init;
 }
 
@@ -584,27 +584,26 @@ private void settle(ref IndexEntry* entries) @trusted {
 // Sets `entries` to `relation`'s index on `column`, rebuilt if stale; the store is fixed during a join, so parallel joins share it.
 private bool indexOn(ref Program self, const ref ecrs.context.Context ctx, size_t relation, size_t column, out const(IndexEntry)[] entries) @trusted {
 	immutable generation = ecrs.context.generation(ctx, relation);
-	Index* find() {
-		foreach (ref candidate; fp.dynarray.slice(self.indexes))
+	inout(Index)* find(inout(Index)* indexes) {
+		foreach (ref candidate; fp.dynarray.slice(indexes))
 			if (candidate.relation == relation && candidate.column == column) return &candidate;
 		return null;
 	}
 
-	bc.spinlock.readLock(self.indexLock);
-	if (auto current = find())
-		if (current.generation == generation) {
-			entries = fp.dynarray.slice(current.entries);
-			bc.spinlock.readUnlock(self.indexLock);
-			return true;
-		}
-	bc.spinlock.readUnlock(self.indexLock);
+	{
+		auto indexes = bc.monitor.read(self.indexes);
+		if (auto current = find(indexes.value))
+			if (current.generation == generation) {
+				entries = fp.dynarray.slice(current.entries);
+				return true;
+			}
+	}
 
-	bc.spinlock.writeLock(self.indexLock);
-	scope(exit) bc.spinlock.writeUnlock(self.indexLock);
-	Index* index = find();
+	auto indexes = bc.monitor.write(self.indexes);
+	Index* index = find(indexes.value);
 	if (index is null) {
-		if (!fp.dynarray.pushBack(self.indexes, Index(relation, column, size_t.max, null))) return false;
-		index = fp.dynarray.back(self.indexes);
+		if (!fp.dynarray.pushBack(indexes.value, Index(relation, column, size_t.max, null))) return false;
+		index = fp.dynarray.back(indexes.value);
 	}
 
 	if (index.generation != generation) {
@@ -632,7 +631,8 @@ private bool indexOn(ref Program self, const ref ecrs.context.Context ctx, size_
 private void extendIndexes(ref Program self, const ref ecrs.context.Context ctx, size_t relation, size_t before, const(EntityId)* delta, size_t arity) @trusted {
 	immutable after = ecrs.context.generation(ctx, relation);
 	immutable n = fp.dynarray.length(delta) / arity;
-	foreach (ref index; fp.dynarray.slice(self.indexes)) {
+	auto indexes = bc.monitor.write(self.indexes);
+	foreach (ref index; fp.dynarray.slice(indexes.value)) {
 		if (index.relation != relation || index.generation != before) continue;
 		bool extended = true;
 		foreach (i; 0 .. n) {

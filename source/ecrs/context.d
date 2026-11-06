@@ -6,7 +6,7 @@ module ecrs.context;
 import core.atomic : atomicLoad, atomicOp;
 import core.stdc.string : memcpy, memset;
 
-static import bc.spinlock;
+static import bc.monitor;
 static import ecrs.registry;
 static import ecrs.storage;
 static import fp.dynarray;
@@ -28,13 +28,19 @@ private struct RemapHook {
 
 private enum JournalKind : ubyte { touchedStorage, removedEntity, removedComponent, replacedComponent }
 
-// One undoable step of a transaction; `saved` is the offset of a replaced component's old bytes in `Context.saved`. Additions are not journaled one by one: a storage's first is a `touchedStorage` holding its size in `slot` and its hole count in `saved`, and new entities are those from `Context.firstNew`.
+// One undoable step of a transaction; `saved` is the offset of a replaced component's old bytes in `Journal.saved`. Additions are not journaled one by one: a storage's first is a `touchedStorage` holding its size in `slot` and its hole count in `saved`, and new entities are those from `Context.firstNew`.
 private struct JournalEntry {
 	JournalKind kind;
 	EntityId e;
 	size_t componentId;
 	size_t slot;
 	size_t saved;
+}
+
+// A transaction's undo log; `Context` keeps it in a monitor, the one lock concurrent writers share.
+private struct Journal {
+	JournalEntry* entries = null;
+	ubyte* saved = null; // replaced components' old bytes, each at an offset aligned to `savedAlignment`
 }
 
 /// The entity and component database: one `ecrs.storage.Storage` per component id, and each entity's index list mapping its components to their slots.
@@ -54,9 +60,7 @@ struct Context {
 	private bool transaction = false;
 	private size_t firstNew; // the entity count when the transaction began; it adds entities only past it
 	private bool concurrent = false; // inside `beginConcurrentWrites`
-	private bc.spinlock.SpinLock journalLock; // held while concurrent writes reserve and append journal entries
-	private JournalEntry* journal = null;
-	private ubyte* saved = null; // replaced components' old bytes, each at an offset aligned to `savedAlignment`
+	private bc.monitor.Monitor!Journal journal; // write-held while a change reserves and appends entries
 }
 
 /// Whether an `ecrs.schedules` parallel combinator is running on `self`.
@@ -253,32 +257,32 @@ void beginTransaction(ref Context self) {
 	self.firstNew = fp.dynarray.length(self.indexTable);
 }
 
-private bool reserveJournal(ref Context self, size_t n) @trusted {
-	return reserveMore(self.journal, n);
+private bool reserveJournal(ref Journal journal, size_t n) @trusted {
+	return reserveMore(journal.entries, n);
 }
 
 // Appends an entry; the caller has reserved room for it with `reserveJournal`.
-private void record(ref Context self, JournalEntry entry) @trusted {
-	immutable recorded = fp.dynarray.pushBack(self.journal, entry);
+private void record(ref Journal journal, JournalEntry entry) @trusted {
+	immutable recorded = fp.dynarray.pushBack(journal.entries, entry);
 	assert(recorded);
 }
 
 // Before the open transaction's first `add` to `storage`, whose lock the caller holds in concurrent writes, records where a rollback restores it to. False if the journal cannot grow.
 private bool journalStorage(ref Context self, ref ecrs.storage.Storage storage, size_t componentId) @trusted {
 	if (storage.journaled) return true;
-	if (self.concurrent) bc.spinlock.writeLock(self.journalLock);
-	scope(exit) if (self.concurrent) bc.spinlock.writeUnlock(self.journalLock);
-	if (!reserveJournal(self, 1)) return false;
-	record(self, JournalEntry(JournalKind.touchedStorage, invalidEntity, componentId, ecrs.storage.size(storage), ecrs.storage.holeCount(storage)));
+	auto journal = bc.monitor.write(self.journal);
+	if (!reserveJournal(journal.value, 1)) return false;
+	record(journal.value, JournalEntry(JournalKind.touchedStorage, invalidEntity, componentId, ecrs.storage.size(storage), ecrs.storage.holeCount(storage)));
 	storage.journaled = true;
 	return true;
 }
 
-private void endTransaction(ref Context self) @trusted {
-	foreach (entry; fp.dynarray.slice(self.journal))
+// Empties `journal`, which the caller holds as `self`'s.
+private void endTransaction(ref Context self, ref Journal journal) @trusted {
+	foreach (entry; fp.dynarray.slice(journal.entries))
 		if (entry.kind == JournalKind.touchedStorage) existingStorage(self, entry.componentId).journaled = false;
-	fp.dynarray.clear(self.journal);
-	fp.dynarray.clear(self.saved);
+	fp.dynarray.clear(journal.entries);
+	fp.dynarray.clear(journal.saved);
 	self.transaction = false;
 }
 
@@ -297,7 +301,8 @@ private void endTransaction(ref Context self) @trusted {
 /// ---
 void commitTransaction(ref Context self) @trusted {
 	assert(self.transaction);
-	foreach (entry; fp.dynarray.slice(self.journal)) final switch (entry.kind) {
+	auto journal = bc.monitor.write(self.journal);
+	foreach (entry; fp.dynarray.slice(journal.value.entries)) final switch (entry.kind) {
 		case JournalKind.touchedStorage:
 			break;
 		case JournalKind.removedEntity:
@@ -308,10 +313,10 @@ void commitTransaction(ref Context self) @trusted {
 			ecrs.storage.release(existingStorage(self, entry.componentId), entry.slot);
 			break;
 		case JournalKind.replacedComponent:
-			ecrs.storage.finalizeBytes(existingStorage(self, entry.componentId), self.saved + entry.saved);
+			ecrs.storage.finalizeBytes(existingStorage(self, entry.componentId), journal.value.saved + entry.saved);
 			break;
 	}
-	endTransaction(self);
+	endTransaction(self, journal.value);
 }
 
 /// Closes the open transaction on `self`, undoing its changes in reverse order, so every entity and component is as it was when it began, holes included: each storage it added to goes back to its size and holes then, and the entities it added are cut from the table. Storage generations still advance, and storages and index-list room it grew stay allocated. It cannot fail.
@@ -331,7 +336,8 @@ void commitTransaction(ref Context self) @trusted {
 /// ---
 void rollbackTransaction(ref Context self) @trusted {
 	assert(self.transaction);
-	foreach_reverse (entry; fp.dynarray.slice(self.journal)) final switch (entry.kind) {
+	auto journal = bc.monitor.write(self.journal);
+	foreach_reverse (entry; fp.dynarray.slice(journal.value.entries)) final switch (entry.kind) {
 		case JournalKind.touchedStorage:
 			ecrs.storage.restore(existingStorage(self, entry.componentId), entry.componentId, self.indexTable, entry.slot, entry.saved);
 			break;
@@ -348,13 +354,13 @@ void rollbackTransaction(ref Context self) @trusted {
 			auto storage = &existingStorage(self, entry.componentId);
 			void* p = ecrs.storage.get(*storage, entry.slot);
 			ecrs.storage.finalizeBytes(*storage, p);
-			memcpy(p, self.saved + entry.saved, storage.elementSize);
+			memcpy(p, journal.value.saved + entry.saved, storage.elementSize);
 			break;
 	}
 	// The entities it added are the tail of the table; restoring their storages has taken every component off them.
 	foreach (e; self.firstNew .. fp.dynarray.length(self.indexTable)) fp.dynarray.free(self.indexTable[e]);
 	cast(void) fp.dynarray.popBackCount(self.indexTable, fp.dynarray.length(self.indexTable) - self.firstNew);
-	endTransaction(self);
+	endTransaction(self, journal.value);
 }
 
 
@@ -458,8 +464,11 @@ Context create() {
 /// ---
 void free(ref Context self) @trusted {
 	if (self.transaction) commitTransaction(self);
-	fp.dynarray.free(self.journal);
-	fp.dynarray.free(self.saved);
+	{
+		auto journal = bc.monitor.write(self.journal);
+		fp.dynarray.free(journal.value.entries);
+		fp.dynarray.free(journal.value.saved);
+	}
 	foreach (i; 0 .. fp.dynarray.length(self.storages))
 		if (self.storages[i].elementSize != ecrs.storage.Storage.invalid)
 			ecrs.storage.free(self.storages[i]);
@@ -667,12 +676,13 @@ bool removeEntity(ref Context self, EntityId e) @trusted {
 		size_t count = 0;
 		foreach (componentId; 0 .. fp.dynarray.length(indices))
 			if (indices[componentId] != ecrs.storage.Storage.absent) ++count;
-		if (!reserveJournal(self, count + 1)) return false;
+		auto journal = bc.monitor.write(self.journal);
+		if (!reserveJournal(journal.value, count + 1)) return false;
 		// The index list stays, so a rollback can reattach the components; the commit frees it.
 		foreach (componentId; 0 .. fp.dynarray.length(indices))
 			if (indices[componentId] != ecrs.storage.Storage.absent)
-				record(self, JournalEntry(JournalKind.removedComponent, e, componentId, ecrs.storage.detach(self.storages[componentId], componentId, self.indexTable, e)));
-		record(self, JournalEntry(JournalKind.removedEntity, e));
+				record(journal.value, JournalEntry(JournalKind.removedComponent, e, componentId, ecrs.storage.detach(self.storages[componentId], componentId, self.indexTable, e)));
+		record(journal.value, JournalEntry(JournalKind.removedEntity, e));
 		cast(void) fp.dynarray.pushBack(self.freelist, cast(size_t) e); // reserved above
 		return true;
 	}
@@ -785,10 +795,9 @@ bool removeComponent(ref Context self, EntityId e, size_t componentId) {
 	auto storage = &existingStorage(self, componentId);
 	assert(!self.concurrent || self.transaction, "ecrs: concurrent writes remove components only inside a transaction, which keeps their slots until it ends");
 	if (!self.transaction) return ecrs.storage.remove(*storage, componentId, self.indexTable, e);
-	if (self.concurrent) bc.spinlock.writeLock(self.journalLock);
-	scope(exit) if (self.concurrent) bc.spinlock.writeUnlock(self.journalLock);
-	if (!reserveJournal(self, 1)) return false;
-	record(self, JournalEntry(JournalKind.removedComponent, e, componentId, ecrs.storage.detach(*storage, componentId, self.indexTable, e)));
+	auto journal = bc.monitor.write(self.journal);
+	if (!reserveJournal(journal.value, 1)) return false;
+	record(journal.value, JournalEntry(JournalKind.removedComponent, e, componentId, ecrs.storage.detach(*storage, componentId, self.indexTable, e)));
 	return true;
 }
 
@@ -828,11 +837,12 @@ bool clearComponent(ref Context self, size_t componentId) @trusted {
 	if (!hasStorage(self, componentId)) return true;
 	auto storage = &self.storages[componentId];
 	if (self.transaction) {
-		if (!reserveJournal(self, ecrs.storage.liveCount(*storage))) return false;
+		auto journal = bc.monitor.write(self.journal);
+		if (!reserveJournal(journal.value, ecrs.storage.liveCount(*storage))) return false;
 		foreach (slot; 0 .. ecrs.storage.size(*storage)) {
 			immutable slotOwner = ecrs.storage.owner(*storage, slot);
 			if (slotOwner != invalidEntity)
-				record(self, JournalEntry(JournalKind.removedComponent, slotOwner, componentId, ecrs.storage.detach(*storage, componentId, self.indexTable, slotOwner)));
+				record(journal.value, JournalEntry(JournalKind.removedComponent, slotOwner, componentId, ecrs.storage.detach(*storage, componentId, self.indexTable, slotOwner)));
 		}
 		return true;
 	}
@@ -1000,15 +1010,15 @@ template setComponent(T, size_t unique = 0) {
 			return true;
 		}
 		immutable id = ecrs.registry.componentId!(T, unique)();
-		if (self.concurrent) bc.spinlock.writeLock(self.journalLock);
-		scope(exit) if (self.concurrent) bc.spinlock.writeUnlock(self.journalLock);
-		immutable offset = (fp.dynarray.length(self.saved) + savedAlignment - 1) / savedAlignment * savedAlignment;
-		if (!reserveJournal(self, 1) || !reserveMore(self.saved, offset + T.sizeof - fp.dynarray.length(self.saved)) || fp.dynarray.growToSize(self.saved, offset + T.sizeof) is null) {
+		auto journal = bc.monitor.write(self.journal);
+		auto saved = &journal.value.saved;
+		immutable offset = (fp.dynarray.length(*saved) + savedAlignment - 1) / savedAlignment * savedAlignment;
+		if (!reserveJournal(journal.value, 1) || !reserveMore(*saved, offset + T.sizeof - fp.dynarray.length(*saved)) || fp.dynarray.growToSize(*saved, offset + T.sizeof) is null) {
 			fp.lifecycle.endLifetime(value);
 			return false;
 		}
-		record(self, JournalEntry(JournalKind.replacedComponent, e, id, self.indexTable[e][id], offset));
-		memcpy(self.saved + offset, existing, T.sizeof);
+		record(journal.value, JournalEntry(JournalKind.replacedComponent, e, id, self.indexTable[e][id], offset));
+		memcpy(*saved + offset, existing, T.sizeof);
 		memset(existing, 0, T.sizeof);
 		fp.lifecycle.moveInto(*existing, value);
 		return true;
