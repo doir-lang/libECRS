@@ -6,7 +6,6 @@
 module ecrs.storage;
 
 static import core.atomic;
-static import core.stdc.string;
 
 static import bc.platform;
 static import ecrs.registry;
@@ -329,7 +328,7 @@ void* add(ref Storage self, size_t componentId, ref IndexTable indexTable, Entit
 		self.slotOwners[claimed] = e;
 		indexTable[e][componentId] = cast(uint) claimed;
 		void* q = fp.pagedarray.get(self.elements, claimed);
-		core.stdc.string.memset(q, 0, self.elementSize);
+		fp.pointer.fill((cast(ubyte*) q)[0 .. self.elementSize], 0);
 		return q;
 	}
 
@@ -351,7 +350,7 @@ void* add(ref Storage self, size_t componentId, ref IndexTable indexTable, Entit
 	++self.live;
 
 	void* p = getForWriting(self, slot);
-	core.stdc.string.memset(p, 0, self.elementSize);
+	fp.pointer.fill((cast(ubyte*) p)[0 .. self.elementSize], 0);
 	return p;
 }
 
@@ -544,7 +543,7 @@ package void release(ref Storage self, size_t slot) @trusted {
 	void* p = fp.pagedarray.get(self.elements, slot);
 	finalizeBytes(self, p);
 	// Zeroed even without a finalizer, so a hole never holds a stale value that looks live.
-	core.stdc.string.memset(p, 0, self.elementSize);
+	fp.pointer.fill((cast(ubyte*) p)[0 .. self.elementSize], 0);
 	// A hole missing from the list just waits for the next reorder to reclaim it.
 	cast(void) fp.dynarray.pushBack(self.holes, slot);
 }
@@ -587,7 +586,7 @@ package void restore(ref Storage self, size_t componentId, ref IndexTable indexT
 		if (self.slotOwners[slot] != invalidEntity) cast(void) detach(self, componentId, indexTable, self.slotOwners[slot]);
 		void* p = fp.pagedarray.get(self.elements, slot);
 		finalizeBytes(self, p);
-		core.stdc.string.memset(p, 0, self.elementSize);
+		fp.pointer.fill((cast(ubyte*) p)[0 .. self.elementSize], 0);
 	}
 	if (reusedFrom < oldHoles) cast(void) fp.dynarray.growToSize(self.holes, oldHoles); // within capacity, so it keeps the slot numbers
 	foreach (slot; oldSize .. slotCount(self))

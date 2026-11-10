@@ -6,7 +6,6 @@
 module ecrs.registry;
 
 static import core.atomic;
-static import core.stdc.string;
 
 static import bc.monitor;
 static import fp.dynarray;
@@ -157,7 +156,7 @@ private struct SizeEntry {
 private enum size_t probeId = fp.pointer.notFound;
 
 private const(char)[] nameOf(const(ForwardEntry)* e) @trusted {
-	return e.id == probeId ? e.name[0 .. core.stdc.string.strlen(e.name)] : fp.string.slice(e.name);
+	return e.id == probeId ? fp.string.sliceTerminated(e.name) : fp.string.slice(e.name);
 }
 
 private size_t nameHash(inout(ubyte)[] data) @trusted {

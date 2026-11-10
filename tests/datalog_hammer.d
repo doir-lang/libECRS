@@ -1,8 +1,6 @@
 /// Differential stress test for `ecrs.datalog`: random graphs and every rule shape the engine treats differently, each answer checked against a brute-force reference over adjacency matrices. Each case then mutates the base relation and renumbers the store, and must still agree.
 module datalog_hammer;
 
-import core.stdc.stdio : fprintf, stderr;
-import core.stdc.string : memcpy, memset;
 
 static import bc.threadpool;
 static import ecrs.context;
@@ -10,6 +8,7 @@ static import ecrs.datalog;
 static import ecrs.registry;
 static import ecrs.relation;
 static import fp.dynarray;
+static import fp.io;
 static import fp.pointer;
 
 @nogc nothrow:
@@ -39,7 +38,7 @@ private struct Matrix {
 private Matrix matrix(size_t n) @trusted {
 	auto m = Matrix(n, cast(bool*) fp.pointer.allocator(null, n * n + 1));
 	assert(m.cells !is null);
-	memset(m.cells, 0, n * n + 1);
+	fp.pointer.fill(m.cells[0 .. n * n + 1], false);
 	return m;
 }
 
@@ -232,14 +231,14 @@ private void check(ref ecrs.datalog.Program p, ref Case c, ref Relations r, uint
 	void expect(Matrix got, Matrix want, const(char)* what) {
 		scope(exit) { release(got); release(want); }
 		if (!equal(got, want)) {
-			fprintf(stderr, "hammer: seed %llu, n %zu, traits %u: %s disagrees\n", seed, c.n, traits, what);
+			cast(void) fp.io.print(fp.io.Console.error, "hammer: seed ", seed, ", n ", c.n, ", traits ", traits, ": ", what, " disagrees\n");
 			assert(false);
 		}
 	}
 
 	auto closure = transitive(c.adj);
 	scope(exit) release(closure);
-	Matrix copy() { auto m = matrix(c.n); memcpy(m.cells, closure.cells, c.n * c.n); return m; }
+	Matrix copy() { auto m = matrix(c.n); fp.pointer.copy(m.cells[0 .. c.n * c.n], closure.cells[0 .. c.n * c.n]); return m; }
 
 	// Unbound, then each binding pattern: a bound target reads the derived relation's own index, which evaluation extended round by round.
 	void expectAll(size_t relation, Matrix want, const(char)* what) {

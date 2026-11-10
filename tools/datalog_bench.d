@@ -3,9 +3,6 @@
 /// Build with `dub build --config=datalog-bench --build=release`, to `bin/datalog-bench`. Arguments: a size scale, then an optional substring that selects the "workload pool" lines to run.
 module datalog_bench;
 
-import core.stdc.stdio : printf;
-import core.stdc.stdlib : abort, atoi;
-import core.stdc.string : strstr;
 
 static import bc.thread;
 static import bc.threadpool;
@@ -14,16 +11,23 @@ static import ecrs.datalog;
 static import ecrs.registry;
 static import ecrs.relation;
 static import fp.dynarray;
+static import fp.io;
 static import fp.string;
+static import fp.string.numbers;
 
 @nogc nothrow:
 
 
 // Unlike `assert`, which a release build drops along with the call it checks.
 private void require(bool ok) {
-	if (ok) return;
-	cast(void) printf("datalog-bench: a call failed\n");
-	abort();
+	if (!ok) fp.io.abort("datalog-bench: a call failed\n");
+}
+
+// Prints one row of the table, laid out by a C format pattern.
+private void report(Args...)(const char* pattern, Args args) {
+	char* row = fp.string.format(pattern, args).get(null);
+	scope(exit) fp.string.free(row);
+	require(row !is null && fp.io.print(row));
 }
 
 private double now() @trusted {
@@ -68,14 +72,14 @@ private size_t count(ref ecrs.datalog.Program p, ref ecrs.context.Context contex
 }
 
 private enum repeats = 3;
-private __gshared const(char)* filter = null;
+private __gshared const(char)[] filter = null;
 
 // Runs `body`, which builds a program, evaluates it and returns the fact count, `repeats` times, and prints the best time.
 private void measure(const(char)* name, const(char)* pool, scope size_t delegate() @nogc nothrow body) @trusted {
 	char* label = fp.string.format("%s %s", name, pool).get(null);
 	require(label !is null);
 	scope(exit) fp.string.free(label);
-	if (filter !is null && strstr(label, filter) is null) return;
+	if (filter !is null && !fp.string.contains(label, filter)) return;
 	double best = double.max;
 	size_t facts;
 	foreach (r; 0 .. repeats) {
@@ -84,12 +88,17 @@ private void measure(const(char)* name, const(char)* pool, scope size_t delegate
 		immutable t = now() - start;
 		if (t < best) best = t;
 	}
-	cast(void) printf("%-34s %-8s %10zu facts %9.3f ms %8.2f Mfacts/s\n", name, pool, facts, best * 1e3, facts / best * 1e-6);
+	report("%-34s %-8s %10zu facts %9.3f ms %8.2f Mfacts/s\n", name, pool, facts, best * 1e3, facts / best * 1e-6);
 }
 
 extern (C) int main(int argc, char** argv) @trusted {
-	immutable scale = argc > 1 ? atoi(argv[1]) : 1;
-	filter = argc > 2 ? argv[2] : null;
+	int scale = 1;
+	if (argc > 1) {
+		auto parsed = fp.string.numbers.parseUnsigned(fp.string.sliceTerminated(argv[1]));
+		require(!parsed.isNull && parsed.get.value <= int.max);
+		scale = cast(int) parsed.get.value;
+	}
+	filter = argc > 2 ? fp.string.sliceTerminated(argv[2]) : null;
 	size_t[5] poolSizes = [0, 1, 2, 4, 8];
 	bc.threadpool.ThreadPool*[5] pools;
 	foreach (i, w; poolSizes) {
@@ -100,7 +109,7 @@ extern (C) int main(int argc, char** argv) @trusted {
 	const(char)*[5] poolNames = ["serial", "pool1", "pool2", "pool4", "pool8"];
 	mixin(ecrs.datalog.createVariables!("x", "y", "z", "a", "b"));
 
-	cast(void) printf("%-34s %-8s %16s %12s %17s\n", "workload".ptr, "pool".ptr, "derived".ptr, "best".ptr, "throughput".ptr);
+	report("%-34s %-8s %16s %12s %17s\n", "workload".ptr, "pool".ptr, "derived".ptr, "best".ptr, "throughput".ptr);
 
 	// Chain of n: the closure is n(n-1)/2 facts over n rounds of one new fact per source, the worst case for round count.
 	{
@@ -199,7 +208,7 @@ extern (C) int main(int argc, char** argv) @trusted {
 		}
 
 		// An up-to-date evaluate is a generation check per input.
-		if (filter is null || strstr("up-to-date evaluate serial", filter) !is null) {
+		if (filter is null || fp.string.contains("up-to-date evaluate serial", filter)) {
 			ecrs.datalog.Program p;
 			scope(exit) ecrs.datalog.free(p);
 			immutable reach = ecrs.datalog.derive(p, "bench.dagReach3", 1);
@@ -209,7 +218,7 @@ extern (C) int main(int argc, char** argv) @trusted {
 			enum calls = 1_000_000;
 			immutable start = now();
 			foreach (i; 0 .. calls) require(ecrs.datalog.evaluate(p, g.context) == ecrs.datalog.Status.ok);
-			cast(void) printf("%-34s %-8s %10d calls %9.3f ms %8.1f ns/call\n", "up-to-date evaluate".ptr, "serial".ptr,
+			report("%-34s %-8s %10d calls %9.3f ms %8.1f ns/call\n", "up-to-date evaluate".ptr, "serial".ptr,
 				calls, (now() - start) * 1e3, (now() - start) / calls * 1e9);
 		}
 	}

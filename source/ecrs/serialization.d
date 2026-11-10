@@ -3,13 +3,13 @@
 /// Entity ids round-trip exactly, freed ones included, so a component holding ids, such as an `ecrs.relation.Relation`, needs no remapping. A type that encodes itself, as `ecrs.registry.hasSerialize` detects, such as a dynamic relation, is written through its hooks instead; one that holds pointers, as `ecrs.registry.Hooks.opaque` marks it, but does not encode itself is left out. Components are matched by registered name, so the loading program must register every saved type first. The bytes are native: they load only where endianness and struct layout match.
 module ecrs.serialization;
 
-import core.stdc.string : memcpy, strlen;
 
 static import ecrs.context;
 static import ecrs.registry;
 static import ecrs.storage;
 static import fp.dynarray;
 static import fp.pointer;
+static import fp.string;
 
 public import ecrs.registry : EntityId, invalidEntity;
 
@@ -42,7 +42,7 @@ private bool writeSection(ref ubyte* out_, const ref ecrs.storage.Storage storag
 	immutable encode = ecrs.registry.hooksOf(componentId).serializeFunction;
 	auto name = ecrs.registry.nameOf(componentId);
 	assert(name !is null, "ecrs: serializing a component the registry has forgotten");
-	auto named = name[0 .. strlen(name) + 1];
+	auto named = name[0 .. fp.string.sliceTerminated(name).length + 1];
 	if (!putValue(out_, cast(ulong) named.length) || !put(out_, named)) return false;
 	if (!putValue(out_, cast(ulong) storage.elementSize) || !putValue(out_, cast(ubyte)(encode !is null))) return false;
 	if (!putValue(out_, cast(ulong) ecrs.storage.liveCount(storage))) return false;
@@ -97,7 +97,7 @@ ubyte* serialize(const ref ecrs.context.Context self) @trusted {
 
 private bool take(ref const(ubyte)[] data, void* dest, size_t n) @trusted {
 	if (data.length < n) return false;
-	memcpy(dest, data.ptr, n);
+	fp.pointer.copy((cast(ubyte*) dest)[0 .. n], data[0 .. n]);
 	data = data[n .. $];
 	return true;
 }
@@ -113,7 +113,7 @@ private bool readSection(ref ecrs.context.Context self, ref const(ubyte)[] data)
 	if (!takeValue(data, nameLength) || nameLength == 0 || nameLength > data.length) return false;
 	auto name = cast(const(char)[]) data[0 .. cast(size_t) nameLength];
 	data = data[name.length .. $];
-	if (strlen(name.ptr) + 1 != name.length) return false;
+	if (fp.string.sliceTerminated(name.ptr).length + 1 != name.length) return false;
 
 	immutable id = ecrs.registry.idOf(name.ptr);
 	if (id == fp.pointer.notFound) return false;
@@ -305,7 +305,7 @@ unittest {
 	bool renamed = false;
 	foreach (i; 0 .. data.length - name.length)
 		if (cast(const(char)[]) data[i .. i + name.length] == name) {
-			memcpy(corrupt.ptr, data.ptr, data.length);
+			fp.pointer.copy(corrupt, data);
 			corrupt[i + name.length - 1] = '?';
 			assert(!deserialize(context, corrupt));
 			renamed = true;

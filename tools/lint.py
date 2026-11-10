@@ -7,7 +7,7 @@ When code moves into a lower library, add the pattern it replaced to `PUSHED` in
 Tags:
 - `NAME-Cryptic`: a C-heritage or abbreviated identifier.
 - `WRAP-OneLine`: a function whose whole body forwards to one call or field; mark a wrapper a protocol requires with `// wrapper: <reason>` on the line above its documentation comment.
-- `LAYER-Platform`: an OS API outside the modules allowed to use one, tests aside.
+- `LAYER-Platform`: an OS API or C runtime binding (`core.sys.*`, `core.stdc.*`) outside the modules allowed to use one, tests aside.
 - `LAYER-Pushed`: a pattern a lower library replaced.
 - `E-Remap`: a hand-written `remap[` lookup outside libECRS.
 - `ECRS-Write`: a write through a component pointer from a read accessor; use `getForWriting`, `findForWriting` or `setComponent`.
@@ -68,9 +68,11 @@ PUSHED = [
 	('renamed-replace-hash', r'\bfp\.string\.replace\s*\(|\bhashBytesFast\b', 'fp.string.replace or fp.algorithms.hashBytesFast, since renamed', 'use fp.string.replaceAll or fp.algorithms.hashShortBytes'),
 	('hand-written-line-break', r'==\s+\|\|\s*\(\s*[\w.]+\[[^\]]+\]\s*==\s+&&\s*\(', 'line break (\\n, \\r\\n or lone \\r) tested by hand', 'use fp.string.breaksLine, lineOf, lineStart or lineEnd'),
 	('hand-written-trim', r'while\s*\(\s*([\w.]+)\.length\s*&&\s*\(\s*\1\[\s*(0|\$\s*-\s*1)\s*\]\s*==', 'leading or trailing characters trimmed by hand', 'use fp.string.trim, trimStart or trimEnd'),
+	('renamed-fp-file', r'\bfp\.file\b', 'fp.file, since renamed', 'use fp.io'),
+	('fix-from-hint', r'\bstartsWith\s*\(\s*hint\b', 'quick fix parsed back out of a hint\'s text', 'attach a diagnose.Diagnostic.Fix where the diagnostic is made'),
 ]
 
-PLATFORM = re.compile(r'\bcore\s*\.\s*sys\s*\.')
+PLATFORM = re.compile(r'\bcore\s*\.\s*(?:sys|stdc)\s*\.')
 
 PROTOCOL_HOOKS = {
 	'remapEntities', 'finalize', 'moveTo', 'copyTo', 'opCall', 'compute', 'empty', 'front', 'popFront', 'back', 'popBack', 'save',
@@ -251,7 +253,7 @@ def check_layers(path, code, config):
 		for match in PLATFORM.finditer(code):
 			if inside(tests, match.start()):
 				continue  # a test may provoke the OS directly, as with a signal
-			yield Finding(path, line_of(code, match.start()), 'LAYER-Platform', 'OS API used above the platform libraries', 'reach it through libfp, bc-threads, bc-fetch or mizu.ffi, adding the call there if it is missing')
+			yield Finding(path, line_of(code, match.start()), 'LAYER-Platform', 'OS API or C runtime used above the platform libraries', 'reach it through libfp, bc-threads, bc-fetch or mizu.ffi (as fp.pointer.copy and fill, fp.string.sliceTerminated, fp.string.numbers.parseFloat, fp.io.print and abort), adding the call there if it is missing')
 	for rule, pattern, message, hint in PUSHED:
 		if _exempt(config, rule, path):
 			continue

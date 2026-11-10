@@ -1,10 +1,10 @@
 /// A minimal tour of the public API: component registration, entities and components, and iterating entities.
 module examples.simple;
 
-import core.stdc.stdio : printf;
 static import ecrs.context;
 static import ecrs.registry;
 static import ecrs.storage;
+static import fp.io;
 
 struct Vec2 { float x, y; }
 
@@ -12,8 +12,8 @@ extern(C) int main() {
 	if (!ecrs.registry.register!(Vec2, int, float)()) return 1;
 	scope(exit) ecrs.registry.free();
 
-	cast(void) printf("int component id: %zu\n", ecrs.registry.idOf("int"));
-	cast(void) printf("int component size: %zu\n", ecrs.registry.elementSizeOf(ecrs.registry.componentId!int()));
+	cast(void) fp.io.print("int component id: ", ecrs.registry.idOf("int"), '\n');
+	cast(void) fp.io.print("int component size: ", ecrs.registry.elementSizeOf(ecrs.registry.componentId!int()), '\n');
 
 	auto context = ecrs.context.create();
 	scope(exit) ecrs.context.free(context);
@@ -33,11 +33,11 @@ extern(C) int main() {
 	foreach (e; ecrs.context.entities(context)) {
 		if (!ecrs.context.hasComponent!Vec2(context, e)) continue; // the reserved entity 0 has none
 		auto component = ecrs.context.getComponent!Vec2(context, e);
-		cast(void) printf("%u: %f, %f\n", cast(uint) e, cast(double) component.x, cast(double) component.y);
+		cast(void) fp.io.print(e, ": ", component.x, ", ", component.y, '\n');
 	}
 
 	// The same entities, read from the storage's owner list instead.
 	foreach (e; ecrs.storage.slotOwnersOf(*ecrs.context.getStorage!Vec2(context)))
-		if (e != ecrs.registry.invalidEntity) cast(void) printf("owns a Vec2: %u\n", cast(uint) e);
+		if (e != ecrs.registry.invalidEntity) cast(void) fp.io.print("owns a Vec2: ", e, '\n');
 	return 0;
 }

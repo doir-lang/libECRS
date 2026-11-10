@@ -4,7 +4,6 @@
 module ecrs.context;
 
 static import core.atomic;
-static import core.stdc.string;
 
 static import bc.platform;
 static import bc.monitor;
@@ -1134,7 +1133,7 @@ template setComponent(T, size_t unique = 0) {
 		}
 		record(journal.value, JournalEntry(JournalKind.replacedComponent, e, id, self.indexTable[e][id], offset));
 		fp.pointer.copy((*saved)[offset .. offset + T.sizeof], (cast(const(ubyte)*) existing)[0 .. T.sizeof]);
-		core.stdc.string.memset(existing, 0, T.sizeof);
+		fp.pointer.fill((cast(ubyte*) existing)[0 .. T.sizeof], 0);
 		fp.lifecycle.moveInto(*existing, value);
 		return true;
 	}

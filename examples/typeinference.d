@@ -12,12 +12,12 @@
 /// ---
 module examples.typeinference;
 
-import core.stdc.stdio : printf;
 static import ecrs.context;
 static import ecrs.datalog;
 static import ecrs.registry;
 static import ecrs.relation;
 static import fp.dynarray;
+static import fp.io;
 
 struct Name { const(char)* text; }
 struct IntLiteral {}
@@ -133,16 +133,16 @@ extern(C) int main() {
 	immutable ecrs.registry.EntityId[7] bindings = [one, two, isZero, sum, test, bad, oops];
 	foreach (binding; bindings) {
 		ecrs.datalog.Atom[1] typeOf = [ecrs.datalog.atom(hasType, ecrs.relation.Term(binding), t)];
-		cast(void) printf("%s:", nameOf(binding));
-		if (ecrs.datalog.query(p, context, typeOf[], (b) { cast(void) printf(" %s", nameOf(b[1])); return true; }) != ecrs.datalog.Status.ok) return 1;
-		cast(void) printf("\n");
+		cast(void) fp.io.print(nameOf(binding), ':');
+		if (ecrs.datalog.query(p, context, typeOf[], (b) { cast(void) fp.io.print(' ', nameOf(b[1])); return true; }) != ecrs.datalog.Status.ok) return 1;
+		cast(void) fp.io.print('\n');
 	}
 
 	// An error names the binding whose initializer is ill-typed.
 	bool report(size_t errors, const(char)* message) {
 		ecrs.datalog.Atom[2] body = [ecrs.datalog.atom(errors, x), ecrs.datalog.atom(initOf, e, x)];
 		return ecrs.datalog.query(p, context, body[], (b) {
-			cast(void) printf("error in %s: %s\n", nameOf(b[0]), message);
+			cast(void) fp.io.print("error in ", nameOf(b[0]), ": ", message, '\n');
 			return true;
 		}) == ecrs.datalog.Status.ok;
 	}

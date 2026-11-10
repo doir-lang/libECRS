@@ -1,12 +1,12 @@
 /// The classic Datalog family example over the Simpsons: parenthood as a relation component, grandparents and ancestors derived by rules, founders by negation, and marriage as a symmetric relation.
 module examples.simpsons;
 
-import core.stdc.stdio : printf;
 static import ecrs.context;
 static import ecrs.datalog;
 static import ecrs.registry;
 static import ecrs.relation;
 static import fp.dynarray;
+static import fp.io;
 
 struct Name { const(char)* text; }
 struct Person {}
@@ -20,12 +20,12 @@ immutable const(char)*[familySize] names = ["Abraham", "Mona", "Clancy", "Jackie
 // Prints `label`, then the name each solution of `body` binds variable `var` to.
 bool list(const(char)* label, ref ecrs.datalog.Program p, ref ecrs.context.Context context, size_t var, const(ecrs.datalog.Atom)[] body...) {
 	const(ecrs.context.Context)* view = &context; // a const read is not a change, so the next query need not re-evaluate
-	cast(void) printf("%s:", label);
+	cast(void) fp.io.print(label, ':');
 	immutable status = ecrs.datalog.query(p, context, body, (b) {
-		cast(void) printf(" %s", ecrs.context.getComponent!Name(*view, b[var]).text);
+		cast(void) fp.io.print(' ', ecrs.context.getComponent!Name(*view, b[var]).text);
 		return true;
 	});
-	cast(void) printf("\n");
+	cast(void) fp.io.print('\n');
 	return status == ecrs.datalog.Status.ok;
 }
 
