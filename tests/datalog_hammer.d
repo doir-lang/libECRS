@@ -1,4 +1,5 @@
-/// Differential stress test for `ecrs.datalog`: random graphs and every rule shape the engine treats differently, each answer checked against a brute-force reference over adjacency matrices. Each case then mutates the base relation and renumbers the store, and must still agree.
+/// Differential stress test for `ecrs.datalog`: random graphs and every rule shape the engine treats differently, each answer checked against a brute-force reference over adjacency matrices.
+/// Each case then mutates the base relation and renumbers the store, and must still agree.
 module datalog_hammer;
 
 
@@ -7,6 +8,7 @@ static import ecrs.context;
 static import ecrs.datalog;
 static import ecrs.registry;
 static import ecrs.relation;
+static import fp.algorithms;
 static import fp.dynarray;
 static import fp.io;
 static import fp.pointer;
@@ -16,17 +18,6 @@ static import fp.pointer;
 
 // `restrict` leaves a row or column unrestricted when given this, which is never a node index.
 private enum size_t anyNode = fp.pointer.notFound;
-
-private struct Rng {
-	ulong state;
-	uint next() @nogc nothrow {
-		state ^= state << 13;
-		state ^= state >> 7;
-		state ^= state << 17;
-		return cast(uint)(state >> 16);
-	}
-	uint below(size_t n) @nogc nothrow { return cast(uint)(next() % n); }
-}
 
 // An n x n boolean matrix.
 private struct Matrix {
@@ -137,20 +128,20 @@ private void rebuildIndex(ref Case c) @trusted {
 	foreach (i; 0 .. c.n) c.indexOf[c.nodes[i]] = i;
 }
 
-private Case makeCase(ref Rng rng) @trusted {
+private Case makeCase(ref fp.algorithms.Random rng) @trusted {
 	Case c;
 	c.context = ecrs.context.create();
-	c.n = 2 + rng.below(38);
+	c.n = 2 + cast(uint) fp.algorithms.randomBelow(rng, 38);
 	c.adj = matrix(c.n);
 	// Spare entities around the nodes, so ids and node indices differ.
 	foreach (i; 0 .. c.n) {
-		if (rng.below(4) == 0) assert(ecrs.context.addEntity(c.context) != ecrs.registry.invalidEntity);
+		if (cast(uint) fp.algorithms.randomBelow(rng, 4) == 0) assert(ecrs.context.addEntity(c.context) != ecrs.registry.invalidEntity);
 		c.nodes[i] = ecrs.context.addEntity(c.context);
 		assert(ecrs.context.addComponent!Node(c.context, c.nodes[i]) !is null);
 	}
-	immutable edges = rng.below(3 * c.n + 1);
+	immutable edges = cast(uint) fp.algorithms.randomBelow(rng, 3 * c.n + 1);
 	foreach (k; 0 .. edges) {
-		immutable i = rng.below(c.n), j = rng.below(c.n);
+		immutable i = cast(uint) fp.algorithms.randomBelow(rng, c.n), j = cast(uint) fp.algorithms.randomBelow(rng, c.n);
 		setEdge(c, i, j, true); // duplicates and self-loops included
 	}
 	// Empty slots are not facts.
@@ -227,7 +218,7 @@ private Relations declare(ref ecrs.datalog.Program p, size_t root) {
 }
 
 // Checks every derived relation, and the trait relation from each binding pattern, against the references.
-private void check(ref ecrs.datalog.Program p, ref Case c, ref Relations r, uint traits, bc.threadpool.ThreadPool* pool, ref Rng rng, ulong seed) @trusted {
+private void check(ref ecrs.datalog.Program p, ref Case c, ref Relations r, uint traits, bc.threadpool.ThreadPool* pool, ref fp.algorithms.Random rng, ulong seed) @trusted {
 	void expect(Matrix got, Matrix want, const(char)* what) {
 		scope(exit) { release(got); release(want); }
 		if (!equal(got, want)) {
@@ -243,7 +234,7 @@ private void check(ref ecrs.datalog.Program p, ref Case c, ref Relations r, uint
 	// Unbound, then each binding pattern: a bound target reads the derived relation's own index, which evaluation extended round by round.
 	void expectAll(size_t relation, Matrix want, const(char)* what) {
 		scope(exit) release(want);
-		immutable i = rng.below(c.n), j = rng.below(c.n);
+		immutable i = cast(uint) fp.algorithms.randomBelow(rng, c.n), j = cast(uint) fp.algorithms.randomBelow(rng, c.n);
 		expect(answers(p, c, relation, pool), restrict(want, anyNode, anyNode), what);
 		expect(answers(p, c, relation, pool, c.nodes[i]), restrict(want, i, anyNode), what);
 		expect(answers(p, c, relation, pool, ecrs.registry.invalidEntity, c.nodes[j]), restrict(want, anyNode, j), what);
@@ -267,21 +258,21 @@ private void check(ref ecrs.datalog.Program p, ref Case c, ref Relations r, uint
 	scope(exit) release(traited);
 	expect(answers(p, c, r.viaTrait, pool), restrict(traited, anyNode, anyNode), "trait closure (derived copy)");
 	expect(answers(p, c, r.edgeT, pool), restrict(traited, anyNode, anyNode), "trait closure (unbound)");
-	immutable i = rng.below(c.n), j = rng.below(c.n);
+	immutable i = cast(uint) fp.algorithms.randomBelow(rng, c.n), j = cast(uint) fp.algorithms.randomBelow(rng, c.n);
 	expect(answers(p, c, r.edgeT, pool, c.nodes[i]), restrict(traited, i, anyNode), "trait closure (owner bound)");
 	expect(answers(p, c, r.edgeT, pool, ecrs.registry.invalidEntity, c.nodes[j]), restrict(traited, anyNode, j), "trait closure (target bound)");
 	expect(answers(p, c, r.edgeT, pool, c.nodes[i], c.nodes[j]), restrict(traited, i, j), "trait closure (both bound)");
 }
 
 // Renumbers every entity but 0 by a random permutation.
-private void shuffle(ref Case c, ref Rng rng) @trusted {
+private void shuffle(ref Case c, ref fp.algorithms.Random rng) @trusted {
 	immutable slots = fp.dynarray.length(c.context.indexTable);
 	auto order = cast(size_t*) fp.pointer.allocator(null, slots * size_t.sizeof);
 	assert(order !is null);
 	scope(exit) cast(void) fp.pointer.allocator(order, 0);
 	foreach (k; 0 .. slots) order[k] = k;
 	foreach_reverse (k; 2 .. slots) {
-		immutable other = 1 + rng.below(k);
+		immutable other = 1 + cast(uint) fp.algorithms.randomBelow(rng, k);
 		immutable t = order[k]; order[k] = order[other]; order[other] = t;
 	}
 	assert(ecrs.context.reorderEntities(c.context, order[0 .. slots]));
@@ -302,7 +293,7 @@ unittest {
 	scope(exit) ecrs.registry.setRelationTraits(ecrs.registry.componentId!(Edge, traitUnique)(), 0);
 
 	foreach (seed; 1 .. cases + 1) {
-		auto rng = Rng(seed * 0x9E3779B97F4A7C15UL);
+		auto rng = fp.algorithms.createRandom(seed);
 		auto c = makeCase(rng);
 		scope(exit) release(c);
 		ecrs.datalog.Program p;
@@ -311,14 +302,14 @@ unittest {
 		scope(exit) assert(ecrs.datalog.detach(c.context, p));
 		auto r = declare(p, c.nodes[0]);
 
-		immutable traits = rng.below(8);
+		immutable traits = cast(uint) fp.algorithms.randomBelow(rng, 8);
 		ecrs.registry.setRelationTraits(r.edgeT, traits);
 		auto pool = pools[seed % 3];
 		check(p, c, r, traits, pool, rng, seed);
 
 		// Mutate: drop and add a few edges, then compare again.
-		foreach (k; 0 .. 1 + rng.below(4)) {
-			immutable i = rng.below(c.n), j = rng.below(c.n);
+		foreach (k; 0 .. 1 + cast(uint) fp.algorithms.randomBelow(rng, 4)) {
+			immutable i = cast(uint) fp.algorithms.randomBelow(rng, c.n), j = cast(uint) fp.algorithms.randomBelow(rng, c.n);
 			setEdge(c, i, j, !c.adj[i, j]);
 		}
 		check(p, c, r, traits, pools[(seed + 1) % 3], rng, seed);

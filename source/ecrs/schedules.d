@@ -1,8 +1,12 @@
 /// Schedules, and the combinators that build them, run over a `Context` one after another or concurrently on a `bc.threadpool`.
 ///
-/// A schedule is anything callable as `bool schedule(ref Context)`, or as `bool schedule(ref Owner)` for an owner: a type holding the context it runs against as a `context` member, such as a compiler's store alongside its query engine. `sequential!step` and `parallel!step` make a system, a schedule that runs a function over every entity, `bool step(ref Context, EntityId)`, or over every element of a slice, `bool step(ref Context, ref T)`. The other combinators, `sequential`, `parallel`, `untilStable`, `whenChanged` and `concurrentWrites`, take schedules and return one, so schedules nest. Each reports failure by returning false.
+/// A schedule is anything callable as `bool schedule(ref Context)`, or as `bool schedule(ref Owner)` for an owner: a type holding the context it runs against as a `context` member, such as a compiler's store alongside its query engine.
+/// `sequential!step` and `parallel!step` make a system, a schedule that runs a function over every entity, `bool step(ref Context, EntityId)`, or over every element of a slice, `bool step(ref Context, ref T)`.
+/// The other combinators, `sequential`, `parallel`, `untilStable`, `whenChanged` and `concurrentWrites`, take schedules and return one, so schedules nest.
+/// Each reports failure by returning false.
 ///
-/// Every combinator runs over a `Context` or an owner, and passes it through: a function or schedule it runs receives the owner if it can be called with it, and the owner's `context` otherwise, so one taking `ref Context` runs under any owner. Combinators run the schedules they are given, and those bound into them, in place rather than on copies, so a schedule that keeps state, such as `whenChanged`'s, keeps it when nested.
+/// Every combinator runs over a `Context` or an owner, and passes it through: a function or schedule it runs receives the owner if it can be called with it, and the owner's `context` otherwise, so one taking `ref Context` runs under any owner.
+/// Combinators run the schedules they are given, and those bound into them, in place rather than on copies, so a schedule that keeps state, such as `whenChanged`'s, keeps it when nested.
 module ecrs.schedules;
 
 static import bc.threadpool;
@@ -14,10 +18,12 @@ static import std.traits;
 @nogc nothrow:
 
 
-/// The shape a schedule takes as a plain function pointer. The combinators accept any callable schedule, as `isSchedule` describes, not just this.
+/// The shape a schedule takes as a plain function pointer.
+/// The combinators accept any callable schedule, as `isSchedule` describes, not just this.
 alias ScheduleFunction = bool function(ref ecrs.context.Context) @nogc nothrow;
 
-/// Whether `T` is an owner: a type holding the context a schedule should run against as a `context` member, the context itself or a pointer to it, so the combinators pass it through to the functions and schedules that take it. A type naming its context otherwise can declare `alias context = store;`.
+/// Whether `T` is an owner: a type holding the context a schedule should run against as a `context` member, the context itself or a pointer to it, so the combinators pass it through to the functions and schedules that take it.
+/// A type naming its context otherwise can declare `alias context = store;`.
 ///
 /// Examples:
 /// ---
@@ -201,10 +207,12 @@ private struct ItemJob(C, T) {
 
 private void runItem(alias step, C, T)(void* arg) {
 	auto job = cast(ItemJob!(C, T)*) arg;
+	assert(job !is null && job.owner !is null && job.item !is null, "ecrs.schedules: a pass job with nothing to run over");
 	auto outer = runningPool;
 	runningPool = job.pool;
 	scope(exit) runningPool = outer;
 	job.result = callOver!step(*job.owner, *job.item);
+	assert(runningPool is job.pool, "ecrs.schedules: a step changed which pool this thread runs for");
 }
 
 // Runs `step` over every element in order and ANDs the results: what a parallel pass does when it cannot run anything concurrently.
@@ -228,6 +236,7 @@ private bool dispatchItems(alias step, C, T)(ref C owner, bc.threadpool.ThreadPo
 	if (itemJobs is null || jobs is null)
 		return andAllItems!step(owner, items);
 
+	assert(ecrs.context.inParallel(contextOf(owner)), "ecrs.schedules: dispatching a pass not marked as parallel");
 	foreach (i, ref item; items) {
 		itemJobs[i] = ItemJob!(C, T)(&owner, pool, &item);
 		jobs[i] = bc.threadpool.Job(&runItem!(step, C, T), &itemJobs[i]);
@@ -246,7 +255,8 @@ private bool dispatchItems(alias step, C, T)(ref C owner, bc.threadpool.ThreadPo
 /// - `parallel!step(owner, pool, items)` on every element of `items`, as `bool step(ref Context, ref T)`; each job has its element to itself, so it may write it;
 /// - `parallel!step(pool)` and `parallel!step(pool, items)` return those systems as copyable structs; `items` must outlive its system.
 ///
-/// Unlike `sequential!step` it never stops early, so running inline makes exactly the calls the pool would; it runs inline with fewer than two calls, a null or single-worker pool, inside one of `pool`'s own jobs, which may not wait on it, and when allocating or submitting the jobs fails. `owner` is a `Context` or an owner, and `step` may take either, as the module documentation says.
+/// Unlike `sequential!step` it never stops early, so running inline makes exactly the calls the pool would; it runs inline with fewer than two calls, a null or single-worker pool, inside one of `pool`'s own jobs, which may not wait on it, and when allocating or submitting the jobs fails.
+/// `owner` is a `Context` or an owner, and `step` may take either, as the module documentation says.
 ///
 /// Examples:
 /// ---
@@ -281,6 +291,7 @@ template parallel(alias step) {
 			return andAllEntities(owner);
 		size_t n = 0;
 		foreach (e; ecrs.context.entities(contextOf(owner))) ids[n++] = e;
+		assert(n == ecrs.context.entityCount(contextOf(owner)), "ecrs.schedules: an entity range that disagrees with the entity count");
 		return dispatchItems!step(owner, pool, ids[0 .. n]);
 	}
 
@@ -355,7 +366,8 @@ struct ParallelItems(alias step, T) {
 }
 
 
-/// Runs schedules over `owner`, a `Context` or an owner, in order, stopping at the first that fails, and returns whether all of them succeeded. Unlike the schedule-taking `parallel`, which has no first failure to stop at, it suits schedules that work on what earlier ones produce.
+/// Runs schedules over `owner`, a `Context` or an owner, in order, stopping at the first that fails, and returns whether all of them succeeded.
+/// Unlike the schedule-taking `parallel`, which has no first failure to stop at, it suits schedules that work on what earlier ones produce.
 ///
 /// Examples:
 /// ---
@@ -436,13 +448,16 @@ private bool invokeSchedule(S, C)(void* schedule, ref C owner) {
 
 private void runSchedule(C)(void* arg) {
 	auto job = cast(ScheduleJob!C*) arg;
+	assert(job !is null && job.invoke !is null && job.owner !is null, "ecrs.schedules: a schedule job with nothing to run");
 	auto outer = runningPool;
 	runningPool = job.pool;
 	scope(exit) runningPool = outer;
 	job.result = job.invoke(job.schedule, *job.owner);
+	assert(runningPool is job.pool, "ecrs.schedules: a schedule changed which pool this thread runs for");
 }
 
-/// Runs schedules over `owner`, a `Context` or an owner, concurrently on `pool`, queuing all of them at once, and returns whether every one succeeded. Every schedule runs, however many fail; with fewer than two schedules, a single-worker pool, a call from inside one of `pool`'s own jobs, or a pool that cannot take the jobs, they run inline, in the order given.
+/// Runs schedules over `owner`, a `Context` or an owner, concurrently on `pool`, queuing all of them at once, and returns whether every one succeeded.
+/// Every schedule runs, however many fail; with fewer than two schedules, a single-worker pool, a call from inside one of `pool`'s own jobs, or a pool that cannot take the jobs, they run inline, in the order given.
 ///
 /// Examples:
 /// ---
@@ -464,6 +479,7 @@ bool parallel(C, Schedules...)(ref C owner, bc.threadpool.ThreadPool* pool, auto
 
 		ScheduleJob!C[Schedules.length] scheduleJobs;
 		bc.threadpool.Job[Schedules.length] jobs;
+		assert(ecrs.context.inParallel(contextOf(owner)), "ecrs.schedules: dispatching schedules not marked as parallel");
 		static foreach (i, Schedule; Schedules) {
 			scheduleJobs[i] = ScheduleJob!C(&schedules[i], &invokeSchedule!(Schedule, C), &owner, pool);
 			jobs[i] = bc.threadpool.Job(&runSchedule!C, &scheduleJobs[i]);
@@ -533,7 +549,9 @@ private size_t watchedGeneration(const ref ecrs.context.Context context, const(s
 	return sum;
 }
 
-/// Runs `schedule` over `owner`, a `Context` or an owner, until a run changes no component `watched` names, or with `watched` null, no component at all, as `ecrs.context.generation` sees it. Returns false as soon as a run fails, and true once one changes nothing; it runs at least once, and never stops if the schedule changes something every run. A mutable access counts as a change, so a schedule meant to settle should read through a `const` context.
+/// Runs `schedule` over `owner`, a `Context` or an owner, until a run changes no component `watched` names, or with `watched` null, no component at all, as `ecrs.context.generation` sees it.
+/// Returns false as soon as a run fails, and true once one changes nothing; it runs at least once, and never stops if the schedule changes something every run.
+/// A mutable access counts as a change, so a schedule meant to settle should read through a `const` context.
 ///
 /// Examples:
 /// ---
@@ -552,11 +570,14 @@ bool untilStable(C, Schedule)(ref C owner, auto ref Schedule schedule, const(siz
 	while (true) {
 		immutable before = watchedGeneration(contextOf(owner), watched);
 		if (!runOver(schedule, owner)) return false;
-		if (watchedGeneration(contextOf(owner), watched) == before) return true;
+		immutable after = watchedGeneration(contextOf(owner), watched);
+		assert(after >= before, "ecrs.schedules: a generation that went backwards");
+		if (after == before) return true;
 	}
 }
 
-/// `untilStable` with its schedule and watched components bound, from `untilStable(schedule, watched)`: a copyable struct that is itself a schedule, as `Sequential` is. `watched` must outlive it.
+/// `untilStable` with its schedule and watched components bound, from `untilStable(schedule, watched)`: a copyable struct that is itself a schedule, as `Sequential` is.
+/// `watched` must outlive it.
 ///
 /// Examples:
 /// ---
@@ -600,7 +621,9 @@ UntilStable!Schedule untilStable(Schedule)(Schedule schedule, const(size_t)[] wa
 /// The `seen` a `whenChanged` schedule starts from, so its first call runs.
 enum size_t neverRan = size_t.max;
 
-/// Runs `schedule` over `owner`, a `Context` or an owner, unless no component `watched` names, or with `watched` null, no component at all, has changed, as `ecrs.context.generation` sees it, since the run that left `seen`. A run that succeeds sets `seen` after it, so the schedule's own writes do not count as changes; start `seen` at `neverRan`. Returns true when it skips, and otherwise what the schedule returns, leaving `seen` as it was when that is false, so the next call runs it again.
+/// Runs `schedule` over `owner`, a `Context` or an owner, unless no component `watched` names, or with `watched` null, no component at all, has changed, as `ecrs.context.generation` sees it, since the run that left `seen`.
+/// A run that succeeds sets `seen` after it, so the schedule's own writes do not count as changes; start `seen` at `neverRan`.
+/// Returns true when it skips, and otherwise what the schedule returns, leaving `seen` as it was when that is false, so the next call runs it again.
 ///
 /// Examples:
 /// ---
@@ -615,10 +638,12 @@ bool whenChanged(C, Schedule)(ref C owner, auto ref Schedule schedule, ref size_
 	if (seen != neverRan && watchedGeneration(contextOf(owner), watched) == seen) return true;
 	if (!runOver(schedule, owner)) return false;
 	seen = watchedGeneration(contextOf(owner), watched);
+	assert(seen != neverRan, "ecrs.schedules: a generation that reads as never run");
 	return true;
 }
 
-/// `whenChanged` with its schedule and watched components bound, from `whenChanged(schedule, watched)`: a copyable struct that is itself a schedule, as `Sequential` is, remembering its own last run, so each copy tracks changes separately. `watched` must outlive it.
+/// `whenChanged` with its schedule and watched components bound, from `whenChanged(schedule, watched)`: a copyable struct that is itself a schedule, as `Sequential` is, remembering its own last run, so each copy tracks changes separately.
+/// `watched` must outlive it.
 ///
 /// Examples:
 /// ---
@@ -661,7 +686,9 @@ WhenChanged!Schedule whenChanged(Schedule)(Schedule schedule, const(size_t)[] wa
 }
 
 
-/// Runs `schedule` over `owner`, a `Context` or an owner, between `ecrs.context.beginConcurrentWrites` and `endConcurrentWrites`, so the parallel combinators inside it may add, set and remove components of the entities each job owns; ready every storage they add to with `ecrs.context.reserveConcurrentAdds` first. Returns what the schedule returns. Like the phase it opens, it must not run inside a parallel combinator, nor inside another of its kind.
+/// Runs `schedule` over `owner`, a `Context` or an owner, between `ecrs.context.beginConcurrentWrites` and `endConcurrentWrites`, so the parallel combinators inside it may add, set and remove components of the entities each job owns; ready every storage they add to with `ecrs.context.reserveConcurrentAdds` first.
+/// Returns what the schedule returns.
+/// Like the phase it opens, it must not run inside a parallel combinator, nor inside another of its kind.
 ///
 /// Examples:
 /// ---

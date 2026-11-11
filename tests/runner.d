@@ -1,4 +1,5 @@
-/// Runs every module's unittests, which `-betterC` has no built-in runner for, by walking them with `__traits(getUnitTests)`. Progress goes to the unbuffered `stderr`, so a test that hangs or aborts still shows how far the run got.
+/// Runs every module's unittests, which `-betterC` has no built-in runner for, by walking them with `__traits(getUnitTests)`.
+/// Progress goes to the unbuffered `stderr`, so a test that hangs or aborts still shows how far the run got.
 module runner;
 
 // `ecrs.package` only re-exports, so it has no tests of its own.
@@ -11,6 +12,7 @@ private alias modules = imported!"std.meta".AliasSeq!(
 	"ecrs.datalog",
 	"ecrs.serialization",
 	"datalog_hammer",
+	"store_hammer",
 );
 
 private int runEveryTest() {

@@ -7,7 +7,8 @@
   Do not restate what the code already says.
 - Cap every free-standing comment (a `//` or `/* */` block that is not a documentation comment) at 25 words.
   If it needs more, the code or its documentation should carry the explanation instead.
-- Editors here soft-wrap, so write each comment, and each paragraph of a DDoc comment, on a single line rather than hard-wrapping it at a column.
+- Put each sentence of every comment (free-standing, DDoc, docstring or DOIR documentation) on its own line, with a blank line between paragraphs; never hard-wrap a sentence, since editors here soft-wrap.
+  `tools/lint.py` reports a D comment that breaks this as `CMT-Sentence` or `CMT-Wrap`.
 - Do not leave commented-out code, change logs, or notes about what was changed in a comment; those belong in commit messages.
 
 ## Documentation
@@ -17,16 +18,17 @@
 - Every DDoc comment on a function or template includes an example of its use in an `Examples:` section, as a `---` code block:
 
   ```d
-  /// Increments `s`, waking one thread blocked in `wait` on it, if any.
+  /// Associates component `value` with entity `entity`.
   ///
   /// Examples:
   /// ---
-  /// Semaphore s = create();
-  /// post(s);
-  /// wait(s);
-  /// free(s);
+  /// Context context;
+  /// EntityId entity = 1;
+  /// setComponent(context, entity, 42);
+  /// assert(*getComponent!int(context, entity) == 42);
+  /// free(context);
   /// ---
-  void post(ref Semaphore s) { ... }
+  void setComponent(T)(ref Context context, EntityId entity, T value) { ... }
   ```
 
 - Keep examples short, and make them correct against the current API: they should compile and pass as written under `-betterC`.
@@ -39,12 +41,12 @@
 
 ## Style
 
-- Prefer plain-data structs operated on by free functions that take them by `ref` (for example `post(s)`, `free(s)`), rather than methods.
+- Prefer plain-data structs operated on by free functions that take them by `ref` (for example `getComponent(context, entity)`, `free(context)`), rather than methods.
   Use member functions only for operator overloads, for `@property` accessors that name part of a field (such as `ecrs.relation.Relates` naming a slot of `related`), and for what a language protocol requires to be a member, such as range primitives (`empty`, `front`, `popFront`) or an `alias this` target.
   Python is not ported, so it uses classes and methods where they are idiomatic.
-- Prefer fully qualified names to aliasing imports: call `bc.semaphore.free(s)` rather than `import bc.semaphore : semaphoreFree = free;` or `alias semaphoreFree = bc.semaphore.free;`.
+- Prefer fully qualified names to aliasing imports: call `ecrs.context.free(context)` rather than `import ecrs.context : contextFree = free;` or `alias contextFree = ecrs.context.free;`.
   A `static import` keeps a module's names out of scope so every use has to be qualified.
-- One ecrs module uses another, or a libfp or bc-threads module, through a `static import`, so every call names its layer (`ecrs.storage.add`, `fp.dynarray.pushBack`, `bc.spinlock.readLock`).
+- One ecrs module uses another, or a libfp or bc-threads module, through a `static import`, so every call names its layer (`ecrs.storage.add`, `fp.dynarray.pushBack`, `bc.spinlock.lockForReading`).
   The exception is a `public import` that re-exports names as part of the module's own API.
 - In Python, import the module and call qualified (`fp.dynarray.pushBack`, `pathlib.Path`) rather than aliasing or importing names directly; the exception is `from __future__ import …`.
 - Name D in camelCase, and Python in snake_case, with Python classes in PascalCase.
@@ -72,7 +74,18 @@
   Several results go in a struct the `Nullable` holds.
 - Never drop the result of a call that can fail: check it, or discard it explicitly when failure is impossible or harmless there, with `cast(void)` in D and `_ = …` in Python.
   Tests assert on it.
+- Return `std.typecons.Nullable` only of a struct or a pointer, never of a slice or other non-aggregate value.
+  Such a `Nullable` gets a `toHash` that needs druntime's hashing, which `-betterC` does not link, and MSVC's linker fails on it even when nothing calls it; wrap a slice in a struct instead.
 - When a limit on one value follows from another (such as a bit position), name the constant once, derive the others from it, and `assert` the limit where the value is accepted.
+- Give every recursion, and every loop over input, a named bound, and `assert` it where the depth or count grows.
+  A function that calls itself carries `// bounded: <the bound>` on the line above its documentation comment; prefer a worklist where it is no longer than the recursion.
+  `tools/lint.py` reports one without it as `REC-Bound`.
+- Input from outside the program (source text, bytes off a network, a document, a program to run) meets a named limit and a reported failure, never a stack overflow or a hang.
+- Assert what each function relies on: its arguments' preconditions, a structure's invariants where it is written and again where it is read, and what must never happen.
+  A structure with invariants gets a `validate` function that checks all of them, and the module asserts it on what it builds, so it runs wherever asserts do: debug and test builds, not release.
+  `python3 tools/lint.py --report` prints each module's asserts per function.
+- A structure with state, or a function over input, has a seeded test: a random sequence of operations checked against a simple model or a second implementation, with allocations refused at random (`fp.testing.limitAllocations`).
+  It draws from `fp.algorithms.Random`, so a failure replays from its seed, and a refused call must leave its arguments as they were.
 - Put test-only code, such as helper functions and globals the tests use, inside `version(unittest)` in D, and in the test files rather than the modules they test in Python.
 - `tests/runner.d` runs only the modules it lists, so add a new module with unittests to its `modules` list.
 - Keep test coverage as close to 100% as possible: add a test for every new branch and failure path, and check with `python3 tools/coverage.py`; an uncovered line needs a reason, such as being unreachable or platform-specific.
@@ -83,6 +96,9 @@
 - Whenever possible, define a function before anything that uses it, so a module reads bottom-up from its building blocks; a Python tool ends with `main`.
   When functions use each other in a cycle, define first the one that more of the module uses.
 - Keep a module's tests in the same order as the code they test.
+- Keep a function's body to 70 lines.
+  When one grows past that, let it decide the cases and move each straight-line part into a helper defined above it, so the branches sit in the caller and the loops in the helpers.
+  `tools/lint.py` reports a longer one as `FN-Length`.
 - Prefer merging a new test case into an existing test (a D `unittest` block, a Python test function) covering the same section over adding a new one; add one only when no existing test fits.
 
 ## Markdown
@@ -103,6 +119,7 @@ Every library in the stack forwards these rules.
 - Hold owned memory in a struct through `fp.lifecycle.Owned` rather than hand-written `finalize` and `copyTo` hooks.
 - Compare and hash a value through `fp.lifecycle.equal` and `fp.lifecycle.contentHash`, which use its hooks if it declares them.
   Never `memcmp` or hash a struct's raw bytes: its padding is in them.
+- Write a component in place only through `ecrs.context.getForWriting`, `findForWriting`, `ensureComponent` or `setComponent`; `getComponent` and `findComponent` read.
 - Check these rules with `python3 tools/lint.py`, which every library keeps a copy of, each with its own `CONFIG` and the same `PUSHED` registry.
   When code moves into a lower library, add the pattern it replaced to `PUSHED` in every copy, with the replacement as its hint, so the old way cannot come back.
 

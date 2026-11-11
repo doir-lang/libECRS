@@ -1,6 +1,7 @@
 /// The runtime component-type registry: gives every component type a stable numeric id, and keeps name, size and hook tables for callers that only have an id or a name, such as scripting or serialization.
 ///
-/// Thread-safe: the tables sit in a `bc.monitor` whose reader-writer spinlock lookups share and registration takes exclusively, and `componentId` publishes its cached id with release/acquire ordering, so racing first uses of a type agree on one id. `free` is the exception.
+/// Thread-safe: the tables sit in a `bc.monitor` whose reader-writer spinlock lookups share and registration takes exclusively, and `componentId` publishes its cached id with release/acquire ordering, so racing first uses of a type agree on one id.
+/// `free` is the exception.
 ///
 /// `EntityId` lives here rather than in `ecrs.storage` because the hook signatures need it and storage imports this module; a cycle would trip druntime's module-constructor check in the `-cov` build.
 module ecrs.registry;
@@ -28,27 +29,32 @@ enum EntityId invalidEntity = 0;
 /// Relabels every entity id a type-erased component holds, `remap[old]` being the id `old` becomes.
 alias RemapFunction = void function(void* element, const(EntityId)[] remap) @nogc nothrow;
 
-/// Appends a type-erased component's encoding to the byte dynarray `out_`. Returns false if allocation fails.
+/// Appends a type-erased component's encoding to the byte dynarray `out_`.
+/// Returns false if allocation fails.
 alias SerializeFunction = bool function(const(void)* element, ref ubyte* out_) @nogc nothrow;
 
-/// Decodes a component from the front of `data` into the zero-filled `element`, advancing `data` past it. Returns false if `data` is malformed or allocation fails, leaving `element` safe to finalize.
+/// Decodes a component from the front of `data` into the zero-filled `element`, advancing `data` past it.
+/// Returns false if `data` is malformed or allocation fails, leaving `element` safe to finalize.
 alias DeserializeFunction = bool function(void* element, ref const(ubyte)[] data) @nogc nothrow;
 
-/// How `ecrs.datalog` reads a component as a relation: the owning entity, then `columns` entity ids at offset 0 of the element. A fixed relation holds one tuple of them, a dynamic one a dynarray of `columns`-wide tuples; with `columns` 0 the component is a unary predicate, present or not.
+/// How `ecrs.datalog` reads a component as a relation: the owning entity, then `columns` entity ids at offset 0 of the element.
+/// A fixed relation holds one tuple of them, a dynamic one a dynarray of `columns`-wide tuples; with `columns` 0 the component is a unary predicate, present or not.
 struct RelationShape {
 	size_t columns = 0; /// Entity columns after the owner.
 	bool dynamic = false; /// Whether the ids are a dynarray rather than a fixed array.
 	uint traits = 0; /// `RelationTrait` flags, set with `setRelationTraits`.
 }
 
-/// How queries read a binary relation, one with `columns` 1, leaving its stored facts unchanged. `transitive` reads its closure, `symmetric` every edge both ways, and `reflexive` adds `R(x, x)` for each `x` in the relation's field, the entities occurring in it, so the answer is the same whatever the query binds.
+/// How queries read a binary relation, one with `columns` 1, leaving its stored facts unchanged.
+/// `transitive` reads its closure, `symmetric` every edge both ways, and `reflexive` adds `R(x, x)` for each `x` in the relation's field, the entities occurring in it, so the answer is the same whatever the query binds.
 enum RelationTrait : uint {
 	transitive = 1, /// Reads the closure.
 	symmetric = 2, /// Reads every edge both ways.
 	reflexive = 4, /// Relates each entity in the field to itself.
 }
 
-/// The callbacks storage runs on one component type's type-erased elements, recorded when the type registers, so storage created from a runtime id still ends lifetimes, and a holder of entity ids is renumbered by every `ecrs.context.reorderEntities` without the caller naming it. A null hook means the type has none.
+/// The callbacks storage runs on one component type's type-erased elements, recorded when the type registers, so storage created from a runtime id still ends lifetimes, and a holder of entity ids is renumbered by every `ecrs.context.reorderEntities` without the caller naming it.
+/// A null hook means the type has none.
 struct Hooks {
 	fp.lifecycle.Finalizer finalizer = null; /// Ends a component's lifetime, as `fp.lifecycle` defines it, before its slot is discarded.
 	RemapFunction remapFunction = null; /// Run on a component by every entity renumbering.
@@ -99,7 +105,8 @@ private bool serializeThunk(T)(const(void)* p, ref ubyte* out_) @trusted { retur
 // wrapper: adapts a call to the function-pointer type a hook slot requires
 private bool deserializeThunk(T)(void* p, ref const(ubyte)[] data) @trusted { return T.deserialize(*cast(T*) p, data); }
 
-/// The shape of an `ecrs.relation.Relation` whose slots are entities rather than terms, detected structurally because this module cannot import that one. Every other type reads as a unary predicate.
+/// The shape of an `ecrs.relation.Relation` whose slots are entities rather than terms, detected structurally because this module cannot import that one.
+/// Every other type reads as a unary predicate.
 ///
 /// Examples:
 /// ---
@@ -134,6 +141,7 @@ Hooks hooksFor(T)() {
 		hooks.serializeFunction = &serializeThunk!T;
 		hooks.deserializeFunction = &deserializeThunk!T;
 	}
+	assert((hooks.serializeFunction is null) == (hooks.deserializeFunction is null), "ecrs: a component that encodes but cannot decode, or the reverse");
 	return hooks;
 }
 
@@ -160,22 +168,28 @@ private const(char)[] nameOf(const(ForwardEntry)* e) @trusted {
 }
 
 private size_t nameHash(inout(ubyte)[] data) @trusted {
+	assert(data.length == ForwardEntry.sizeof, "ecrs: hashing a registry entry of the wrong size");
 	return cast(size_t) fp.algorithms.hashShortBytes(nameOf(cast(const(ForwardEntry)*) data.ptr));
 }
 private bool nameEqual(inout(ubyte)[] a, inout(ubyte)[] b) @trusted {
+	assert(a.length == ForwardEntry.sizeof && b.length == ForwardEntry.sizeof, "ecrs: comparing registry entries of the wrong size");
 	return nameOf(cast(const(ForwardEntry)*) a.ptr) == nameOf(cast(const(ForwardEntry)*) b.ptr);
 }
 
 // wrapper: adapts a call to the function-pointer type a hook slot requires
 private size_t idHash(inout(ubyte)[] data) @trusted {
+	assert(data.length >= size_t.sizeof, "ecrs: hashing a registry entry without an id");
 	return cast(size_t) fp.algorithms.hashShortBytes(data[0 .. size_t.sizeof]);
 }
 private bool idEqual(inout(ubyte)[] a, inout(ubyte)[] b) @trusted {
+	assert(a.length == b.length && a.length >= size_t.sizeof, "ecrs: comparing registry entries of different kinds");
 	return a[0 .. size_t.sizeof] == b[0 .. size_t.sizeof];
 }
 
 private void finalizeForwardEntry(inout(ubyte)[] data) @trusted {
+	assert(data.length == ForwardEntry.sizeof, "ecrs: finalizing a registry entry of the wrong size");
 	auto e = cast(ForwardEntry*) data.ptr;
+	assert(e.id != probeId, "ecrs: a lookup's probe stored in the registry");
 	if (e.name !is null) fp.string.free(e.name);
 }
 
@@ -205,6 +219,7 @@ private bool ensureTables(ref Tables t) @trusted {
 		t.reverseMap = fp.hashtable.create!ReverseEntry(fp.hashtable.Config(&idHash, &idEqual));
 	if (t.sizeMap is null)
 		t.sizeMap = fp.hashtable.create!SizeEntry(fp.hashtable.Config(&idHash, &idEqual));
+	assert(t.forwardMap is null || fp.hashtable.valid(t.forwardMap), "ecrs: a registry name table that is not a table");
 	return t.forwardMap !is null && t.reverseMap !is null && t.sizeMap !is null;
 }
 
@@ -213,11 +228,13 @@ private bool reserveHooks(ref Tables t, size_t componentId) @trusted {
 	if (oldLength > componentId) return true;
 	if (fp.dynarray.growToSize(t.hooksTable, componentId + 1) is null) return false;
 	foreach (i; oldLength .. componentId + 1) t.hooksTable[i] = Hooks.init;
+	assert(fp.dynarray.length(t.hooksTable) == componentId + 1, "ecrs: a hooks table grown to the wrong length");
 	return true;
 }
 
 
-/// Reserves a fresh component id for `registerType`. Ids are handed out in order from 0, and `free` starts them again.
+/// Reserves a fresh component id for `registerType`.
+/// Ids are handed out in order from 0, and `free` starts them again.
 ///
 /// Examples:
 /// ---
@@ -225,11 +242,14 @@ private bool reserveHooks(ref Tables t, size_t componentId) @trusted {
 /// assert(freshId() == a + 1);
 /// ---
 size_t freshId() {
-	return core.atomic.atomicOp!"+="(idCounter, 1) - 1;
+	immutable id = core.atomic.atomicOp!"+="(idCounter, 1) - 1;
+	assert(id < fp.pointer.allocationRefused, "ecrs: component ids exhausted");
+	return id;
 }
 
 private size_t registerTypeLocked(ref Tables t, const(char)[] name, size_t componentId, size_t typeSize, Hooks hooks) @trusted {
-	assert(name.length > 0);
+	assert(name.length > 0, "ecrs: a component with no name");
+	assert(componentId < fp.pointer.allocationRefused, "ecrs: a component id that is a sentinel");
 	if (!ensureTables(t) || !reserveHooks(t, componentId)) return fp.pointer.notFound;
 	char* owned = fp.string.clone(name).get(null);
 	if (owned is null) return fp.pointer.notFound;
@@ -250,11 +270,13 @@ private size_t registerTypeLocked(ref Tables t, const(char)[] name, size_t compo
 		return fp.pointer.notFound;
 	}
 	t.hooksTable[componentId] = hooks;
+	assert(fp.hashtable.find(t.sizeMap, SizeEntry(componentId, 0)).size == typeSize, "ecrs: a registered size that reads back differently");
 	return componentId;
 }
 
 // wrapper: takes the registry lock around the locked registration
-/// Registers the non-empty `name` under `componentId`, usually from `freshId`, as a component of `typeSize` bytes with `hooks`. A name may be registered once; registering it again fails an assert.
+/// Registers the non-empty `name` under `componentId`, usually from `freshId`, as a component of `typeSize` bytes with `hooks`.
+/// A name may be registered once; registering it again fails an assert.
 ///
 /// Returns `componentId`, or `fp.pointer.notFound` if allocation fails, leaving every lookup as it was.
 ///
@@ -286,7 +308,8 @@ template componentName(T, size_t unique = 0) {
 	else enum componentName = __traits(fullyQualifiedName, T) ~ "#" ~ decimal!unique;
 }
 
-/// The id of component `(T, unique)`, registering it under `componentName!(T, unique)` with `T`'s size and hooks on first use. A nonzero `unique` registers the same type as another, distinct component.
+/// The id of component `(T, unique)`, registering it under `componentName!(T, unique)` with `T`'s size and hooks on first use.
+/// A nonzero `unique` registers the same type as another, distinct component.
 ///
 /// Returns `fp.pointer.notFound` if registration fails; the next call tries again.
 ///
@@ -309,13 +332,15 @@ size_t componentId(T, size_t unique = 0)() @trusted {
 	if (core.atomic.atomicLoad!(core.atomic.MemoryOrder.raw)(cachedEpoch) != current) {
 		immutable registered = registerTypeLocked(tables.value, componentName!(T, unique), freshId(), T.sizeof, hooksFor!T());
 		if (registered == fp.pointer.notFound) return fp.pointer.notFound;
+		assert(registered < fp.dynarray.length(tables.value.hooksTable), "ecrs: a registered id with no hooks");
 		core.atomic.atomicStore!(core.atomic.MemoryOrder.raw)(id, registered);
 		core.atomic.atomicStore!(core.atomic.MemoryOrder.rel)(cachedEpoch, current);
 	}
 	return core.atomic.atomicLoad!(core.atomic.MemoryOrder.raw)(id);
 }
 
-/// Registers each of `Ts`, as `componentId` would on first use. Returns false if any registration fails; the rest are still attempted.
+/// Registers each of `Ts`, as `componentId` would on first use.
+/// Returns false if any registration fails; the rest are still attempted.
 ///
 /// Examples:
 /// ---
@@ -343,6 +368,7 @@ size_t idOf(const(char)* name) @trusted {
 	auto tables = bc.monitor.read(registry);
 	if (tables.value.forwardMap is null) return fp.pointer.notFound;
 	immutable at = fp.hashtable.positionOf(tables.value.forwardMap, ForwardEntry(cast(char*) name, probeId));
+	assert(at == fp.pointer.notFound || tables.value.forwardMap[at].id != probeId, "ecrs: a lookup's probe found in the registry");
 	return at == fp.pointer.notFound ? fp.pointer.notFound : tables.value.forwardMap[at].id;
 }
 
@@ -357,6 +383,7 @@ size_t elementSizeOf(size_t componentId) @trusted {
 	auto tables = bc.monitor.read(registry);
 	if (tables.value.sizeMap is null) return fp.pointer.notFound;
 	immutable at = fp.hashtable.positionOf(tables.value.sizeMap, SizeEntry(componentId, 0));
+	assert(at == fp.pointer.notFound || tables.value.sizeMap[at].id == componentId, "ecrs: a size lookup that found another component");
 	return at == fp.pointer.notFound ? fp.pointer.notFound : tables.value.sizeMap[at].size;
 }
 
@@ -374,7 +401,8 @@ Hooks hooksOf(size_t componentId) @trusted {
 
 private shared size_t traitChanges = 0;
 
-/// Replaces the `RelationTrait` flags of the registered binary relation `componentId`, and advances `traitsGeneration`, since every cached answer over it is now stale. It cannot fail.
+/// Replaces the `RelationTrait` flags of the registered binary relation `componentId`, and advances `traitsGeneration`, since every cached answer over it is now stale.
+/// It cannot fail.
 ///
 /// Examples:
 /// ---
@@ -420,7 +448,9 @@ const(char)* nameOf(size_t componentId) @trusted {
 }
 
 
-/// Frees every table and name the registry owns and resets it as though no type had registered, so a leak checker run at exit sees nothing outstanding. Every id handed out before is forgotten: `componentId` registers its type afresh on next use, so free every `Context` first, since their storages are indexed by the old ids. It is not safe to call while another thread uses the registry.
+/// Frees every table and name the registry owns and resets it as though no type had registered, so a leak checker run at exit sees nothing outstanding.
+/// Every id handed out before is forgotten: `componentId` registers its type afresh on next use, so free every `Context` first, since their storages are indexed by the old ids.
+/// It is not safe to call while another thread uses the registry.
 ///
 /// Examples:
 /// ---

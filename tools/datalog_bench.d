@@ -1,6 +1,8 @@
-/// Throughput of `ecrs.datalog` on classic workloads. Each prints the best of several runs, every run starting from a fresh `Program`, so paying for the full recomputation.
+/// Throughput of `ecrs.datalog` on classic workloads.
+/// Each prints the best of several runs, every run starting from a fresh `Program`, so paying for the full recomputation.
 ///
-/// Build with `dub build --config=datalog-bench --build=release`, to `bin/datalog-bench`. Arguments: a size scale, then an optional substring that selects the "workload pool" lines to run.
+/// Build with `dub build --config=datalog-bench --build=release`, to `bin/datalog-bench`.
+/// Arguments: a size scale, then an optional substring that selects the "workload pool" lines to run.
 module datalog_bench;
 
 
@@ -10,6 +12,7 @@ static import ecrs.context;
 static import ecrs.datalog;
 static import ecrs.registry;
 static import ecrs.relation;
+static import fp.algorithms;
 static import fp.dynarray;
 static import fp.io;
 static import fp.string;
@@ -147,11 +150,10 @@ extern (C) int main(int argc, char** argv) @trusted {
 		immutable n = 4000 * scale;
 		auto g = graph(n);
 		scope(exit) release(g);
-		uint seed = 7;
+		auto random = fp.algorithms.createRandom(7);
 		foreach (i; 0 .. n - 1)
 			foreach (k; 0 .. 2) {
-				seed = seed * 1103515245 + 12345;
-				immutable span = 1 + (seed >> 8) % 40;
+				immutable span = 1 + fp.algorithms.randomBelow(random, 40);
 				if (i + span < n) link!dagUnique(g, i, i + span);
 			}
 		immutable edge = ecrs.registry.componentId!(Edge, dagUnique)();

@@ -1,10 +1,16 @@
-/// A Datalog query layer over the store, whose relations are components: a component is the relation `C(owner, columns...)` its `ecrs.registry.RelationShape` describes, so the store stays the only home of facts, derived ones included. A `Program` holds rules, evaluates them bottom-up, stratified and semi-naive, and writes what they derive back into components it owns.
+/// A Datalog query layer over the store, whose relations are components: a component is the relation `C(owner, columns...)` its `ecrs.registry.RelationShape` describes, so the store stays the only home of facts, derived ones included.
+/// A `Program` holds rules, evaluates them bottom-up, stratified and semi-naive, and writes what they derive back into components it owns.
 ///
-/// Provenance: a rule's head must be a relation the program declared with `derive`, and nothing else may write those. Base relations are any other components, written by ordinary code. `evaluate` recomputes each stratum's derived relations from scratch, and only when a relation its rules mention has a new `ecrs.context.generation`.
+/// Provenance: a rule's head must be a relation the program declared with `derive`, and nothing else may write those.
+/// Base relations are any other components, written by ordinary code.
+/// `evaluate` recomputes each stratum's derived relations from scratch, and only when a relation its rules mention has a new `ecrs.context.generation`.
 ///
-/// `invalidEntity` in a relation slot means no target: tuples holding it are not facts. Within one rule, it also marks an unbound variable.
+/// `invalidEntity` in a relation slot means no target: tuples holding it are not facts.
+/// Within one rule, it also marks an unbound variable.
 ///
-/// Binary relations may carry `ecrs.registry.RelationTrait`s, read as closures at join time. Given a thread pool, `evaluate` splits each round's joins, and large rounds' insertions, across it through `ecrs.schedules`'s combinators. `evaluation` makes it a schedule, to run between those writing base facts and those reading derived ones.
+/// Binary relations may carry `ecrs.registry.RelationTrait`s, read as closures at join time.
+/// Given a thread pool, `evaluate` splits each round's joins, and large rounds' insertions, across it through `ecrs.schedules`'s combinators.
+/// `evaluation` makes it a schedule, to run between those writing base facts and those reading derived ones.
 module ecrs.datalog;
 
 
@@ -38,6 +44,7 @@ enum Status {
 }
 
 private bool contains(const(size_t)* list, size_t value) @trusted {
+	assert(value != fp.pointer.notFound, "ecrs.datalog: looking up a relation that was never made");
 	foreach (v; fp.dynarray.slice(list)) if (v == value) return true;
 	return false;
 }
@@ -51,9 +58,11 @@ private bool contains(const(size_t)* list, size_t value) @trusted {
 /// assert(x.isVar && x.varId == 0);
 /// ---
 ecrs.relation.Term variable(size_t id) {
+	assert(id < size_t.max, "ecrs.datalog: a variable id that would wrap when counted");
 	ecrs.relation.Term t;
 	t.isVar = true;
 	t.varId = id;
+	assert(t.isVar && t.varId == id, "ecrs.datalog: a variable that lost its id");
 	return t;
 }
 
@@ -74,7 +83,8 @@ private template variableDeclarations(int id, names...) {
 	else enum string variableDeclarations = (id ? ", " : "") ~ names[0] ~ " = ecrs.datalog.variable(" ~ id.stringof ~ ")" ~ variableDeclarations!(id + 1, names[1 .. $]);
 }
 
-/// `relation(args...)`, possibly negated, as `atom` and `negate` build it. The first argument is the owning entity.
+/// `relation(args...)`, possibly negated, as `atom` and `negate` build it.
+/// The first argument is the owning entity.
 struct Atom {
 	size_t relation = fp.pointer.notFound; /// The relation's component id.
 	bool negated = false; /// Whether the atom holds when the tuple is absent.
@@ -90,7 +100,8 @@ struct Atom {
 /// assert(a.relation == 5 && a.arity == 2 && !a.negated);
 /// ---
 Atom atom(size_t relation, const(ecrs.relation.Term)[] args...) {
-	assert(args.length >= 1 && args.length <= maxArity);
+	assert(args.length >= 1 && args.length <= maxArity, "ecrs.datalog.atom: an atom of no arguments or more than maxArity");
+	assert(relation != fp.pointer.notFound, "ecrs.datalog.atom: an atom of a relation that was never made");
 	Atom a;
 	a.relation = relation;
 	a.arity = args.length;
@@ -105,6 +116,8 @@ Atom atom(size_t relation, const(ecrs.relation.Term)[] args...) {
 /// assert(negate(atom(5, variable(0))).negated);
 /// ---
 Atom negate(Atom a) {
+	assert(!a.negated, "ecrs.datalog.negate: negating an atom twice");
+	assert(a.arity >= 1 && a.arity <= maxArity, "ecrs.datalog.negate: an atom of no arguments or more than maxArity");
 	a.negated = true;
 	return a;
 }
@@ -115,7 +128,8 @@ private struct Rule {
 	size_t varCount;
 }
 
-// (key, owner) pairs, sorted and unique. The owner's tuples are rescanned for the rest, so inserting into a derived list never invalidates an entry.
+// (key, owner) pairs, sorted and unique.
+// The owner's tuples are rescanned for the rest, so inserting into a derived list never invalidates an entry.
 private struct IndexEntry { EntityId key, owner; }
 
 private struct Index {
@@ -130,7 +144,8 @@ private struct Stratum {
 	size_t seen = ecrs.schedules.neverRan;
 }
 
-/// A Datalog program: rules over component relations, the relations it derives, and the caches `evaluate` keeps. It is plain data, released only by `free`, and must not move while `attach`ed.
+/// A Datalog program: rules over component relations, the relations it derives, and the caches `evaluate` keeps.
+/// It is plain data, released only by `free`, and must not move while `attach`ed.
 struct Program {
 	private Rule* rules = null;
 	private size_t* derived = null;
@@ -139,6 +154,7 @@ struct Program {
 	private size_t traitsSeen = 0; // `traitsGeneration` when the strata last forgot their runs
 	private bool stratified = false;
 	private Status status = Status.ok; // what the last evaluate returned
+	private const(Program)* attachedAt = null; // where `attach` registered it, so a move or a free before `detach` shows
 }
 
 private void dropIndexes(ref Program self) @trusted {
@@ -154,6 +170,7 @@ private void dropStrata(ref Program self) @trusted {
 	}
 	if (self.strata !is null) fp.dynarray.clear(self.strata);
 	self.stratified = false;
+	assert(fp.dynarray.length(self.strata) == 0, "ecrs.datalog: strata left after dropping them");
 }
 
 // Makes every stratum rerun on the next evaluate, as when rule constants or traits change what the same inputs derive.
@@ -161,7 +178,8 @@ private void forgetRuns(ref Program self) @trusted {
 	foreach (ref stratum; fp.dynarray.slice(self.strata)) stratum.seen = ecrs.schedules.neverRan;
 }
 
-/// Frees everything `self` owns, leaving it as `Program.init`; the facts it derived stay in the store. `detach` it first if it is attached.
+/// Frees everything `self` owns, leaving it as `Program.init`; the facts it derived stay in the store.
+/// `detach` it first if it is attached.
 ///
 /// Examples:
 /// ---
@@ -177,15 +195,19 @@ void free(ref Program self) @trusted {
 	fp.dynarray.free(self.strata);
 	dropIndexes(self);
 	fp.dynarray.free(bc.monitor.write(self.indexes).value);
+	assert(self.attachedAt is null, "ecrs.datalog.free: freeing an attached program, whose hook would then relabel freed memory; detach it first");
 	self = Program.init;
+	assert(self.rules is null && self.derived is null && self.strata is null, "ecrs.datalog.free: a program left holding memory");
 }
 
 
 private bool shapeMatches(const ref Atom a) {
+	assert(a.arity <= maxArity, "ecrs.datalog: an atom past maxArity");
 	return a.relation != fp.pointer.notFound && a.arity == 1 + ecrs.registry.hooksOf(a.relation).shape.columns;
 }
 
 private bool positivelyBound(const(Atom)[] body, size_t var) {
+	assert(var < size_t.max, "ecrs.datalog: a variable id past any rule's");
 	foreach (ref a; body)
 		if (!a.negated)
 			foreach (t; a.args[0 .. a.arity])
@@ -194,18 +216,20 @@ private bool positivelyBound(const(Atom)[] body, size_t var) {
 }
 
 // Checks arities and safety, every variable of a negated atom appearing in a positive one, and counts the variables.
-private bool validBody(const(Atom)[] body, out size_t varCount) {
+private std.typecons.Nullable!size_t validBody(const(Atom)[] body) {
+	size_t varCount;
 	foreach (ref a; body) {
-		if (!shapeMatches(a)) return false;
+		if (!shapeMatches(a)) return typeof(return).init;
 		foreach (t; a.args[0 .. a.arity])
 			if (t.isVar && t.varId + 1 > varCount) varCount = t.varId + 1;
 	}
 	foreach (ref a; body) {
 		if (!a.negated) continue;
 		foreach (t; a.args[0 .. a.arity])
-			if (t.isVar && !positivelyBound(body, t.varId)) return false;
+			if (t.isVar && !positivelyBound(body, t.varId)) return typeof(return).init;
 	}
-	return true;
+	foreach (ref a; body) foreach (t; a.args[0 .. a.arity]) assert(!t.isVar || t.varId < varCount, "ecrs.datalog: a variable past the count");
+	return typeof(return)(varCount);
 }
 
 /// Declares a relation `self` derives, named `name`, with `columns` entity columns after the owner, registering its component on first use: a dynamic `ecrs.relation.Relation` holding `columns` ids per tuple, or a tag when `columns` is 0.
@@ -222,7 +246,8 @@ private bool validBody(const(Atom)[] body, out size_t varCount) {
 /// assert(derive(p, "example.ancestor", 2) == fp.pointer.notFound);
 /// ---
 size_t derive(ref Program self, const(char)[] name, size_t columns) @trusted {
-	assert(columns < maxArity);
+	assert(columns < maxArity, "ecrs.datalog.derive: a relation wider than maxArity");
+	assert(name.length > 0, "ecrs.datalog.derive: a relation with no name");
 	immutable shape = columns == 0 ? ecrs.registry.RelationShape.init : ecrs.registry.RelationShape(columns, true);
 
 	char[128] small;
@@ -252,12 +277,14 @@ size_t derive(ref Program self, const(char)[] name, size_t columns) @trusted {
 	if (contains(self.derived, id)) return id;
 	if (!fp.dynarray.pushBack(self.derived, id)) return fp.pointer.notFound;
 	self.stratified = false;
+	assert(ecrs.registry.hooksOf(id).shape.columns == columns, "ecrs.datalog.derive: a relation registered with a different shape");
 	return id;
 }
 
 /// Adds the rule `head :- body`: `head` holds for every binding of its variables under which each atom of `body` does.
 ///
-/// Returns `Status.invalid` if an atom's arity does not match its relation's shape, `head` is negated or not a relation `self` derives, or a variable of `head` or of a negated atom appears in no positive atom of `body`; `Status.outOfMemory` if allocation fails. Either way `self` is left as it was.
+/// Returns `Status.invalid` if an atom's arity does not match its relation's shape, `head` is negated or not a relation `self` derives, or a variable of `head` or of a negated atom appears in no positive atom of `body`; `Status.outOfMemory` if allocation fails.
+/// Either way `self` is left as it was.
 ///
 /// Examples:
 /// ---
@@ -272,24 +299,29 @@ size_t derive(ref Program self, const(char)[] name, size_t columns) @trusted {
 /// assert(addRule(p, atom(ancestor, x, z), atom(parent, x, y)) == Status.invalid);
 /// ---
 Status addRule(ref Program self, Atom head, const(Atom)[] body...) @trusted {
-	size_t varCount;
 	if (head.negated || !shapeMatches(head) || !contains(self.derived, head.relation)) return Status.invalid;
-	if (!validBody(body, varCount)) return Status.invalid;
+	auto checked = validBody(body);
+	if (checked.isNull) return Status.invalid;
+	immutable varCount = checked.get;
 	foreach (t; head.args[0 .. head.arity])
 		if (t.isVar && !positivelyBound(body, t.varId)) return Status.invalid;
 
 	Rule rule = Rule(head, null, varCount);
 	if (!fp.dynarray.concatenate(rule.body, body)) return Status.outOfMemory;
+	immutable rules = fp.dynarray.length(self.rules);
 	if (!fp.dynarray.pushBack(self.rules, rule)) {
 		fp.dynarray.free(rule.body);
 		return Status.outOfMemory;
 	}
 	self.stratified = false;
+	assert(fp.dynarray.length(self.rules) == rules + 1 && fp.dynarray.length(fp.dynarray.back(self.rules).body) == body.length, "ecrs.datalog.addRule: a rule stored with the wrong body");
 	return Status.ok;
 }
 
 
-/// Relabels the entity constants in `self`'s rules, `remap[old]` being the id `old` becomes, and forces the next `evaluate` to recompute. `attach` makes every renumbering of a context call it. It cannot fail.
+/// Relabels the entity constants in `self`'s rules, `remap[old]` being the id `old` becomes, and forces the next `evaluate` to recompute.
+/// `attach` makes every renumbering of a context call it.
+/// It cannot fail.
 ///
 /// Examples:
 /// ---
@@ -302,6 +334,7 @@ Status addRule(ref Program self, Atom head, const(Atom)[] body...) @trusted {
 /// remapEntities(p, remap[]);
 /// ---
 void remapEntities(ref Program self, const(EntityId)[] remap) @trusted {
+	assert(remap.length == 0 || remap[invalidEntity] == invalidEntity, "ecrs.datalog: a renumbering that moves the invalid entity");
 	void fix(ref Atom a) {
 		foreach (ref t; a.args[0 .. a.arity])
 			if (!t.isVar && t.constant < remap.length) t.constant = remap[t.constant];
@@ -313,6 +346,7 @@ void remapEntities(ref Program self, const(EntityId)[] remap) @trusted {
 	// Derived lists are sorted by id, so the old order no longer holds.
 	dropIndexes(self);
 	forgetRuns(self);
+	assert(fp.dynarray.length(bc.monitor.read(self.indexes).value) == 0, "ecrs.datalog: indexes kept across a renumbering");
 }
 
 // wrapper: adapts a call to the function-pointer type a hook slot requires
@@ -320,8 +354,8 @@ private void remapHook(void* program, const(EntityId)[] remap) {
 	remapEntities(*cast(Program*) program, remap);
 }
 
-// wrapper: hides the private hook a program registers
-/// Registers `self` as a holder of entity ids, so renumbering `context` relabels its rule constants. `self` must not move until `detach`.
+/// Registers `self` as a holder of entity ids, so renumbering `context` relabels its rule constants.
+/// `self` must not move until `detach`.
 ///
 /// Returns false if allocation fails, registering nothing.
 ///
@@ -335,10 +369,12 @@ private void remapHook(void* program, const(EntityId)[] remap) {
 /// assert(detach(context, p));
 /// ---
 bool attach(ref ecrs.context.Context context, ref Program self) {
-	return ecrs.context.addRemapHook(context, &remapHook, &self);
+	assert(self.attachedAt is null || self.attachedAt is &self, "ecrs.datalog.attach: a program that moved since it was attached");
+	if (!ecrs.context.addRemapHook(context, &remapHook, &self)) return false;
+	self.attachedAt = &self;
+	return true;
 }
 
-// wrapper: hides the private hook a program registers
 /// Undoes `attach`, returning false if `self` is not attached to `context`.
 ///
 /// Examples:
@@ -349,7 +385,9 @@ bool attach(ref ecrs.context.Context context, ref Program self) {
 /// assert(!detach(context, p));
 /// ---
 bool detach(ref ecrs.context.Context context, ref Program self) {
-	return ecrs.context.removeRemapHook(context, &remapHook, &self);
+	if (!ecrs.context.removeRemapHook(context, &remapHook, &self)) return false;
+	self.attachedAt = null;
+	return true;
 }
 
 
@@ -361,6 +399,7 @@ private void forEachTuple(const ref ecrs.context.Context context, size_t relatio
 	EntityId[maxArity] tuple;
 	tuple[0] = e;
 	immutable arity = 1 + shape.columns;
+	assert(arity <= maxArity, "ecrs.datalog: a relation wider than maxArity");
 	auto p = ecrs.context.getComponent(context, e, relation);
 	if (!shape.dynamic) {
 		fp.pointer.copy(tuple[1 .. arity], (cast(const(EntityId)*) p)[0 .. shape.columns]);
@@ -369,6 +408,8 @@ private void forEachTuple(const ref ecrs.context.Context context, size_t relatio
 	}
 	auto list = *cast(const(EntityId*)*) p;
 	immutable n = fp.dynarray.length(list);
+	assert(shape.columns > 0, "ecrs.datalog: a dynamic relation with no columns would never advance");
+	assert(n % shape.columns == 0, "ecrs.datalog: a relation list that is not whole tuples");
 	for (size_t i = 0; i + shape.columns <= n; i += shape.columns) {
 		fp.pointer.copy(tuple[1 .. arity], list[i .. i + shape.columns]);
 		visit(tuple[0 .. arity]);
@@ -381,6 +422,7 @@ private void forEachTupleStarting(const ref ecrs.context.Context context, size_t
 	if (!ecrs.context.hasComponent(context, e, relation)) return;
 	auto list = *cast(const(EntityId*)*) ecrs.context.getComponent(context, e, relation);
 	immutable k = shape.columns;
+	assert(k > 0 && k < maxArity, "ecrs.datalog: a dynamic relation of no columns or past maxArity");
 	immutable groups = fp.dynarray.length(list) / k;
 	size_t lo = 0, hi = groups;
 	while (lo < hi) {
@@ -388,6 +430,7 @@ private void forEachTupleStarting(const ref ecrs.context.Context context, size_t
 		if (list[mid * k] < first) lo = mid + 1;
 		else hi = mid;
 	}
+	assert(lo == groups || list[lo * k] >= first, "ecrs.datalog: a search that stopped before its key; is the list sorted?");
 	EntityId[maxArity] tuple;
 	tuple[0] = e;
 	for (; lo < groups && list[lo * k] == first; ++lo) {
@@ -397,6 +440,7 @@ private void forEachTupleStarting(const ref ecrs.context.Context context, size_t
 }
 
 private bool holds(const ref ecrs.context.Context context, size_t relation, ecrs.registry.RelationShape shape, const(EntityId)[] tuple) {
+	assert(tuple.length == 1 + shape.columns, "ecrs.datalog: a tuple of the wrong arity for its relation");
 	bool found = false;
 	forEachTuple(context, relation, shape, tuple[0], (t) {
 		if (t == tuple) found = true;
@@ -405,6 +449,7 @@ private bool holds(const ref ecrs.context.Context context, size_t relation, ecrs
 }
 
 private bool lessTuple(const(EntityId)[] a, const(EntityId)[] b) {
+	assert(a.length == b.length, "ecrs.datalog: comparing tuples of different arities");
 	foreach (i; 0 .. a.length)
 		if (a[i] != b[i]) return a[i] < b[i];
 	return false;
@@ -413,8 +458,10 @@ private bool lessTuple(const(EntityId)[] a, const(EntityId)[] b) {
 private enum size_t radixThreshold = 256;
 private enum size_t radixDigitBits = 12;
 
-// Sorts flat `arity`-wide rows, dropping repeats; up to two ids pack as wide as the largest needs. False on allocation failure, leaving `rows` unsorted.
+// Sorts flat `arity`-wide rows, dropping repeats; up to two ids pack as wide as the largest needs.
+// False on allocation failure, leaving `rows` unsorted.
 private bool sortUnique(ref EntityId* rows, size_t arity) @trusted {
+	assert(arity > 0 && fp.dynarray.length(rows) % arity == 0, "ecrs.datalog: rows that are not whole tuples");
 	immutable n = fp.dynarray.length(rows) / arity;
 	if (n <= 1) return true;
 	size_t kept = 0;
@@ -440,6 +487,7 @@ private bool sortUnique(ref EntityId* rows, size_t arity) @trusted {
 			++kept;
 		}
 		cast(void) fp.dynarray.removeLast(rows, (n - kept) * arity);
+		foreach (i; 1 .. kept) assert(lessTuple(rows[(i - 1) * arity .. i * arity], rows[i * arity .. (i + 1) * arity]), "ecrs.datalog: packed rows left out of order or repeated");
 		return true;
 	}
 
@@ -460,14 +508,18 @@ private bool sortUnique(ref EntityId* rows, size_t arity) @trusted {
 	}
 	fp.dynarray.free(rows);
 	rows = sorted;
+	assert(fp.dynarray.length(rows) == kept * arity && kept <= n, "ecrs.datalog: sorted rows of the wrong length");
 	return true;
 }
 
-// Merges sorted, unique `rows` into a derived relation from the back, appending the new ones to `delta`. False if allocation fails.
+// Merges sorted, unique `rows` into a derived relation from the back, appending the new ones to `delta`.
+// False if allocation fails.
 private bool insertFacts(ref ecrs.context.Context context, size_t relation, const(EntityId)[] rows, ref EntityId* delta) @trusted {
 	immutable shape = ecrs.registry.hooksOf(relation).shape;
 	immutable k = shape.columns, arity = 1 + k;
 	immutable n = rows.length / arity;
+	assert(rows.length % arity == 0, "ecrs.datalog: facts that are not whole tuples");
+	assert(k == 0 || shape.dynamic, "ecrs.datalog: deriving into a relation that is not a list");
 	const(ecrs.context.Context)* view = &context;
 	EntityId* fresh = null; // this owner's new rows, without the owner
 	scope(exit) fp.dynarray.free(fresh);
@@ -503,6 +555,7 @@ private bool insertFacts(ref ecrs.context.Context context, size_t relation, cons
 				else hi = mid;
 			}
 			if (lo < existing && old[lo * k .. lo * k + k] == row) continue;
+			assert(lo == existing || lessTuple(row, old[lo * k .. lo * k + k]), "ecrs.datalog: a merge position after its row; is the relation sorted?");
 			if (!fp.dynarray.concatenate(fresh, row) || !fp.dynarray.concatenate(delta, rows[i * arity .. i * arity + arity])) return false;
 		}
 		immutable added = fp.dynarray.length(fresh) / k;
@@ -524,7 +577,10 @@ private bool insertFacts(ref ecrs.context.Context context, size_t relation, cons
 			}
 			--w;
 		}
+		assert(w == i, "ecrs.datalog: a merge that left a gap or overran its old rows");
+		foreach (g; 1 .. existing + added) assert(lessTuple(all[(g - 1) * k .. g * k], all[g * k .. (g + 1) * k]), "ecrs.datalog: a merged relation out of order or repeated");
 	}
+	assert(fp.dynarray.length(delta) % arity == 0, "ecrs.datalog: a delta that is not whole tuples");
 	return true;
 }
 
@@ -541,6 +597,7 @@ private void settle(ref IndexEntry* entries) @trusted {
 	foreach (i; 1 .. n)
 		if (entries[i] != entries[kept - 1]) entries[kept++] = entries[i];
 	cast(void) fp.dynarray.removeLast(entries, n - kept);
+	foreach (i; 1 .. kept) assert(entryLess(entries[i - 1], entries[i]), "ecrs.datalog: index entries out of order or repeated");
 }
 
 private struct CachedIndex {
@@ -548,8 +605,9 @@ private struct CachedIndex {
 	const(IndexEntry)[] entries;
 }
 
-// `relation`'s index on `column`, rebuilt if stale, or null if an allocation was refused; the store is fixed during a join, so parallel joins share it.
+// `relation`'s index on `column`, rebuilt if stale, or null on refused allocation; the store is fixed during a join, so parallel joins share it.
 private std.typecons.Nullable!CachedIndex indexOn(ref Program self, const ref ecrs.context.Context context, size_t relation, size_t column) @trusted {
+	assert(column >= 1 && column < maxArity, "ecrs.datalog: an index on the owner column or past maxArity");
 	immutable generation = ecrs.context.generation(context, relation);
 	inout(Index)* find(inout(Index)* indexes) {
 		foreach (ref candidate; fp.dynarray.slice(indexes))
@@ -587,12 +645,15 @@ private std.typecons.Nullable!CachedIndex indexOn(ref Program self, const ref ec
 		settle(index.entries);
 		index.generation = generation;
 	}
+	assert(index.relation == relation && index.column == column && index.generation == generation, "ecrs.datalog: an index for something else, or stale");
 	return typeof(return)(CachedIndex(relation, column, fp.dynarray.slice(index.entries)));
 }
 
 // Folds facts just inserted into `relation` into the indexes current at generation `before`, so a round pays for its delta, not a rebuild.
 private void extendIndexes(ref Program self, const ref ecrs.context.Context context, size_t relation, size_t before, const(EntityId)* delta, size_t arity) @trusted {
 	immutable after = ecrs.context.generation(context, relation);
+	assert(after >= before, "ecrs.datalog: a generation that went backwards");
+	assert(fp.dynarray.length(delta) % arity == 0, "ecrs.datalog: a delta that is not whole tuples");
 	immutable n = fp.dynarray.length(delta) / arity;
 	auto indexes = bc.monitor.write(self.indexes);
 	foreach (ref index; fp.dynarray.slice(indexes.value)) {
@@ -618,6 +679,8 @@ private const(IndexEntry)[] lookup(const(IndexEntry)[] entries, EntityId key) {
 	}
 	size_t end = lo;
 	while (end < entries.length && entries[end].key == key) ++end;
+	assert(lo == 0 || entries[lo - 1].key < key, "ecrs.datalog: a lookup that stopped past its key; is the index sorted?");
+	assert(end == entries.length || entries[end].key > key, "ecrs.datalog: a lookup that missed entries for its key");
 	return entries[lo .. end];
 }
 
@@ -663,6 +726,7 @@ private struct Solver {
 }
 
 private void fail(ref Solver s) {
+	assert(s.context !is null, "ecrs.datalog: failing a solver that was never set up");
 	s.failed = true;
 	s.stopped = true;
 }
@@ -677,10 +741,12 @@ private const(IndexEntry)[] index(ref Solver s, size_t relation, size_t column) 
 		return null;
 	}
 	if (s.indexCount < s.indexes.length) s.indexes[s.indexCount++] = built.get;
+	assert(s.indexCount <= s.indexes.length, "ecrs.datalog: more indexes remembered than there is room for");
 	return built.get.entries;
 }
 
 private EntityId valueOf(ref Solver s, ecrs.relation.Term t) {
+	assert(!t.isVar || t.varId < s.bindings.length, "ecrs.datalog: a variable past the rule's");
 	return t.isVar ? s.bindings[t.varId] : t.constant;
 }
 
@@ -697,11 +763,15 @@ private bool[] seenFlags(ref Solver s) @trusted {
 		s.seen[s.seenLength .. n] = false;
 		s.seenLength = n;
 	}
+	assert(s.seenLength >= n, "ecrs.datalog: scratch flags shorter than the entity table");
 	return s.seen[0 .. n];
 }
 
-// Each entity one edge from `e`: targets going forward, owners going back through the column-1 index, both when symmetric. May repeat.
+// Each entity one edge from `e`: targets going forward, owners going back through the column-1 index, both when symmetric.
+// May repeat.
 private void forEachNeighbor(ref Solver s, size_t relation, ecrs.registry.RelationShape shape, EntityId e, bool forward, scope void delegate(EntityId) @nogc nothrow visit) @trusted {
+	assert(shape.columns == 1, "ecrs.datalog: neighbours in a relation that is not binary");
+	assert(e != invalidEntity, "ecrs.datalog: the neighbours of the invalid entity");
 	const(ecrs.context.Context)* context = s.context;
 	immutable symmetric = (shape.traits & ecrs.registry.RelationTrait.symmetric) != 0;
 	if (forward || symmetric)
@@ -736,6 +806,7 @@ private EntityId* reach(ref Solver s, size_t relation, ecrs.registry.RelationSha
 			forEachNeighbor(s, relation, shape, found[i], forward, &visit);
 	if ((shape.traits & ecrs.registry.RelationTrait.reflexive) && inField(s, relation, shape, start)) visit(start);
 	foreach (e; fp.dynarray.slice(found)) seen[e] = false;
+	assert(fp.dynarray.length(found) <= seen.length, "ecrs.datalog: reached more entities than exist");
 	return found;
 }
 
@@ -773,6 +844,7 @@ private void closure(ref Solver s, size_t relation, ecrs.registry.RelationShape 
 			if (o != invalidEntity)
 				forEachTuple(*s.context, relation, shape, o, (t) { if (t[1] != invalidEntity) { note(t[0]); note(t[1]); } });
 	foreach (e; fp.dynarray.slice(field)) seen[e] = false;
+	assert(part < parts, "ecrs.datalog: a partition past the count");
 	foreach (i, e; fp.dynarray.slice(field))
 		if (i % parts == part) walk(e, true);
 }
@@ -781,6 +853,8 @@ private void closure(ref Solver s, size_t relation, ecrs.registry.RelationShape 
 // Matches an atom with an unbound owner, through an index or a scan, replaying the last key's tuples since outer atoms rebind the same values.
 private void solveUnowned(ref Solver s, size_t depth, const ref Atom atom, ecrs.registry.RelationShape shape, bool sorted, scope TupleFn match) @trusted {
 	const(ecrs.context.Context)* context = s.context;
+	assert(depth < s.memos.length, "ecrs.datalog: a memo past the rule's atoms");
+	assert(!atom.negated, "ecrs.datalog: enumerating a negated atom");
 	auto memo = &s.memos[depth];
 	EntityId[maxArity] key;
 	foreach (c; 0 .. atom.arity) key[c] = valueOf(s, atom.args[c]);
@@ -814,7 +888,9 @@ private void solveUnowned(ref Solver s, size_t depth, const ref Atom atom, ecrs.
 				forEachTuple(*context, atom.relation, shape, o, &record);
 }
 
+// bounded: the rule's body, one level per atom of `s.plan`
 private void solve(ref Solver s, size_t depth, scope Emit emit) @trusted {
+	assert(depth <= s.plan.length, "ecrs.datalog: solving past the last atom of a rule");
 	if (s.stopped) return;
 	if (depth == s.plan.length) {
 		if (!emit(s.bindings)) s.stopped = true;
@@ -856,6 +932,7 @@ private void solve(ref Solver s, size_t depth, scope Emit emit) @trusted {
 	}
 
 	if (s.plan[depth] == s.deltaAtom) {
+		assert(s.delta.length % atom.arity == 0, "ecrs.datalog: a delta that is not whole tuples");
 		for (size_t i = 0; i + atom.arity <= s.delta.length; i += atom.arity)
 			match(s.delta[i .. i + atom.arity]);
 		return;
@@ -883,9 +960,10 @@ private void solve(ref Solver s, size_t depth, scope Emit emit) @trusted {
 	solveUnowned(s, depth, *atom, shape, sorted, &match);
 }
 
-// A join order, written to `plan` (one slot per atom): `first`, then greedily the positive atom with most bound arguments, a bound owner counting most; negations once bound.
+// Join order written to `plan`: `first`, then greedily the positive atom with most bound arguments, a bound owner counting most; negations once bound.
 private void makePlan(const(Atom)[] body, size_t first, size_t varCount, size_t[] plan) @trusted {
-	assert(plan.length == body.length);
+	assert(plan.length == body.length, "ecrs.datalog: a plan of the wrong length");
+	assert(first == fp.pointer.notFound || (first < body.length && !body[first].negated), "ecrs.datalog: a plan starting at a negated atom or none of the body's");
 	mixin fp.pointer.allocateOnStack!(bool, "bound", "varCount");
 	bound[0 .. varCount] = false;
 	mixin fp.pointer.allocateOnStack!(bool, "used", "body.length");
@@ -921,12 +999,16 @@ private void makePlan(const(Atom)[] body, size_t first, size_t varCount, size_t[
 		take(best);
 	}
 	takeReadyNegations();
-	assert(planned == body.length);
+	assert(planned == body.length, "ecrs.datalog: a plan that missed an atom; is a negated atom unsafe?");
+	foreach (i; 0 .. body.length) assert(used[i], "ecrs.datalog: a plan that missed an atom");
 }
 
-// Solves `body`, calling `emit` with each solution's bindings. False if allocation fails, possibly after some solutions were emitted.
+// Solves `body`, calling `emit` with each solution's bindings.
+// False if allocation fails, possibly after some solutions were emitted.
 private bool join(ref Program self, ref ecrs.context.Context context, const(Atom)[] body, size_t varCount, size_t deltaAtom, const(EntityId)[] delta, scope Emit emit, size_t partition = 0, size_t partitions = 1) @trusted {
 	// A rule's scratch is a few bytes per atom and variable, so the stack holds it for the duration of the join.
+	assert(partition < partitions, "ecrs.datalog: a partition past the count");
+	assert(deltaAtom == fp.pointer.notFound || deltaAtom < body.length, "ecrs.datalog: a delta atom past the body");
 	mixin fp.pointer.allocateOnStack!(size_t, "plan", "body.length");
 	makePlan(body, deltaAtom, varCount, plan[0 .. body.length]);
 	mixin fp.pointer.allocateOnStack!(EntityId, "bindings", "varCount");
@@ -959,6 +1041,7 @@ private bool join(ref Program self, ref ecrs.context.Context context, const(Atom
 
 
 private size_t derivedIndex(const ref Program self, size_t relation) @trusted {
+	assert(fp.dynarray.length(self.derived) < fp.pointer.allocationRefused, "ecrs.datalog: an index that could read as a sentinel");
 	foreach (i, d; fp.dynarray.slice(self.derived)) if (d == relation) return i;
 	return fp.pointer.notFound;
 }
@@ -979,7 +1062,9 @@ private Status stratify(const ref Program self, ref size_t* order, ref size_t* s
 	size_t counter = 0, sccCount = 0;
 	bool grown = true;
 
+	// bounded: the `n` derived relations, each visited once
 	void connect(size_t v) {
+		assert(v < n && counter < n, "ecrs.datalog: a derived relation visited twice");
 		visit[v] = low[v] = counter++;
 		grown = grown && fp.dynarray.pushBack(stack, v);
 		if (!grown) return;
@@ -1011,6 +1096,8 @@ private Status stratify(const ref Program self, ref size_t* order, ref size_t* s
 	}
 	foreach (v; 0 .. n) if (grown && visit[v] == fp.pointer.notFound) connect(v);
 	if (!grown || !fp.dynarray.pushBack(start, fp.dynarray.length(order))) return Status.outOfMemory;
+	assert(fp.dynarray.length(order) == n && fp.dynarray.length(stack) == 0, "ecrs.datalog: a stratification that missed or repeated a relation");
+	assert(fp.dynarray.length(start) == sccCount + 1, "ecrs.datalog: component starts that disagree with the component count");
 
 	foreach (ref r; fp.dynarray.slice(self.rules))
 		foreach (ref a; fp.dynarray.slice(r.body)) {
@@ -1021,7 +1108,8 @@ private Status stratify(const ref Program self, ref size_t* order, ref size_t* s
 	return Status.ok;
 }
 
-// Rebuilds `self.strata` from the rules, every one yet to run. Returns what `stratify` does, leaving no strata unless it succeeds.
+// Rebuilds `self.strata` from the rules, every one yet to run.
+// Returns what `stratify` does, leaving no strata unless it succeeds.
 private Status buildStrata(ref Program self) @trusted {
 	dropStrata(self);
 	size_t* order = null, start = null;
@@ -1046,6 +1134,9 @@ private Status buildStrata(ref Program self) @trusted {
 		}
 	}
 	self.stratified = true;
+	size_t covered = 0;
+	foreach (ref stratum; fp.dynarray.slice(self.strata)) covered += fp.dynarray.length(stratum.members);
+	assert(covered == fp.dynarray.length(self.derived), "ecrs.datalog: strata that do not cover the derived relations once each");
 	return Status.ok;
 }
 
@@ -1062,6 +1153,8 @@ private struct Task {
 }
 
 private bool runTask(ref ecrs.context.Context context, ref Task task) @trusted {
+	assert(task.program !is null && task.rule !is null, "ecrs.datalog: a task with no rule");
+	assert(task.partition < task.partitions, "ecrs.datalog: a task's partition past the count");
 	const head = &task.rule.head;
 	bool buffered = true;
 	// Head tuples reach `output` in batches, sparing each one a dynarray append's checks.
@@ -1078,6 +1171,7 @@ private bool runTask(ref ecrs.context.Context context, ref Task task) @trusted {
 	}, task.partition, task.partitions);
 	buffered = buffered && fp.dynarray.concatenate(task.output, pending[0 .. used]);
 	task.failed = !joined || !buffered;
+	assert(task.failed || fp.dynarray.length(task.output) % head.arity == 0, "ecrs.datalog: a task's output that is not whole tuples");
 	return !task.failed;
 }
 
@@ -1094,19 +1188,24 @@ private struct Bucket {
 
 // Sorts `b`'s rows and counts the lists inserting them will add, which concurrent writes must prepare for.
 private bool sortBucket(ref ecrs.context.Context context, ref Bucket b) @trusted {
+	assert(b.arity > 1 && b.newOwners == 0, "ecrs.datalog: a bucket of unary facts, or sorted twice");
 	if (!sortUnique(b.rows, b.arity)) return false;
 	for (size_t j = 0; j < fp.dynarray.length(b.rows); j += b.arity)
 		if ((j == 0 || b.rows[j] != b.rows[j - b.arity]) && !ecrs.context.hasComponent(context, b.rows[j], b.relation)) ++b.newOwners;
+	assert(b.newOwners * b.arity <= fp.dynarray.length(b.rows), "ecrs.datalog: more new owners than rows");
 	return true;
 }
 
 // wrapper: the per-item function a parallel schedule needs by name
 private bool insertBucket(ref ecrs.context.Context context, ref Bucket b) @trusted {
-	return insertFacts(context, b.relation, fp.dynarray.slice(b.rows), b.delta);
+	immutable inserted = insertFacts(context, b.relation, fp.dynarray.slice(b.rows), b.delta);
+	assert(!inserted || fp.dynarray.length(b.delta) <= fp.dynarray.length(b.rows), "ecrs.datalog: a bucket's delta longer than its rows");
+	return inserted;
 }
 
 // `sortUnique` and `insertFacts` across `pool`, buckets holding disjoint owners, so each owner's list is created and written by one thread under concurrent writes.
 private bool insertInParallel(ref ecrs.context.Context context, bc.threadpool.ThreadPool* pool, size_t parts, size_t relation, size_t arity, const(Task)* tasks, size_t member, ref EntityId* delta) @trusted {
+	assert(parts > 1 && arity > 1, "ecrs.datalog: a parallel insert of one part or unary facts");
 	auto buckets = fp.dynarray.create!Bucket(parts);
 	if (buckets is null) return false;
 	scope(exit) {
@@ -1128,6 +1227,7 @@ private bool insertInParallel(ref ecrs.context.Context context, bc.threadpool.Th
 	if (!ecrs.schedules.concurrentWrites(context, ecrs.schedules.parallel!insertBucket(pool, fp.dynarray.slice(buckets)))) return false;
 	foreach (ref b; fp.dynarray.slice(buckets))
 		if (!fp.dynarray.concatenate(delta, fp.dynarray.slice(b.delta))) return false;
+	assert(fp.dynarray.length(delta) % arity == 0, "ecrs.datalog: a delta that is not whole tuples");
 	return true;
 }
 
@@ -1149,15 +1249,19 @@ private void free(ref Rounds self) @trusted {
 	fp.dynarray.free(self.tasks);
 	self.delta = null;
 	self.tasks = null;
+	assert(!self.wide, "ecrs.datalog: rounds freed in the middle of a wide round");
 }
 
 private size_t member(const ref Rounds self, size_t relation) {
 	immutable d = derivedIndex(*self.program, relation);
+	assert(self.members.length < fp.pointer.allocationRefused, "ecrs.datalog: a member index that could read as a sentinel");
 	foreach (i, x; self.members) if (x == d) return i;
 	return fp.pointer.notFound;
 }
 
 private bool schedule(ref Rounds self, const(Rule)* r, size_t deltaAtom, const(EntityId)[] deltaFacts) {
+	assert(member(self, r.head.relation) != fp.pointer.notFound, "ecrs.datalog: scheduling a rule whose head is outside the stratum");
+	assert(deltaAtom == fp.pointer.notFound || deltaAtom < fp.dynarray.length(r.body), "ecrs.datalog: a delta atom past the body");
 	immutable split = deltaAtom != fp.pointer.notFound && deltaFacts.length < parallelThreshold ? 1 : self.partitions;
 	self.wide |= split > 1;
 	foreach (p; 0 .. split)
@@ -1171,7 +1275,8 @@ private bool dispatch(ref ecrs.context.Context context, ref Rounds self) @truste
 	return self.wide ? ecrs.schedules.parallel!runTask(context, self.pool, all) : ecrs.schedules.sequential!runTask(context, all);
 }
 
-// Inserts what the round's tasks derived, making it the next round's delta. False if allocation fails.
+// Inserts what the round's tasks derived, making it the next round's delta.
+// False if allocation fails.
 private bool commit(ref ecrs.context.Context context, ref Rounds self) @trusted {
 	foreach (i; 0 .. self.members.length) {
 		immutable relation = self.program.derived[self.members[i]];
@@ -1193,10 +1298,12 @@ private bool commit(ref ecrs.context.Context context, ref Rounds self) @trusted 
 			inserted = inserted && sortUnique(rows, arity) && insertFacts(context, relation, fp.dynarray.slice(rows), self.delta[i]);
 		}
 		if (!inserted) return false;
+		assert(fp.dynarray.length(self.delta[i]) <= total, "ecrs.datalog: a delta longer than what the round derived");
 		extendIndexes(*self.program, context, relation, before, self.delta[i], arity);
 	}
 	foreach (ref t; fp.dynarray.slice(self.tasks)) fp.dynarray.free(t.output);
 	if (self.tasks !is null) fp.dynarray.clear(self.tasks);
+	assert(fp.dynarray.length(self.tasks) == 0, "ecrs.datalog: tasks left after committing a round");
 	return true;
 }
 
@@ -1231,9 +1338,12 @@ private bool nextRound(ref ecrs.context.Context context, ref Rounds self) @trust
 	return dispatch(context, self) && commit(context, self);
 }
 
-// Semi-naive evaluation of one stratum: a first round, then rounds until one leaves the members' generations unchanged. False if allocation fails.
+// Semi-naive evaluation of one stratum: a first round, then rounds until one leaves the members' generations unchanged.
+// False if allocation fails.
 private bool evaluateStratum(ref Program self, ref ecrs.context.Context context, const(size_t)[] members, bc.threadpool.ThreadPool* pool) @trusted {
 	immutable m = members.length;
+	assert(m > 0, "ecrs.datalog: a stratum with no members");
+	foreach (d; members) assert(d < fp.dynarray.length(self.derived), "ecrs.datalog: a stratum member past the derived relations");
 	Rounds[1] rounds;
 	rounds[0] = Rounds(&self, members, pool, pool is null ? 1 : bc.threadpool.workerCount(pool));
 	scope(exit) free(rounds[0]);
@@ -1256,6 +1366,7 @@ private struct StratumRun {
 
 	@nogc nothrow:
 	bool opCall(ref ecrs.context.Context context) @trusted {
+		assert(program !is null && stratum !is null, "ecrs.datalog: running no stratum");
 		const(size_t)[] members = fp.dynarray.slice(stratum.members);
 		foreach (d; members)
 			if (!ecrs.context.clearComponent(context, program.derived[d])) return false;
@@ -1277,10 +1388,13 @@ private Status recompute(ref Program self, ref ecrs.context.Context context, bc.
 	bool runStratum(ref ecrs.context.Context c, ref Stratum stratum) {
 		return ecrs.schedules.whenChanged(c, StratumRun(&self, &stratum, pool), stratum.seen, fp.dynarray.slice(stratum.inputs));
 	}
+	assert(self.stratified, "ecrs.datalog: evaluating a program that is not stratified");
 	return ecrs.schedules.sequential!runStratum(context, fp.dynarray.slice(self.strata)) ? Status.ok : Status.outOfMemory;
 }
 
-/// Brings every relation `self` derives up to date with `context`, stratum by stratum through `ecrs.schedules.whenChanged`: a stratum is recomputed from scratch only if a relation its rules mention, or any trait, changed since it last ran, and what it rewrites counts as a change to the strata reading it. Each round's joins spread over `pool` if one is given. Read results through a `const` context: a mutable access counts as a change, so forces the next call to recompute.
+/// Brings every relation `self` derives up to date with `context`, stratum by stratum through `ecrs.schedules.whenChanged`: a stratum is recomputed from scratch only if a relation its rules mention, or any trait, changed since it last ran, and what it rewrites counts as a change to the strata reading it.
+/// Each round's joins spread over `pool` if one is given.
+/// Read results through a `const` context: a mutable access counts as a change, so forces the next call to recompute.
 ///
 /// Returns `Status.unstratifiable`, changing nothing, if the rules recurse through negation, or `Status.outOfMemory` if allocation fails, leaving the derived relations partial until a later call succeeds.
 ///
@@ -1299,7 +1413,9 @@ private Status recompute(ref Program self, ref ecrs.context.Context context, bc.
 /// assert(ecrs.context.hasComponent(context, child, hasParent) && !ecrs.context.hasComponent(context, parent, hasParent));
 /// ---
 Status evaluate(ref Program self, ref ecrs.context.Context context, bc.threadpool.ThreadPool* pool = null) {
+	assert(self.attachedAt is null || self.attachedAt is &self, "ecrs.datalog.evaluate: a program that moved since it was attached, so renumbering misses its constants");
 	self.status = recompute(self, context, pool);
+	assert(self.status != Status.ok || self.stratified, "ecrs.datalog: an evaluation that succeeded without strata");
 	return self.status;
 }
 
@@ -1314,7 +1430,9 @@ Status evaluate(ref Program self, ref ecrs.context.Context context, bc.threadpoo
 /// ---
 Status lastStatus(const ref Program self) { return self.status; }
 
-/// Evaluates `self`, on `pool` if given, then calls `onMatch` with the bindings, indexed by variable id, of each solution of `body` against `context`, until it returns false. A solution may repeat if a base relation lists a tuple twice. `onMatch` runs on the calling thread and must not change the store.
+/// Evaluates `self`, on `pool` if given, then calls `onMatch` with the bindings, indexed by variable id, of each solution of `body` against `context`, until it returns false.
+/// A solution may repeat if a base relation lists a tuple twice.
+/// `onMatch` runs on the calling thread and must not change the store.
 ///
 /// Returns `Status.invalid` if `body` is malformed, as `addRule` defines it, or what `evaluate` returns if that fails, calling `onMatch` never either way; `Status.outOfMemory` if the join's allocation fails, possibly after some calls.
 ///
@@ -1333,14 +1451,22 @@ Status lastStatus(const ref Program self) { return self.status; }
 /// assert(found == parent);
 /// ---
 Status query(ref Program self, ref ecrs.context.Context context, const(Atom)[] body, scope Emit onMatch, bc.threadpool.ThreadPool* pool = null) @trusted {
-	size_t varCount;
-	if (!validBody(body, varCount)) return Status.invalid;
+	auto checked = validBody(body);
+	if (checked.isNull) return Status.invalid;
+	immutable varCount = checked.get;
+	assert(varCount <= body.length * maxArity, "ecrs.datalog.query: more variables than the body's argument slots");
 	if (immutable status = evaluate(self, context, pool)) return status;
-	return join(self, context, body, varCount, fp.pointer.notFound, null, onMatch) ? Status.ok : Status.outOfMemory;
+	immutable before = ecrs.context.generation(context);
+	immutable joined = join(self, context, body, varCount, fp.pointer.notFound, null, onMatch);
+	assert(ecrs.context.generation(context) == before, "ecrs.datalog.query: onMatch changed the store it is reading");
+	return joined ? Status.ok : Status.outOfMemory;
 }
 
 
-/// `evaluate` as an `ecrs.schedules` schedule, from `evaluation(program, pool)`: a copyable struct callable as `bool opCall(ref Context)`, or with any type owning its context as a `context` member, so a schedule can bring derived relations up to date between the schedules that write base facts and those that read derived ones. It returns whether `evaluate` succeeded; `lastStatus` says how it failed. The program must not move, nor be freed, while bound. Like `evaluate`, it must not run inside a parallel combinator.
+/// `evaluate` as an `ecrs.schedules` schedule, from `evaluation(program, pool)`: a copyable struct callable as `bool opCall(ref Context)`, or with any type owning its context as a `context` member, so a schedule can bring derived relations up to date between the schedules that write base facts and those that read derived ones.
+/// It returns whether `evaluate` succeeded; `lastStatus` says how it failed.
+/// The program must not move, nor be freed, while bound.
+/// Like `evaluate`, it must not run inside a parallel combinator.
 struct Evaluation {
 	private Program* program;
 	private bc.threadpool.ThreadPool* pool;
@@ -1514,10 +1640,9 @@ unittest {
 			foreach (kind; 0 .. 4) {
 				EntityId* rows = null;
 				scope(exit) fp.dynarray.free(rows);
-				uint seed = 3;
+				auto random = fp.algorithms.createRandom(3);
 				foreach (i; 0 .. n * arity) {
-					seed = seed * 1103515245 + 12345;
-					immutable r = seed >> 8;
+					immutable r = cast(uint) fp.algorithms.nextRandom(random);
 					immutable EntityId[4] pick = [7, r % 600, r % 70_000, wide[r % 4]];
 					assert(fp.dynarray.pushBack(rows, pick[kind]));
 				}
@@ -1701,7 +1826,8 @@ unittest {
 	assert(sameSet(solutions(p, f.context, 0, atom(root, x)), f.abraham, f.jackie));
 	assert(sameSet(solutions(p, f.context, 0, atom(person, x), negate(atom(root, x))), f.bart, f.lisa, f.homer, f.marge));
 
-	// As a schedule: one settling a base relation fed by a derived one. Each root adopts a fresh child until no person is a root.
+	// As a schedule: one settling a base relation fed by a derived one.
+	// Each root adopts a fresh child until no person is a root.
 	static struct Adopt {
 		size_t root;
 		bool opCall(ref ecrs.context.Context context) @nogc nothrow @trusted {
@@ -1900,12 +2026,9 @@ unittest {
 		e = ecrs.context.addEntity(context);
 		assert(ecrs.context.addComponent!Person(context, e) !is null);
 	}
-	uint seed = 12345;
+	auto random = fp.algorithms.createRandom(12345);
 	foreach (i; 0 .. 2 * n) {
-		seed = seed * 1103515245 + 12345;
-		immutable from = (seed >> 8) % n;
-		seed = seed * 1103515245 + 12345;
-		immutable to = (seed >> 8) % n;
+		immutable from = fp.algorithms.randomBelow(random, n), to = fp.algorithms.randomBelow(random, n);
 		assert(fp.dynarray.pushBack(ecrs.context.ensureComponent!(Edge, unique)(context, nodes[from]).related, nodes[to]));
 	}
 
