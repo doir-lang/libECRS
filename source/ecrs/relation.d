@@ -39,7 +39,8 @@ template Slot(bool canBeTerm) {
 
 // Hooks `Relates` or `RelatesEach` declare cover the whole struct, as `fp.lifecycle` reads them; the `*Besides` helpers cover the fields beyond the mixin's `skip`.
 
-/// Whether `a` and `b` agree on every field of `T` but `skip`, each compared through `fp.lifecycle.equal`: what `Relates` and `RelatesEach` compare besides their own field, so a struct mixing one in compares whole. It cannot fail.
+/// Whether `a` and `b` agree on every field of `T` but `skip`, each compared through `fp.lifecycle.equal`: what `Relates` and `RelatesEach` compare besides their own field, so a struct mixing one in compares whole.
+/// It cannot fail.
 ///
 /// Examples:
 /// ---
@@ -54,7 +55,8 @@ bool equalBesides(string skip, T)(auto ref const T a, auto ref const T b) {
 	return true;
 }
 
-/// `h` chained with the `fp.lifecycle.contentHash` of every field of `T` but `skip`, or `h` itself if there is none, so a relation of ids alone hashes as its slots do. It cannot fail.
+/// `h` chained with the `fp.lifecycle.contentHash` of every field of `T` but `skip`, or `h` itself if there is none, so a relation of ids alone hashes as its slots do.
+/// It cannot fail.
 ///
 /// Examples:
 /// ---
@@ -127,7 +129,8 @@ void remapBesides(string skip, T)(ref T value, const(ecrs.registry.EntityId)[] r
 			remapHeldIds(value.tupleof[i], remap);
 }
 
-/// Whether every field of `T` but `skip` can be encoded: it has encoding hooks of its own, as `ecrs.registry.hasSerialize` detects, or its lifetime is its bytes. A dynamic `Relates` declares its encoding hooks only then.
+/// Whether every field of `T` but `skip` can be encoded: it has encoding hooks of its own, as `ecrs.registry.hasSerialize` detects, or its lifetime is its bytes.
+/// A dynamic `Relates` declares its encoding hooks only then.
 ///
 /// Examples:
 /// ---
@@ -146,7 +149,8 @@ template encodableBesides(string skip, T) {
 	}();
 }
 
-/// Appends the encoding of every field of `T` but `skip` to `out_`: a field's own encoding hooks if it has them, as `ecrs.registry.hasSerialize` detects, otherwise its bytes, which a field that owns memory without such hooks cannot be. Returns false if allocation fails, leaving `out_` longer by what was written.
+/// Appends the encoding of every field of `T` but `skip` to `out_`: a field's own encoding hooks if it has them, as `ecrs.registry.hasSerialize` detects, otherwise its bytes, which a field that owns memory without such hooks cannot be.
+/// Returns false if allocation fails, leaving `out_` longer by what was written.
 ///
 /// Examples:
 /// ---
@@ -158,6 +162,7 @@ template encodableBesides(string skip, T) {
 /// assert(serializeBesides!"related"(w, bytes) && fp.dynarray.length(bytes) == int.sizeof);
 /// ---
 bool serializeBesides(string skip, T)(ref const T value, ref ubyte* out_) @trusted {
+	assert(out_ is null || fp.dynarray.valid(out_), "ecrs.relation: encoding into something that is not a dynarray");
 	static foreach (i; 0 .. T.tupleof.length)
 		static if (__traits(identifier, T.tupleof[i]) != skip) {{
 			alias F = typeof(T.tupleof[i]);
@@ -171,7 +176,8 @@ bool serializeBesides(string skip, T)(ref const T value, ref ubyte* out_) @trust
 	return true;
 }
 
-/// Ditto, reading what `serializeBesides` wrote into `value`'s fields besides `skip`, which must be empty, and advancing `data` past it. Returns false if `data` is too short or allocation fails, leaving `data` as it was and the fields it read to be ended with `endLifetimeBesides`.
+/// Ditto, reading what `serializeBesides` wrote into `value`'s fields besides `skip`, which must be empty, and advancing `data` past it.
+/// Returns false if `data` is too short or allocation fails, leaving `data` as it was and the fields it read to be ended with `endLifetimeBesides`.
 ///
 /// Examples:
 /// ---
@@ -183,6 +189,7 @@ bool serializeBesides(string skip, T)(ref const T value, ref ubyte* out_) @trust
 /// version(LittleEndian) assert(w.weight == 9);
 /// ---
 bool deserializeBesides(string skip, T)(ref T value, ref const(ubyte)[] data) @trusted {
+	assert(data.ptr !is null || data.length == 0, "ecrs.relation: data with a length but no bytes");
 	auto rest = data;
 	static foreach (i; 0 .. T.tupleof.length)
 		static if (__traits(identifier, T.tupleof[i]) != skip) {{
@@ -195,6 +202,7 @@ bool deserializeBesides(string skip, T)(ref T value, ref const(ubyte)[] data) @t
 				rest = rest[F.sizeof .. $];
 			}
 		}}
+	assert(rest.length <= data.length, "ecrs.relation: decoding read past its data");
 	data = rest;
 	return true;
 }
@@ -202,11 +210,15 @@ bool deserializeBesides(string skip, T)(ref T value, ref const(ubyte)[] data) @t
 
 // --- relations ---------------------------------------------------------------
 
-/// The body of a relation listing `n` related entities, or terms if `canBeTerm`: the `related` slots and every hook libECRS and `fp.lifecycle` find by name. Mixing it in as a struct's first member makes that struct a relation component of its own type, so two components of the same arity stay distinct. With `n` as `dynamicArity`, `related` is a growable dynarray the component owns: removing the component frees it, copying it with `fp.lifecycle.copyInto` copies it, and `ecrs.serialization` saves it through the encoding hooks.
+/// The body of a relation listing `n` related entities, or terms if `canBeTerm`: the `related` slots and every hook libECRS and `fp.lifecycle` find by name.
+/// Mixing it in as a struct's first member makes that struct a relation component of its own type, so two components of the same arity stay distinct.
+/// With `n` as `dynamicArity`, `related` is a growable dynarray the component owns: removing the component frees it, copying it with `fp.lifecycle.copyInto` copies it, and `ecrs.serialization` saves it through the encoding hooks.
 ///
-/// `contentHash` and `equal` read the slots rather than the dynarray pointer, so two relations relating the same entities hash and compare alike. An id the remap does not cover keeps its own, so `invalidEntity` maps to itself.
+/// `contentHash` and `equal` read the slots rather than the dynarray pointer, so two relations relating the same entities hash and compare alike.
+/// An id the remap does not cover keeps its own, so `invalidEntity` maps to itself.
 ///
-/// A fixed relation may name its slots: each of `names` becomes a `@property` reading and writing its slot of `related`, so `mixin Relates!(1, false, "parent")` reads `self.parent` for `self.related[0]`. The overload `Relates!("file", "level")` names a fixed entity relation of that many slots.
+/// A fixed relation may name its slots: each of `names` becomes a `@property` reading and writing its slot of `related`, so `mixin Relates!(1, false, "parent")` reads `self.parent` for `self.related[0]`.
+/// The overload `Relates!("file", "level")` names a fixed entity relation of that many slots.
 ///
 /// Examples:
 /// ---
@@ -271,6 +283,7 @@ mixin template Relates(size_t n = ecrs.relation.dynamicArity, bool canBeTerm = f
 	/// assert(next.related[0] == 3);
 	/// ---
 	static void remapEntities(ref typeof(this) self, const(ecrs.registry.EntityId)[] remap) @nogc nothrow {
+		assert(remap.length == 0 || remap[ecrs.registry.invalidEntity] == ecrs.registry.invalidEntity, "Relates: a renumbering that moves the invalid entity");
 		foreach (ref e; slots(self)) {
 			static if (canBeTerm) {
 				if (!e.isVar && e.constant < remap.length) e.constant = remap[e.constant];
@@ -321,7 +334,8 @@ mixin template Relates(size_t n = ecrs.relation.dynamicArity, bool canBeTerm = f
 	}
 
 	static if (isDynamic) {
-		/// Ends the lifetime, as `fp.lifecycle` defines it, by freeing `related`. Safe on an empty relation.
+		/// Ends the lifetime, as `fp.lifecycle` defines it, by freeing `related`.
+		/// Safe on an empty relation.
 		///
 		/// Examples:
 		/// ---
@@ -332,6 +346,7 @@ mixin template Relates(size_t n = ecrs.relation.dynamicArity, bool canBeTerm = f
 		/// many.finalize();
 		/// ---
 		void finalize() @nogc nothrow {
+			assert(related is null || fp.dynarray.valid(related), "Relates: related entities that are not a dynarray");
 			fp.dynarray.free(related);
 			related = null;
 			ecrs.relation.endLifetimeBesides!"related"(this);
@@ -351,15 +366,18 @@ mixin template Relates(size_t n = ecrs.relation.dynamicArity, bool canBeTerm = f
 		/// original.finalize();
 		/// ---
 		bool copyTo(ref typeof(this) dest) @nogc nothrow {
+			assert(&dest !is &this, "Relates: copying a relation onto itself");
 			dest.related = fp.dynarray.clone(related);
 			// `clone` gives null for a null source too, so only a non-null source can have been refused.
 			if (related !is null && dest.related is null) return false;
+			assert(fp.dynarray.length(dest.related) == fp.dynarray.length(related), "Relates: a copy with a different number of related entities");
 			if (ecrs.relation.copyBesides!"related"(dest, this)) return true;
 			fp.dynarray.free(dest.related);
 			return false;
 		}
 
-		/// The encoding hooks `ecrs.registry.hasSerialize` detects: the slot count, the slots' bytes, then the other fields as `serializeBesides` writes them, declared when `encodableBesides` holds. Returns false if allocation fails.
+		/// The encoding hooks `ecrs.registry.hasSerialize` detects: the slot count, the slots' bytes, then the other fields as `serializeBesides` writes them, declared when `encodableBesides` holds.
+		/// Returns false if allocation fails.
 		///
 		/// Examples:
 		/// ---
@@ -377,12 +395,16 @@ mixin template Relates(size_t n = ecrs.relation.dynamicArity, bool canBeTerm = f
 		/// ---
 		static bool serialize()(const ref typeof(this) self, ref ubyte* out_) @trusted @nogc nothrow if (ecrs.relation.encodableBesides!("related", typeof(this))) {
 			immutable ulong count = fp.dynarray.length(self.related);
-			return fp.dynarray.concatenate(out_, (cast(const(ubyte)*) &count)[0 .. count.sizeof])
+			immutable before = fp.dynarray.length(out_);
+			immutable written = fp.dynarray.concatenate(out_, (cast(const(ubyte)*) &count)[0 .. count.sizeof])
 				&& fp.dynarray.concatenate(out_, (cast(const(ubyte)*) self.related)[0 .. cast(size_t) count * MaybeTerm.sizeof])
 				&& ecrs.relation.serializeBesides!"related"(self, out_);
+			assert(!written || fp.dynarray.length(out_) >= before + count.sizeof + cast(size_t) count * MaybeTerm.sizeof, "Relates: an encoding shorter than its entities");
+			return written;
 		}
 
-		/// Ditto, reading what `serialize` wrote into the empty `self` and advancing `data` past it. Returns false if `data` is too short or allocation fails, leaving `self` empty and `data` as it was.
+		/// Ditto, reading what `serialize` wrote into the empty `self` and advancing `data` past it.
+		/// Returns false if `data` is too short or allocation fails, leaving `self` empty and `data` as it was.
 		///
 		/// Examples:
 		/// ---
@@ -404,10 +426,12 @@ mixin template Relates(size_t n = ecrs.relation.dynamicArity, bool canBeTerm = f
 				fp.pointer.copy((cast(ubyte*) self.related)[0 .. bytes], data[count.sizeof .. count.sizeof + bytes]);
 			}
 			auto rest = data[count.sizeof + bytes .. $];
+			assert(fp.dynarray.length(self.related) == count, "Relates: decoded a different number of entities than encoded");
 			if (!ecrs.relation.deserializeBesides!"related"(self, rest)) {
 				self.finalize();
 				return false;
 			}
+			assert(rest.length <= data.length - count.sizeof - bytes, "Relates: decoding read backwards");
 			data = rest;
 			return true;
 		}
@@ -427,7 +451,8 @@ mixin template Relates(names...) if (names.length > 0 && is(typeof(names[0]) : s
 	mixin ecrs.relation.Relates!(names.length, false, names);
 }
 
-/// A component listing `n` related entities, or terms if `canBeTerm`; see `Relates` for its hooks and lifetime. Mix `Relates` into a struct of your own instead when two components would otherwise share this type.
+/// A component listing `n` related entities, or terms if `canBeTerm`; see `Relates` for its hooks and lifetime.
+/// Mix `Relates` into a struct of your own instead when two components would otherwise share this type.
 ///
 /// Examples:
 /// ---
@@ -447,7 +472,9 @@ struct Relation(size_t n = dynamicArity, bool canBeTerm = false) {
 }
 
 
-/// Relabels every entity id `value` holds, `remap[old]` being the id `old` becomes: through its own `remapEntities` hook if it has one, which covers the whole value as a `Relates` does, otherwise through the hooks of each of its fields and static array elements, at any depth. So a struct whose fields mix in `Relates` needs no hook of its own to be remapped as an element of `RelatesEach`.
+// bounded: the nesting of `T`'s fields and elements, at compile time
+/// Relabels every entity id `value` holds, `remap[old]` being the id `old` becomes: through its own `remapEntities` hook if it has one, which covers the whole value as a `Relates` does, otherwise through the hooks of each of its fields and static array elements, at any depth.
+/// So a struct whose fields mix in `Relates` needs no hook of its own to be remapped as an element of `RelatesEach`.
 ///
 /// Examples:
 /// ---
@@ -469,7 +496,8 @@ void remapHeldIds(T)(ref T value, const(ecrs.registry.EntityId)[] remap) {
 	}
 }
 
-/// The body of a component listing elements of type `E`, each of which may hold entity ids through `Relates` fields, as a growable dynarray named `field` the component owns: the hooks libECRS and `fp.lifecycle` find by name, so such a list needs none written by hand. Renumbering relabels every element through `remapHeldIds`; removing the component ends each element's lifetime and frees the list; copying it copies each element; `contentHash` and `equal` read the elements through `fp.lifecycle`.
+/// The body of a component listing elements of type `E`, each of which may hold entity ids through `Relates` fields, as a growable dynarray named `field` the component owns: the hooks libECRS and `fp.lifecycle` find by name, so such a list needs none written by hand.
+/// Renumbering relabels every element through `remapHeldIds`; removing the component ends each element's lifetime and frees the list; copying it copies each element; `contentHash` and `equal` read the elements through `fp.lifecycle`.
 ///
 /// Examples:
 /// ---
@@ -509,6 +537,7 @@ mixin template RelatesEach(E, string field = "items") {
 	/// assert(list.items[0].related[0] == 5);
 	/// ---
 	static void remapEntities(ref typeof(this) self, const(ecrs.registry.EntityId)[] remap) @nogc nothrow {
+		assert(remap.length == 0 || remap[ecrs.registry.invalidEntity] == ecrs.registry.invalidEntity, "RelatesEach: a renumbering that moves the invalid entity");
 		foreach (ref element; elementsOf(self)) ecrs.relation.remapHeldIds(element, remap);
 		ecrs.relation.remapBesides!field(self, remap);
 	}
@@ -546,7 +575,8 @@ mixin template RelatesEach(E, string field = "items") {
 		return ecrs.relation.equalBesides!field(a, b);
 	}
 
-	/// Ends the lifetime, as `fp.lifecycle` defines it: ends every element's and frees the list. Safe on an empty list.
+	/// Ends the lifetime, as `fp.lifecycle` defines it: ends every element's and frees the list.
+	/// Safe on an empty list.
 	///
 	/// Examples:
 	/// ---
@@ -576,9 +606,11 @@ mixin template RelatesEach(E, string field = "items") {
 	/// assert(copy.items !is list.items && copy.items[0].related[0] == 1);
 	/// ---
 	bool copyTo(ref typeof(this) dest) @nogc nothrow {
+		assert(&dest !is &this, "RelatesEach: copying onto itself");
 		__traits(getMember, dest, field) = fp.dynarray.clone(__traits(getMember, this, field));
 		// `clone` gives null for a null source too, so only a non-null source can have been refused.
 		if (__traits(getMember, this, field) !is null && __traits(getMember, dest, field) is null) return false;
+		assert(fp.dynarray.length(__traits(getMember, dest, field)) == fp.dynarray.length(__traits(getMember, this, field)), "RelatesEach: a copy with a different number of elements");
 		if (ecrs.relation.copyBesides!field(dest, this)) return true;
 		fp.dynarray.free(__traits(getMember, dest, field));
 		return false;

@@ -1,6 +1,9 @@
 /// The simplest serialization there is: `serialize` copies out the entity table and every component whose bytes are its whole value, and `deserialize` copies them back into a fresh `Context`.
 ///
-/// Entity ids round-trip exactly, freed ones included, so a component holding ids, such as an `ecrs.relation.Relation`, needs no remapping. A type that encodes itself, as `ecrs.registry.hasSerialize` detects, such as a dynamic relation, is written through its hooks instead; one that holds pointers, as `ecrs.registry.Hooks.opaque` marks it, but does not encode itself is left out. Components are matched by registered name, so the loading program must register every saved type first. The bytes are native: they load only where endianness and struct layout match.
+/// Entity ids round-trip exactly, freed ones included, so a component holding ids, such as an `ecrs.relation.Relation`, needs no remapping.
+/// A type that encodes itself, as `ecrs.registry.hasSerialize` detects, such as a dynamic relation, is written through its hooks instead; one that holds pointers, as `ecrs.registry.Hooks.opaque` marks it, but does not encode itself is left out.
+/// Components are matched by registered name, so the loading program must register every saved type first.
+/// The bytes are native: they load only where endianness and struct layout match.
 module ecrs.serialization;
 
 
@@ -23,7 +26,10 @@ private enum uint formatVersion = 2;
 
 // wrapper: views a value as the bytes the encoding writes
 private bool put(ref ubyte* out_, const(void)[] bytes) @trusted {
-	return fp.dynarray.concatenate(out_, cast(const(ubyte)[]) bytes);
+	immutable before = fp.dynarray.length(out_);
+	immutable written = fp.dynarray.concatenate(out_, cast(const(ubyte)[]) bytes);
+	assert(fp.dynarray.length(out_) == before + (written ? bytes.length : 0), "ecrs.serialization: wrote the wrong number of bytes");
+	return written;
 }
 
 // wrapper: views a value as the bytes the encoding writes
@@ -46,13 +52,16 @@ private bool writeSection(ref ubyte* out_, const ref ecrs.storage.Storage storag
 	if (!putValue(out_, cast(ulong) named.length) || !put(out_, named)) return false;
 	if (!putValue(out_, cast(ulong) storage.elementSize) || !putValue(out_, cast(ubyte)(encode !is null))) return false;
 	if (!putValue(out_, cast(ulong) ecrs.storage.liveCount(storage))) return false;
+	size_t written = 0;
 	foreach (slot; 0 .. ecrs.storage.slotCount(storage)) {
 		immutable owner = ecrs.storage.owner(storage, slot);
 		if (owner == invalidEntity) continue;
 		auto element = ecrs.storage.get(storage, slot);
 		if (!putValue(out_, owner)) return false;
 		if (encode !is null ? !encode(element, out_) : !put(out_, element[0 .. storage.elementSize])) return false;
+		++written;
 	}
+	assert(written == ecrs.storage.liveCount(storage), "ecrs.serialization: a section whose count disagrees with its components");
 	return true;
 }
 
@@ -68,12 +77,15 @@ private bool writeContext(ref ubyte* out_, const ref ecrs.context.Context self) 
 	foreach (id; 0 .. ecrs.context.storageCount(self))
 		if (serializable(self, id)) ++sections;
 	if (!putValue(out_, sections)) return false;
+	assert(sections <= ecrs.context.storageCount(self), "ecrs.serialization: more sections than storages");
 	foreach (id; 0 .. ecrs.context.storageCount(self))
 		if (serializable(self, id) && !writeSection(out_, *ecrs.context.getStorage(self, id), id)) return false;
+	assert(fp.dynarray.length(out_) >= magic.length + formatVersion.sizeof + 3 * ulong.sizeof, "ecrs.serialization: an encoding shorter than its header");
 	return true;
 }
 
-/// Writes `self` into a new byte dynarray, which the caller releases with `fp.dynarray.free`: the entity table's length, the freelist, and every component with its owner, as its bytes or through its type's encoding hooks. Opaque components without those hooks are left out.
+/// Writes `self` into a new byte dynarray, which the caller releases with `fp.dynarray.free`: the entity table's length, the freelist, and every component with its owner, as its bytes or through its type's encoding hooks.
+/// Opaque components without those hooks are left out.
 ///
 /// Returns null if allocation fails.
 ///
@@ -88,6 +100,7 @@ private bool writeContext(ref ubyte* out_, const ref ecrs.context.Context self) 
 /// fp.dynarray.free(bytes);
 /// ---
 ubyte* serialize(const ref ecrs.context.Context self) @trusted {
+	assert(!ecrs.context.inTransaction(self), "ecrs.serialization: serializing in the middle of a transaction");
 	ubyte* out_ = null;
 	if (writeContext(out_, self)) return out_;
 	fp.dynarray.free(out_);
@@ -96,21 +109,19 @@ ubyte* serialize(const ref ecrs.context.Context self) @trusted {
 
 
 private bool take(ref const(ubyte)[] data, void* dest, size_t n) @trusted {
+	assert(dest !is null || n == 0, "ecrs.serialization: taking bytes into nowhere");
 	if (data.length < n) return false;
+	immutable before = data.length;
 	fp.pointer.copy((cast(ubyte*) dest)[0 .. n], data[0 .. n]);
 	data = data[n .. $];
+	assert(data.length == before - n, "ecrs.serialization: took the wrong number of bytes");
 	return true;
-}
-
-// wrapper: views a value as the bytes the encoding writes
-private bool takeValue(T)(ref const(ubyte)[] data, out T value) @trusted {
-	return take(data, &value, T.sizeof);
 }
 
 private bool readSection(ref ecrs.context.Context self, ref const(ubyte)[] data) @trusted {
 	ulong nameLength, elementSize, count;
 	ubyte encoded;
-	if (!takeValue(data, nameLength) || nameLength == 0 || nameLength > data.length) return false;
+	if (!take(data, &nameLength, nameLength.sizeof) || nameLength == 0 || nameLength > data.length) return false;
 	auto name = cast(const(char)[]) data[0 .. cast(size_t) nameLength];
 	data = data[name.length .. $];
 	if (fp.string.sliceTerminated(name.ptr).length + 1 != name.length) return false;
@@ -119,13 +130,14 @@ private bool readSection(ref ecrs.context.Context self, ref const(ubyte)[] data)
 	if (id == fp.pointer.notFound) return false;
 	immutable hooks = ecrs.registry.hooksOf(id);
 	immutable decode = hooks.deserializeFunction;
-	if (!takeValue(data, elementSize) || elementSize != ecrs.registry.elementSizeOf(id)) return false;
-	if (!takeValue(data, encoded) || encoded != (decode !is null) || (decode is null && hooks.opaque)) return false;
-	if (!takeValue(data, count)) return false;
+	if (!take(data, &elementSize, elementSize.sizeof) || elementSize != ecrs.registry.elementSizeOf(id)) return false;
+	if (!take(data, &encoded, encoded.sizeof) || encoded != (decode !is null) || (decode is null && hooks.opaque)) return false;
+	if (!take(data, &count, count.sizeof)) return false;
 	immutable size = cast(size_t) elementSize;
 	foreach (_; 0 .. count) {
+		immutable remaining = data.length;
 		EntityId owner;
-		if (!takeValue(data, owner) || owner == invalidEntity || owner >= fp.dynarray.length(self.indexTable)) return false;
+		if (!take(data, &owner, owner.sizeof) || owner == invalidEntity || owner >= fp.dynarray.length(self.indexTable)) return false;
 		if ((decode is null && data.length < size) || ecrs.context.hasComponent(self, owner, id)) return false;
 		void* p = ecrs.context.addComponent(self, owner, id, size);
 		if (p is null) return false;
@@ -134,6 +146,8 @@ private bool readSection(ref ecrs.context.Context self, ref const(ubyte)[] data)
 			if (!decode(p, data)) return false;
 		} else
 			cast(void) take(data, p, size); // length checked above
+		assert(data.length < remaining, "ecrs.serialization: a component that read no bytes");
+		assert(ecrs.context.hasComponent(self, owner, id), "ecrs.serialization: a decoded component its owner does not have");
 	}
 	return true;
 }
@@ -148,11 +162,12 @@ private bool freeEntities(ref ecrs.context.Context self, const(ubyte)[] freedIds
 	freed[0 .. n] = false;
 	while (freedIds.length > 0) {
 		ulong e;
-		cast(void) takeValue(freedIds, e); // the caller sliced whole ids
+		cast(void) take(freedIds, &e, e.sizeof); // the caller sliced whole ids
 		if (e == invalidEntity || e >= n || freed[cast(size_t) e]) return false;
 		freed[cast(size_t) e] = true;
 		if (!ecrs.context.removeEntity(self, cast(EntityId) e)) return false;
 	}
+	assert(fp.dynarray.length(self.freelist) <= n, "ecrs.serialization: more freed entities than the table holds");
 	return true;
 }
 
@@ -160,25 +175,27 @@ private bool readContext(ref ecrs.context.Context self, const(ubyte)[] data) @tr
 	char[4] fileMagic;
 	uint fileVersion;
 	if (!take(data, fileMagic.ptr, magic.length) || fileMagic != magic) return false;
-	if (!takeValue(data, fileVersion) || fileVersion != formatVersion) return false;
+	if (!take(data, &fileVersion, fileVersion.sizeof) || fileVersion != formatVersion) return false;
 
 	ulong entityTableLength, freedCount, sections;
-	if (!takeValue(data, entityTableLength) || entityTableLength == 0 || entityTableLength > EntityId.max) return false;
+	if (!take(data, &entityTableLength, entityTableLength.sizeof) || entityTableLength == 0 || entityTableLength > EntityId.max) return false;
 	foreach (_; 1 .. cast(size_t) entityTableLength)
 		if (ecrs.context.addEntity(self) == invalidEntity) return false;
+	assert(fp.dynarray.length(self.indexTable) == entityTableLength, "ecrs.serialization: a table of the wrong length");
 
 	// Freed ids are applied after the components, which may only be given to entities that exist.
-	if (!takeValue(data, freedCount) || freedCount > data.length / ulong.sizeof) return false;
+	if (!take(data, &freedCount, freedCount.sizeof) || freedCount > data.length / ulong.sizeof) return false;
 	auto freedIds = data[0 .. cast(size_t) freedCount * ulong.sizeof];
 	data = data[freedIds.length .. $];
 
-	if (!takeValue(data, sections)) return false;
+	if (!take(data, &sections, sections.sizeof)) return false;
 	foreach (_; 0 .. sections)
 		if (!readSection(self, data)) return false;
 	return data.length == 0 && freeEntities(self, freedIds);
 }
 
-/// Loads what `serialize` wrote into `self`, which must be fresh from `ecrs.context.create`, so every entity keeps its id and freed ids stay freed. Every saved component type must already be registered under the same name and size, encoding itself just as it did when saved; `ecrs.registry.register` does that up front.
+/// Loads what `serialize` wrote into `self`, which must be fresh from `ecrs.context.create`, so every entity keeps its id and freed ids stay freed.
+/// Every saved component type must already be registered under the same name and size, encoding itself just as it did when saved; `ecrs.registry.register` does that up front.
 ///
 /// Returns false if `data` is malformed, names a type that is unknown, resized or now encoded differently, or allocation fails, leaving `self` as a fresh context again.
 ///
@@ -199,9 +216,13 @@ private bool readContext(ref ecrs.context.Context self, const(ubyte)[] data) @tr
 /// ---
 bool deserialize(ref ecrs.context.Context self, const(ubyte)[] data) {
 	assert(fp.dynarray.length(self.indexTable) <= 1 && fp.dynarray.length(self.freelist) == 0, "ecrs: deserialize needs a fresh context");
-	if (readContext(self, data)) return true;
+	if (readContext(self, data)) {
+		assert(ecrs.context.validate(self), "ecrs.serialization: decoded a store that breaks its invariants");
+		return true;
+	}
 	ecrs.context.free(self);
 	self = ecrs.context.create();
+	assert(ecrs.context.entityCount(self) <= 1, "ecrs.serialization: a refused decode left entities");
 	return false;
 }
 

@@ -1,4 +1,5 @@
-/// Type inference in Datalog over a tiny expression language, whose syntax tree is entities and relation components. Rules propagate types from literals and annotations through bindings, additions and calls, then flag ill-typed expressions by negation.
+/// Type inference in Datalog over a tiny expression language, whose syntax tree is entities and relation components.
+/// Rules propagate types from literals and annotations through bindings, additions and calls, then flag ill-typed expressions by negation.
 ///
 /// The program it checks:
 /// ---

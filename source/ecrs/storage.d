@@ -1,8 +1,11 @@
 /// Per-component-type storage, `Storage`, and the `Tag` trait components can opt into.
 ///
-/// Element bytes live in an `fp.pagedarray`, so a component's address never changes while it exists: a query may hold a `ref` to one while nested queries add more. Each slot also records its owning entity, so finding a slot's entity is O(1). Removal leaves a hole for the next add to reuse rather than moving another component into the gap; only `reorder` and the sorts move components, and they also trim trailing holes.
+/// Element bytes live in an `fp.pagedarray`, so a component's address never changes while it exists: a query may hold a `ref` to one while nested queries add more.
+/// Each slot also records its owning entity, so finding a slot's entity is O(1).
+/// Removal leaves a hole for the next add to reuse rather than moving another component into the gap; only `reorder` and the sorts move components, and they also trim trailing holes.
 ///
-/// Components follow `fp.lifecycle`: a type with a `finalize()` or destructor has it run once, when the component is removed or its storage freed. Every slot that holds no component is empty, all zero bytes, except one `detach` took, which keeps its bytes until `release` or `reattach`.
+/// Components follow `fp.lifecycle`: a type with a `finalize()` or destructor has it run once, when the component is removed or its storage freed.
+/// Every slot that holds no component is empty, all zero bytes, except one `detach` took, which keeps its bytes until `release` or `reattach`.
 module ecrs.storage;
 
 static import core.atomic;
@@ -21,7 +24,8 @@ public import ecrs.registry : EntityId, invalidEntity;
 @nogc nothrow:
 
 
-/// One entity's index list: a dynarray holding, for each component id, `Storage.absent` or the slot of the entity's component in that component's storage. Slots are 32-bit, since an entity's list runs to the highest component id it has and most of a large store is these lists.
+/// One entity's index list: a dynarray holding, for each component id, `Storage.absent` or the slot of the entity's component in that component's storage.
+/// Slots are 32-bit, since an entity's list runs to the highest component id it has and most of a large store is these lists.
 alias IndexList = uint*;
 
 /// Every entity's index list, as a dynarray indexed by entity id.
@@ -78,6 +82,7 @@ struct Storage {
 	private size_t live = 0;
 	private ecrs.registry.RemapFunction remapFunction = null;
 	private size_t changes = 0; // atomic; see `generation`
+	private bool observed = true; // atomic; whether `generation` returned `changes` since it last advanced; a missing storage reads as 0, so the first change must advance it
 	package bool journaled = false; // whether the open transaction has recorded where to `restore` this storage to
 	package size_t claimLimit = 0; // while concurrent writes add to it, the end of the slots `prepareClaims` made
 	package size_t claimBase; // where those slots begin
@@ -97,7 +102,9 @@ struct Storage {
 /// free(storage);
 /// ---
 size_t slotCount(const ref Storage self) @trusted {
-	return fp.dynarray.length(cast(EntityId*) self.slotOwners);
+	immutable slots = fp.dynarray.length(cast(EntityId*) self.slotOwners);
+	assert(slots == fp.pagedarray.length(self.elements), "ecrs: a storage's owners and elements disagree in length");
+	return slots;
 }
 
 // wrapper: reads a private field
@@ -109,7 +116,10 @@ size_t slotCount(const ref Storage self) @trusted {
 /// assert(liveCount(storage) == 0);
 /// free(storage);
 /// ---
-size_t liveCount(const ref Storage self) { return self.live; }
+size_t liveCount(const ref Storage self) {
+	assert(self.claimLimit || self.live <= slotCount(self), "ecrs: more live components than slots");
+	return self.live;
+}
 
 /// Whether no slot holds a component.
 ///
@@ -119,7 +129,10 @@ size_t liveCount(const ref Storage self) { return self.live; }
 /// assert(empty(storage));
 /// free(storage);
 /// ---
-bool empty(const ref Storage self) { return self.live == 0; }
+bool empty(const ref Storage self) {
+	assert(self.claimLimit || self.live <= slotCount(self), "ecrs: more live components than slots");
+	return self.live == 0;
+}
 
 /// Each slot's owner, `invalidEntity` for a hole: the entities that have this component.
 ///
@@ -148,12 +161,14 @@ const(EntityId)[] slotOwnersOf(const ref Storage self) @trusted {
 /// fp.dynarray.free(indices);
 /// ---
 EntityId owner(const ref Storage self, size_t slot) @trusted {
-	assert(slot < slotCount(self));
+	assert(slot < slotCount(self), "ecrs: the owner of a slot past the storage");
+	assert(self.slotOwners[slot] == invalidEntity || self.slotOwners[slot] < EntityId.max, "ecrs: a slot owned by an id never made");
 	return self.slotOwners[slot];
 }
 
-// wrapper: reads a private field
-/// A counter that advances on every change to `self`, including every access through `getForWriting`, since its caller may write through the pointer; reads through `get` leave it alone. Equal generations mean unchanged contents. Atomic, because parallel schedules may write distinct entities at once.
+/// A counter that advances on a change to `self`, including an access through `getForWriting`, since its caller may write through the pointer; reads through `get` leave it alone.
+/// Equal generations mean unchanged contents: a change made after a call to `generation` advances the counter past what that call returned, while changes nobody has observed in between share one step.
+/// Atomic, because parallel schedules may write distinct entities at once.
 ///
 /// Examples:
 /// ---
@@ -169,16 +184,22 @@ EntityId owner(const ref Storage self, size_t slot) @trusted {
 /// fp.dynarray.free(indices);
 /// ---
 size_t generation(const ref Storage self) @trusted {
+	// Marking the count seen is not a change to the contents, so it writes through the const view.
+	auto observed = &(cast(Storage*) &self).observed;
+	if (!core.atomic.atomicLoad!(core.atomic.MemoryOrder.raw)(bc.platform.asShared(*observed))) core.atomic.atomicStore(bc.platform.asShared(*observed), true);
 	return core.atomic.atomicLoad(bc.platform.asShared(self.changes));
 }
 
 private void touch(ref Storage self) @trusted {
-	// Concurrent writers would contend for one counter, so a phase counts once, at its end; reading the flag first keeps its line shared.
-	if (!self.quiet) core.atomic.atomicOp!"+="(bc.platform.asShared(self.changes), 1);
+	// Threads writing one storage would contend for its counter, so a write advances it only after `generation` observed it, and a quiet phase counts once, at its end.
+	if (!self.quiet) {
+		if (core.atomic.atomicLoad!(core.atomic.MemoryOrder.raw)(bc.platform.asShared(self.observed)) && core.atomic.cas(&bc.platform.asShared(self.observed), true, false)) core.atomic.atomicOp!"+="(bc.platform.asShared(self.changes), 1);
+	}
 	else if (!core.atomic.atomicLoad!(core.atomic.MemoryOrder.raw)(bc.platform.asShared(self.touchedQuietly))) core.atomic.atomicStore!(core.atomic.MemoryOrder.raw)(bc.platform.asShared(self.touchedQuietly), true);
 }
 
-/// Ends the quiet a concurrent phase put `self` in, counting one change if it was accessed mutably meanwhile, so its generation still says whether its contents may differ. It cannot fail.
+/// Ends the quiet a concurrent phase put `self` in, counting one change if it was accessed mutably meanwhile, so its generation still says whether its contents may differ.
+/// It cannot fail.
 ///
 /// Examples:
 /// ---
@@ -198,6 +219,7 @@ private void touch(ref Storage self) @trusted {
 /// fp.dynarray.free(indices);
 /// ---
 package void endQuiet(ref Storage self) @trusted {
+	assert(self.quiet, "ecrs: ending a quiet phase that did not begin");
 	self.quiet = false;
 	if (!self.touchedQuietly) return;
 	self.touchedQuietly = false;
@@ -205,7 +227,8 @@ package void endQuiet(ref Storage self) @trusted {
 }
 
 // wrapper: reads an element of a private paged array
-/// The component in slot `i`, which must be below `size`, for reading; the typed form checks that `T` is the right size. Reading counts no change.
+/// The component in slot `i`, which must be below `size`, for reading; the typed form checks that `T` is the right size.
+/// Reading counts no change.
 ///
 /// Examples:
 /// ---
@@ -224,11 +247,13 @@ package void endQuiet(ref Storage self) @trusted {
 const(void)* get(const ref Storage self, size_t i) { return fp.pagedarray.get(self.elements, i); }
 /// Ditto
 ref const(T) get(T)(const ref Storage self, size_t i) @trusted {
-	assert(T.sizeof == self.elementSize);
+	assert(T.sizeof == self.elementSize, "ecrs: reading a component as the wrong type");
+	assert(i < slotCount(self) && self.slotOwners[i] != invalidEntity, "ecrs: reading a hole or past the storage");
 	return *cast(const(T)*) get(self, i);
 }
 
-/// The component in slot `i`, which must be below `size`, for writing: counts a change, since the caller may write through it. The typed form checks that `T` is the right size.
+/// The component in slot `i`, which must be below `size`, for writing: counts a change, since the caller may write through it.
+/// The typed form checks that `T` is the right size.
 ///
 /// Examples:
 /// ---
@@ -244,18 +269,22 @@ ref const(T) get(T)(const ref Storage self, size_t i) @trusted {
 /// fp.dynarray.free(indices[1]);
 /// fp.dynarray.free(indices);
 /// ---
-void* getForWriting(ref Storage self, size_t i) {
+void* getForWriting(ref Storage self, size_t i) @trusted {
+	assert(i < fp.pagedarray.length(self.elements), "ecrs: writing past the storage");
+	// No assert compares generations around `touch`: another writer may take the observation and advance the count after this thread looks.
 	touch(self);
 	return fp.pagedarray.get(self.elements, i);
 }
 /// Ditto
 ref T getForWriting(T)(ref Storage self, size_t i) @trusted {
-	assert(T.sizeof == self.elementSize);
+	assert(T.sizeof == self.elementSize, "ecrs: writing a component as the wrong type");
+	assert(i < slotCount(self) && self.slotOwners[i] != invalidEntity, "ecrs: writing a hole or past the storage");
 	return *cast(T*) getForWriting(self, i);
 }
 
 
-/// An empty storage of `elementSize`-byte components, whose lifetimes `finalizer` ends and whose entity ids `remapFunction` relabels, either of which may be null. Allocates nothing until the first `add`, so it cannot fail.
+/// An empty storage of `elementSize`-byte components, whose lifetimes `finalizer` ends and whose entity ids `remapFunction` relabels, either of which may be null.
+/// Allocates nothing until the first `add`, so it cannot fail.
 ///
 /// Examples:
 /// ---
@@ -270,10 +299,12 @@ Storage create(size_t elementSize, fp.lifecycle.Finalizer finalizer = null, ecrs
 	self.elements = fp.pagedarray.create(elementSize);
 	self.elements.finalizer = finalizer;
 	self.remapFunction = remapFunction;
+	assert(slotCount(self) == 0 && self.live == 0, "ecrs: a new storage that is not empty");
 	return self;
 }
 
-/// Ends every component's lifetime and frees what `self` owns, leaving it as `Storage.init`. Index lists still naming its slots must be freed or reset too.
+/// Ends every component's lifetime and frees what `self` owns, leaving it as `Storage.init`.
+/// Index lists still naming its slots must be freed or reset too.
 ///
 /// Examples:
 /// ---
@@ -282,6 +313,7 @@ Storage create(size_t elementSize, fp.lifecycle.Finalizer finalizer = null, ecrs
 /// assert(storage.elementSize == Storage.unknownSize);
 /// ---
 void free(ref Storage self) @trusted {
+	assert(!self.claimLimit, "ecrs: freeing a storage with claims still open");
 	// Holes are empty, which `fp.lifecycle` requires finalizing to accept.
 	fp.pagedarray.free(self.elements);
 	fp.dynarray.free(self.slotOwners);
@@ -296,10 +328,12 @@ private bool ensureIndexSlot(ref IndexList indices, size_t componentId) @trusted
 	if (fp.dynarray.growToSize(indices, componentId + 1) is null) return false;
 	foreach (i; oldLength .. componentId + 1)
 		indices[i] = Storage.absent;
+	assert(fp.dynarray.length(indices) == componentId + 1, "ecrs: an index list grown to the wrong length");
 	return true;
 }
 
-/// Gives entity `e` an empty, zero-filled slot for component `componentId`, reusing a hole if there is one, and records it in `e`'s index list, which `indexTable` must already have. `e` must not have this component yet.
+/// Gives entity `e` an empty, zero-filled slot for component `componentId`, reusing a hole if there is one, and records it in `e`'s index list, which `indexTable` must already have.
+/// `e` must not have this component yet.
 ///
 /// Returns the slot, or null if allocation fails, leaving `self` as it was; `e`'s index list may have grown, its new entries `Storage.absent`.
 ///
@@ -318,13 +352,14 @@ private bool ensureIndexSlot(ref IndexList indices, size_t componentId) @trusted
 /// fp.dynarray.free(indices);
 /// ---
 void* add(ref Storage self, size_t componentId, ref IndexTable indexTable, EntityId e) @trusted {
-	assert(e != invalidEntity && e < fp.dynarray.length(indexTable));
+	assert(e != invalidEntity && e < fp.dynarray.length(indexTable), "ecrs: adding a component to an entity the table does not have");
 	if (!ensureIndexSlot(indexTable[e], componentId)) return null;
-	assert(indexTable[e][componentId] == Storage.absent);
+	assert(indexTable[e][componentId] == Storage.absent, "ecrs: adding a component the entity already has");
 	if (self.claimLimit) {
 		// Concurrent writes: slots were made beforehand, so taking one moves nothing another thread reads.
 		immutable claimed = core.atomic.atomicOp!"+="(bc.platform.asShared(self.claimNext), 1) - 1;
 		assert(claimed < self.claimLimit, "ecrs: more concurrent additions to a storage than `reserveConcurrentAdds` allowed");
+		assert(claimed >= self.claimBase && self.slotOwners[claimed] == invalidEntity, "ecrs: a claimed slot already owned");
 		self.slotOwners[claimed] = e;
 		indexTable[e][componentId] = cast(uint) claimed;
 		void* q = fp.pagedarray.get(self.elements, claimed);
@@ -345,16 +380,19 @@ void* add(ref Storage self, size_t componentId, ref IndexTable indexTable, Entit
 		slot = slotCount(self) - 1;
 	}
 	assert(slot < Storage.absent, "ecrs: a storage's slots must stay below Storage.absent");
+	assert(self.slotOwners[slot] == invalidEntity, "ecrs: a component added over a live one");
 	self.slotOwners[slot] = e;
 	indexTable[e][componentId] = cast(uint) slot;
 	++self.live;
 
 	void* p = getForWriting(self, slot);
 	fp.pointer.fill((cast(ubyte*) p)[0 .. self.elementSize], 0);
+	assert(self.live <= slotCount(self), "ecrs: more live components than slots");
 	return p;
 }
 
-/// Ditto, for component `(T, unique)`, with the slot holding `T.init`. Returns null also if `T` cannot be registered.
+/// Ditto, for component `(T, unique)`, with the slot holding `T.init`.
+/// Returns null also if `T` cannot be registered.
 ///
 /// Examples:
 /// ---
@@ -372,6 +410,7 @@ void* add(ref Storage self, size_t componentId, ref IndexTable indexTable, Entit
 /// ---
 template add(T, size_t unique = 0) {
 	T* add(ref Storage self, ref IndexTable indexTable, EntityId e) @trusted {
+		assert(self.elementSize == T.sizeof, "ecrs: adding a component of the wrong type");
 		immutable id = ecrs.registry.componentId!(T, unique)();
 		if (id == fp.pointer.notFound) return null;
 		auto p = cast(T*) .add(self, id, indexTable, e);
@@ -383,7 +422,8 @@ template add(T, size_t unique = 0) {
 }
 
 
-/// Ends entity `e`'s component `componentId`'s lifetime and releases its slot. No other component moves: the last slot is popped, and any other becomes a hole.
+/// Ends entity `e`'s component `componentId`'s lifetime and releases its slot.
+/// No other component moves: the last slot is popped, and any other becomes a hole.
 ///
 /// Returns false, changing nothing, if `e` has no such component; it cannot otherwise fail.
 ///
@@ -403,13 +443,16 @@ template add(T, size_t unique = 0) {
 /// fp.dynarray.free(indices);
 /// ---
 bool remove(ref Storage self, size_t componentId, ref IndexTable indexTable, EntityId e) @trusted {
+	immutable live = self.live;
 	immutable slot = detach(self, componentId, indexTable, e);
 	if (slot == Storage.noSlot) return false;
 	release(self, slot);
+	assert(self.live == live - 1, "ecrs: a removal that did not end one component");
 	return true;
 }
 
-/// Takes entity `e`'s component `componentId` off `e` without ending its lifetime: the slot keeps its bytes and reads as a hole, but no `add` reuses it until `release` frees it or `reattach` gives it back. A transaction removes components this way so a rollback cannot fail.
+/// Takes entity `e`'s component `componentId` off `e` without ending its lifetime: the slot keeps its bytes and reads as a hole, but no `add` reuses it until `release` frees it or `reattach` gives it back.
+/// A transaction removes components this way so a rollback cannot fail.
 ///
 /// Returns the slot, or `Storage.noSlot`, changing nothing, if `e` has no such component.
 ///
@@ -435,6 +478,9 @@ package size_t detach(ref Storage self, size_t componentId, ref IndexTable index
 	if (fp.dynarray.length(indices) <= componentId || indices[componentId] == Storage.absent)
 		return Storage.noSlot;
 	immutable size_t slot = indices[componentId];
+	assert(slot < slotCount(self) && self.slotOwners[slot] == e, "ecrs: an index naming a slot another entity owns");
+	// While claims are open the claimed slots are not yet counted live, so the count may dip below zero until endClaims.
+	assert(self.live > 0 || self.claimLimit, "ecrs: detaching from a storage with nothing live");
 	indices[componentId] = Storage.absent;
 	self.slotOwners[slot] = invalidEntity;
 	core.atomic.atomicOp!"-="(bc.platform.asShared(self.live), 1);
@@ -442,7 +488,8 @@ package size_t detach(ref Storage self, size_t componentId, ref IndexTable index
 	return slot;
 }
 
-/// Makes `n` empty slots past the end, for `add` to hand out from any thread until `endClaims`, so that adding moves nothing another thread may read. False on refusal, leaving `self` as it was.
+/// Makes `n` empty slots past the end, for `add` to hand out from any thread until `endClaims`, so that adding moves nothing another thread may read.
+/// False on refusal, leaving `self` as it was.
 ///
 /// Examples:
 /// ---
@@ -466,10 +513,12 @@ package bool prepareClaims(ref Storage self, size_t n) @trusted {
 	foreach (i; 0 .. n) cast(void) fp.dynarray.pushBack(self.slotOwners, invalidEntity); // reserved above
 	self.claimBase = self.claimNext = base;
 	self.claimLimit = base + n;
+	assert(slotCount(self) == self.claimLimit, "ecrs: prepared slots that disagree with the claims");
 	return true;
 }
 
-/// Ends what `prepareClaims` began, giving back the slots no `add` took. It cannot fail.
+/// Ends what `prepareClaims` began, giving back the slots no `add` took.
+/// It cannot fail.
 ///
 /// Examples:
 /// ---
@@ -481,6 +530,7 @@ package bool prepareClaims(ref Storage self, size_t n) @trusted {
 /// ---
 package void endClaims(ref Storage self) @trusted {
 	if (!self.claimLimit) return;
+	assert(self.claimBase <= self.claimNext && self.claimNext <= self.claimLimit, "ecrs: claims outside the slots prepared for them");
 	// Claimed slots were left out of the live count, which every claim would otherwise have contended for.
 	self.live += self.claimNext - self.claimBase;
 	immutable unclaimed = self.claimLimit - self.claimNext;
@@ -490,9 +540,11 @@ package void endClaims(ref Storage self) @trusted {
 	}
 	self.claimLimit = 0;
 	touch(self);
+	assert(self.live <= slotCount(self), "ecrs: more live components than slots after the claims");
 }
 
-/// Gives the slot `detach` took back to entity `e`, whose index list must still have room for `componentId` and must not name another slot for it. It cannot fail.
+/// Gives the slot `detach` took back to entity `e`, whose index list must still have room for `componentId` and must not name another slot for it.
+/// It cannot fail.
 ///
 /// Examples:
 /// ---
@@ -515,9 +567,11 @@ package void reattach(ref Storage self, size_t componentId, ref IndexTable index
 	indexTable[e][componentId] = cast(uint) slot;
 	++self.live;
 	touch(self);
+	assert(self.live <= slotCount(self), "ecrs: more live components than slots");
 }
 
-/// Ends the lifetime of the component in `slot`, which no entity owns any more, and frees the slot: the last slot is popped, and any other becomes a hole. It cannot fail.
+/// Ends the lifetime of the component in `slot`, which no entity owns any more, and frees the slot: the last slot is popped, and any other becomes a hole.
+/// It cannot fail.
 ///
 /// Examples:
 /// ---
@@ -546,6 +600,7 @@ package void release(ref Storage self, size_t slot) @trusted {
 	fp.pointer.fill((cast(ubyte*) p)[0 .. self.elementSize], 0);
 	// A hole missing from the list just waits for the next reorder to reclaim it.
 	cast(void) fp.dynarray.pushBack(self.holes, slot);
+	assert(fp.dynarray.length(self.holes) <= slotCount(self), "ecrs: more holes than slots");
 }
 
 // wrapper: reads a private field
@@ -561,7 +616,9 @@ package size_t holeCount(const ref Storage self) @trusted {
 	return fp.dynarray.length(cast(size_t*) self.holes);
 }
 
-/// Undoes every `add` since the storage had `oldSize` slots and `oldHoles` holes, for a transaction rollback: the slots added past `oldSize` and the holes reused are taken off their owners, their components' lifetimes end, and both lists are as they were. Nothing may have released a slot in between, which a transaction never does until it commits. It cannot fail.
+/// Undoes every `add` since the storage had `oldSize` slots and `oldHoles` holes, for a transaction rollback: the slots added past `oldSize` and the holes reused are taken off their owners, their components' lifetimes end, and both lists are as they were.
+/// Nothing may have released a slot in between, which a transaction never does until it commits.
+/// It cannot fail.
 ///
 /// Examples:
 /// ---
@@ -597,6 +654,7 @@ package void restore(ref Storage self, size_t componentId, ref IndexTable indexT
 		cast(void) fp.dynarray.removeLast(self.slotOwners, added);
 	}
 	touch(self);
+	assert(slotCount(self) == oldSize && holeCount(self) == oldHoles, "ecrs: a restore that did not return to the old size");
 }
 
 /// Ends the lifetime of a component of this storage's type at `p`, which need not be in the storage, leaving its bytes for the caller to zero or reuse.
@@ -611,6 +669,7 @@ package void restore(ref Storage self, size_t componentId, ref IndexTable indexT
 /// assert(o.data is null);
 /// ---
 package void finalizeBytes(ref Storage self, void* p) @trusted {
+	assert(p !is null, "ecrs: finalizing no component");
 	if (self.elements.finalizer !is null)
 		self.elements.finalizer(cast(inout(ubyte)[]) (cast(ubyte*) p)[0 .. self.elementSize]);
 }
@@ -636,7 +695,8 @@ template remove(T, size_t unique = 0) {
 }
 
 
-/// Inverts `order` into the relabelling `fp.algorithms.applyPermutation(order, ...)` performs: `remap[old]` is the index `old` ends up at. Release it with `fp.pointer.allocator(remap, 0)`.
+/// Inverts `order` into the relabelling `fp.algorithms.applyPermutation(order, ...)` performs: `remap[old]` is the index `old` ends up at.
+/// Release it with `fp.pointer.allocator(remap, 0)`.
 ///
 /// Returns null if allocation fails.
 ///
@@ -653,12 +713,19 @@ package EntityId* buildRemap(const(size_t)[] order) @trusted {
 	immutable n = order.length > 0 ? order.length : 1;
 	auto remap = cast(EntityId*) fp.pointer.allocator(null, n * EntityId.sizeof);
 	if (remap is null) return null;
-	foreach (i; 0 .. order.length) remap[order[i]] = cast(EntityId) i;
+	// Marked first, so an order that is not a permutation is caught: an id named twice, or one past the table, would leave an entity unmapped.
+	foreach (i; 0 .. order.length) remap[i] = EntityId.max;
+	foreach (i; 0 .. order.length) {
+		assert(order[i] < order.length && remap[order[i]] == EntityId.max, "ecrs: an entity order that is not a permutation of the table");
+		remap[order[i]] = cast(EntityId) i;
+	}
+	foreach (i; 0 .. order.length) assert(remap[order[i]] == i, "ecrs: a remap that does not invert its order");
 	return remap;
 }
 
 // Keeps both owners' index entries naming their components, but leaves `holes` stale for the caller to rebuild.
 private void swapSlots(ref Storage self, size_t componentId, IndexTable indexTable, size_t a, size_t b) @trusted {
+	assert(a < slotCount(self) && b < slotCount(self), "ecrs: swapping slots past the storage");
 	if (a == b) return;
 	touch(self);
 	fp.pagedarray.swap(self.elements, a, b);
@@ -678,9 +745,12 @@ private void settleHoles(ref Storage self) @trusted {
 	foreach (slot; 0 .. slotCount(self))
 		if (self.slotOwners[slot] == invalidEntity)
 			cast(void) fp.dynarray.pushBack(self.holes, slot); // a hole it misses is only left unreused
+	assert(slotCount(self) == 0 || *fp.dynarray.back(self.slotOwners) != invalidEntity, "ecrs: a storage ending in a hole after settling");
+	assert(holeCount(self) + self.live <= slotCount(self), "ecrs: holes and live components that overlap");
 }
 
-/// Applies a permutation of slots, `order[i]` being the slot whose component ends up at `i`, and trims trailing holes. It moves components, so it invalidates pointers into `self`.
+/// Applies a permutation of slots, `order[i]` being the slot whose component ends up at `i`, and trims trailing holes.
+/// It moves components, so it invalidates pointers into `self`.
 ///
 /// Returns false, changing nothing, if allocation fails.
 ///
@@ -702,11 +772,14 @@ private void settleHoles(ref Storage self) @trusted {
 /// fp.dynarray.free(indices);
 /// ---
 bool reorder(ref Storage self, size_t componentId, ref IndexTable indexTable, const(size_t)[] order) @trusted {
-	assert(order.length == slotCount(self));
+	assert(order.length == slotCount(self), "ecrs: an order for a different number of slots");
+	assert(!self.claimLimit, "ecrs: reordering a storage with claims open");
+	immutable live = self.live;
 	auto indices = indexTable;
 	if (!fp.algorithms.applyPermutation(order, (a, b) { swapSlots(self, componentId, indices, a, b); }))
 		return false;
 	settleHoles(self);
+	assert(self.live == live, "ecrs: a reorder that gained or lost components");
 	return true;
 }
 
@@ -749,6 +822,7 @@ private bool sortSlots(ref Storage self, size_t componentId, ref IndexTable inde
 	if (order is null) return false;
 	scope(exit) cast(void) fp.pointer.allocator(order, 0);
 	foreach (i; 0 .. n) order[i] = i;
+	assert(n < fp.pointer.allocationRefused, "ecrs: a slot index could be read as a sentinel");
 
 	// Holes sort last, so `settleHoles` trims every one of them.
 	bool cmp(size_t a, size_t b) @nogc nothrow {
@@ -757,10 +831,12 @@ private bool sortSlots(ref Storage self, size_t componentId, ref IndexTable inde
 		return liveLess(a, b);
 	}
 	std.algorithm.sorting.sort!cmp(order[0 .. n]);
+	foreach (i; 1 .. n) assert(!cmp(order[i], order[i - 1]), "ecrs: slots sorted out of order");
 	return reorder(self, componentId, indexTable, order[0 .. n]);
 }
 
-/// Sorts the components by `less(component(a), component(b))`, ignoring their owners, and trims trailing holes. It moves components, so it invalidates pointers into `self`.
+/// Sorts the components by `less(component(a), component(b))`, ignoring their owners, and trims trailing holes.
+/// It moves components, so it invalidates pointers into `self`.
 ///
 /// Returns false, changing nothing, if allocation fails.
 ///
@@ -862,7 +938,8 @@ template sortByOwner(T, size_t unique = 0) {
 }
 
 
-/// The storage half of an entity renumbering: relabels every slot's owner and, through the remap hook, every entity id the components hold. Only `ecrs.context` calls it, because it alone also moves the index lists to match.
+/// The storage half of an entity renumbering: relabels every slot's owner and, through the remap hook, every entity id the components hold.
+/// Only `ecrs.context` calls it, because it alone also moves the index lists to match.
 ///
 /// Examples:
 /// ---
@@ -879,11 +956,13 @@ template sortByOwner(T, size_t unique = 0) {
 /// fp.dynarray.free(indices);
 /// ---
 package void relabel(ref Storage self, const(EntityId)[] remap) @trusted {
+	assert(!self.claimLimit, "ecrs: relabelling a storage with claims open");
 	touch(self);
 	foreach (slot; 0 .. slotCount(self)) {
 		auto slotOwner = &self.slotOwners[slot];
 		if (*slotOwner == invalidEntity) continue;
 		if (*slotOwner < remap.length) *slotOwner = remap[*slotOwner];
+		assert(*slotOwner != invalidEntity, "ecrs: a remap that made a live slot a hole");
 		if (self.remapFunction !is null) self.remapFunction(fp.pagedarray.get(self.elements, slot), remap);
 	}
 }
@@ -915,6 +994,15 @@ unittest {
 	auto indices = makeIndices(3);
 	scope(exit) freeIndices(indices);
 
+	// A storage that does not exist yet reads as generation 0, so the first change advances it without an observation.
+	assert(generation(storage) == 0);
+	Storage unread = create(long.sizeof);
+	scope(exit) free(unread);
+	auto unreadIndices = makeIndices(2);
+	scope(exit) freeIndices(unreadIndices);
+	*add!long(unread, unreadIndices, 1) = 1;
+	assert(generation(unread) > 0);
+
 	auto g = generation(storage);
 	*add!long(storage, indices, 1) = 5;
 	*add!long(storage, indices, 2) = 4;
@@ -927,17 +1015,27 @@ unittest {
 	getForWriting!long(storage, 0) = 6;
 	assert(generation(storage) > g);
 
+	// Writes nobody observed in between share one step, and the next write after an observation advances it again.
+	g = generation(storage);
+	getForWriting!long(storage, 0) = 7;
+	getForWriting!long(storage, 1) = 3;
+	immutable afterTwo = generation(storage);
+	assert(afterTwo == g + 1);
+	getForWriting!long(storage, 0) = 8;
+	assert(generation(storage) == afterTwo + 1);
+	assert(generation(storage) == generation(storage));
+
 	g = generation(storage);
 	assert(sortByValue!long(storage, indices));
 	assert(generation(storage) > g);
 
 	g = generation(storage);
-	immutable EntityId[3] remap = [0, 2, 1];
+	immutable EntityId[3] remap = [0, 1, 2]; // the identity, since relabel leaves the index lists for the caller to rewrite
 	relabel(storage, remap[]);
 	assert(generation(storage) > g);
 
 	g = generation(storage);
-	assert(remove(storage, id, indices, 1)); // relabel left the index lists alone, so entity 1 still names slot 1, the last
+	assert(remove(storage, id, indices, 1)); // sorting moved entity 1, the larger value, to slot 1, the last
 	assert(generation(storage) > g);
 }
 

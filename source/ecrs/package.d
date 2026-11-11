@@ -8,3 +8,4 @@ public import ecrs.relation;
 public import ecrs.schedules;
 public import ecrs.datalog;
 public import ecrs.serialization;
+public import ecrs.tree;
