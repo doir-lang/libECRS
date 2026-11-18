@@ -9,6 +9,7 @@ Tags:
 - `WRAP-OneLine`: a function whose whole body forwards to one call or field; mark a wrapper a protocol requires with `// wrapper: <reason>` on the line above its documentation comment.
 - `LAYER-Platform`: an OS API or C runtime binding (`core.sys.*`, `core.stdc.*`) outside the modules allowed to use one, tests aside.
 - `LAYER-Pushed`: a pattern a lower library replaced.
+- `LAYER-Import`: an import of a module `CONFIG['forbidden_imports']` names, such as one of a package built on this one.
 - `E-Remap`: a hand-written `remap[` lookup outside libECRS.
 - `ECRS-Write`: a write through a component pointer from a read accessor; use `getForWriting`, `findForWriting` or `setComponent`.
 - `FN-Length`: a function outside the tests whose body is longer than `CONFIG['max_function_lines']`, in a file `CONFIG['any_length']` does not match; let the caller branch and move the straight-line parts into helpers.
@@ -79,7 +80,10 @@ PUSHED = [
 	('hand-written-trim', r'while\s*\(\s*([\w.]+)\.length\s*&&\s*\(\s*\1\[\s*(0|\$\s*-\s*1)\s*\]\s*==', 'leading or trailing characters trimmed by hand', 'use fp.string.trim, trimStart or trimEnd'),
 	('renamed-fp-file', r'\bfp\.file\b', 'fp.file, since renamed', 'use fp.io'),
 	('inline-generator', r'\*\s*1103515245\b|\*\s*6364136223846793005\b', 'random numbers from a hand-written generator', 'use fp.algorithms.Random'),
+	('hash-table-byte-hooks', r'\bfp\.hashtable\.Config\s*\(\s*&|\.(hashFunction|equalFunction|copyFunction)\s*=', 'hash table slots hashed or compared through byte-level hooks', 'pass an fp.hashtable view (keyOf, hash, equal)'),
 	('fix-from-hint', r'\bstartsWith\s*\(\s*hint\b', 'quick fix parsed back out of a hint\'s text', 'attach a diagnose.Diagnostic.Fix where the diagnostic is made'),
+	('hand-written-rewind', r'\b_?lseek\s*\(\s*\w+\s*,\s*0\s*,\s*([\w.]*SEEK_SET|0)\s*\)', 'descriptor moved back to its start by hand', 'use fp.io.rewind'),
+	('hand-written-take-front', r'\bremoveRange\s*\(\s*[\w.]+\s*,\s*0\s*,\s*[\w.]*head\s*\)', 'taken queue front compacted by hand', 'use fp.dynarray.takeFrontAmortized'),
 ]
 
 PLATFORM = re.compile(r'\bcore\s*\.\s*(?:sys|stdc)\s*\.')
@@ -87,7 +91,7 @@ PLATFORM = re.compile(r'\bcore\s*\.\s*(?:sys|stdc)\s*\.')
 PROTOCOL_HOOKS = {
 	'remapEntities', 'finalize', 'moveTo', 'copyTo', 'opCall', 'compute', 'empty', 'front', 'popFront', 'back', 'popBack', 'save',
 	'opIndex', 'opSlice', 'opDollar', 'opEquals', 'opCmp', 'opAssign', 'opApply', 'opUnary', 'opBinary', 'opCast', 'toHash',
-	'contentHash', 'equal', 'serialize', 'deserialize', 'keyEqual', 'keyHash', 'valueEqual', 'cycleFallback', 'describeKey', 'main',
+	'contentHash', 'equal', 'serialize', 'deserialize', 'keyEqual', 'keyHash', 'valueEqual', 'cycleFallback', 'describeKey', 'main', 'keyOf', 'hash',
 }
 
 CONTROL = {
@@ -427,6 +431,9 @@ def check_layers(path, code, config):
 			continue
 		for match in re.finditer(pattern, code):
 			yield Finding(path, line_of(code, match.start()), 'LAYER-Pushed', message, hint)
+	for pattern, hint in config.get('forbidden_imports', []):
+		for match in re.finditer(r'\bimport\s+' + pattern, code):
+			yield Finding(path, line_of(code, match.start()), 'LAYER-Import', 'import of a module this package may not depend on', hint)
 
 
 def check_remap(path, code, config):

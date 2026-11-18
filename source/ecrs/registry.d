@@ -146,89 +146,50 @@ Hooks hooksFor(T)() {
 }
 
 
-// The name comes first, so the hash and equality functions, which see only the key, can read it from the raw entry bytes.
-private struct ForwardEntry {
-	char* name; // owning: freed when the entry is removed or the table freed
-	size_t id;
-}
-private struct ReverseEntry {
-	size_t id;
-	char* name; // the matching ForwardEntry's buffer
-}
-private struct SizeEntry {
-	size_t id;
-	size_t size;
+// What the registry holds for one component id; a null `name` means the id was never registered.
+private struct Registered {
+	char* name; // owning: freed by `free`, or when its registration fails
+	size_t size = fp.pointer.notFound;
+	Hooks hooks;
 }
 
-// Marks a `idOf` key, whose name is the caller's C string: `fp.string.slice` would misread the bytes before one as a fat-pointer header.
-private enum size_t probeId = fp.pointer.notFound;
+// The `fp.hashtable` view of the name index, whose slots are component ids looked up by their registered names.
+private struct ByName {
+	alias Slot = size_t;
+	alias Key = const(char)[];
+	const(Registered)* records;
 
-private const(char)[] nameOf(const(ForwardEntry)* e) @trusted {
-	return e.id == probeId ? fp.string.sliceTerminated(e.name) : fp.string.slice(e.name);
-}
-
-private size_t nameHash(inout(ubyte)[] data) @trusted {
-	assert(data.length == ForwardEntry.sizeof, "ecrs: hashing a registry entry of the wrong size");
-	return cast(size_t) fp.algorithms.hashShortBytes(nameOf(cast(const(ForwardEntry)*) data.ptr));
-}
-private bool nameEqual(inout(ubyte)[] a, inout(ubyte)[] b) @trusted {
-	assert(a.length == ForwardEntry.sizeof && b.length == ForwardEntry.sizeof, "ecrs: comparing registry entries of the wrong size");
-	return nameOf(cast(const(ForwardEntry)*) a.ptr) == nameOf(cast(const(ForwardEntry)*) b.ptr);
-}
-
-// wrapper: adapts a call to the function-pointer type a hook slot requires
-private size_t idHash(inout(ubyte)[] data) @trusted {
-	assert(data.length >= size_t.sizeof, "ecrs: hashing a registry entry without an id");
-	return cast(size_t) fp.algorithms.hashShortBytes(data[0 .. size_t.sizeof]);
-}
-private bool idEqual(inout(ubyte)[] a, inout(ubyte)[] b) @trusted {
-	assert(a.length == b.length && a.length >= size_t.sizeof, "ecrs: comparing registry entries of different kinds");
-	return a[0 .. size_t.sizeof] == b[0 .. size_t.sizeof];
-}
-
-private void finalizeForwardEntry(inout(ubyte)[] data) @trusted {
-	assert(data.length == ForwardEntry.sizeof, "ecrs: finalizing a registry entry of the wrong size");
-	auto e = cast(ForwardEntry*) data.ptr;
-	assert(e.id != probeId, "ecrs: a lookup's probe stored in the registry");
-	if (e.name !is null) fp.string.free(e.name);
+	const(char)[] keyOf(ref const size_t id) const @nogc nothrow @trusted {
+		assert(id < fp.dynarray.length(records) && records[id].name !is null, "ecrs: a name index slot naming no registered component");
+		return fp.string.slice(records[id].name);
+	}
+	size_t hash(const(char)[] key) const @nogc nothrow { return cast(size_t) fp.algorithms.hashShortBytes(key); }
+	bool equal(const(char)[] a, const(char)[] b) const @nogc nothrow { return a == b; }
 }
 
 
 private shared size_t idCounter = 0;
 // Bumped by `free` so every id `componentId` cached is registered afresh; starting at 1 means a fresh cache never matches.
 private shared size_t epoch = 1;
-// fp.hashtable's inserts may reallocate a table, so these fields, never local copies, must be what every insert is handed.
+// fp.hashtable and fp.dynarray may reallocate on growth, so these fields, never local copies, must be what every insert is handed.
 private struct Tables {
-	ForwardEntry* forwardMap = null;
-	ReverseEntry* reverseMap = null;
-	SizeEntry* sizeMap = null;
-	Hooks* hooksTable = null; // dynarray indexed by component id
+	size_t* byName = null; // the ids of `records` that hold a name, an `fp.hashtable` through `ByName`
+	Registered* records = null; // dynarray indexed by component id
 }
 
 // Behind a spinlock rather than `bc.mutex`, which `create` allocates and so would itself need a race-free lazy initialization.
 private __gshared bc.monitor.Monitor!Tables registry;
 
 // Lookups treat a table that does not exist yet as empty, so the tables are created on first registration.
-private bool ensureTables(ref Tables t) @trusted {
-	if (t.forwardMap is null) {
-		fp.hashtable.Config config = fp.hashtable.Config(&nameHash, &nameEqual);
-		config.finalizer = &finalizeForwardEntry;
-		t.forwardMap = fp.hashtable.create!ForwardEntry(config);
-	}
-	if (t.reverseMap is null)
-		t.reverseMap = fp.hashtable.create!ReverseEntry(fp.hashtable.Config(&idHash, &idEqual));
-	if (t.sizeMap is null)
-		t.sizeMap = fp.hashtable.create!SizeEntry(fp.hashtable.Config(&idHash, &idEqual));
-	assert(t.forwardMap is null || fp.hashtable.valid(t.forwardMap), "ecrs: a registry name table that is not a table");
-	return t.forwardMap !is null && t.reverseMap !is null && t.sizeMap !is null;
-}
-
-private bool reserveHooks(ref Tables t, size_t componentId) @trusted {
-	immutable oldLength = fp.dynarray.length(t.hooksTable);
+private bool reserve(ref Tables t, size_t componentId) @trusted {
+	if (t.byName is null) t.byName = fp.hashtable.create!size_t();
+	if (t.byName is null) return false;
+	assert(fp.hashtable.valid(t.byName), "ecrs: a registry name index that is not a table");
+	immutable oldLength = fp.dynarray.length(t.records);
 	if (oldLength > componentId) return true;
-	if (fp.dynarray.growToSize(t.hooksTable, componentId + 1) is null) return false;
-	foreach (i; oldLength .. componentId + 1) t.hooksTable[i] = Hooks.init;
-	assert(fp.dynarray.length(t.hooksTable) == componentId + 1, "ecrs: a hooks table grown to the wrong length");
+	if (fp.dynarray.growToSize(t.records, componentId + 1) is null) return false;
+	foreach (i; oldLength .. componentId + 1) t.records[i] = Registered.init;
+	assert(fp.dynarray.length(t.records) == componentId + 1, "ecrs: a registry grown to the wrong length");
 	return true;
 }
 
@@ -250,27 +211,19 @@ size_t freshId() {
 private size_t registerTypeLocked(ref Tables t, const(char)[] name, size_t componentId, size_t typeSize, Hooks hooks) @trusted {
 	assert(name.length > 0, "ecrs: a component with no name");
 	assert(componentId < fp.pointer.allocationRefused, "ecrs: a component id that is a sentinel");
-	if (!ensureTables(t) || !reserveHooks(t, componentId)) return fp.pointer.notFound;
+	if (!reserve(t, componentId)) return fp.pointer.notFound;
+	assert(t.records[componentId].name is null, "ecrs: component id registered twice");
+	assert(fp.hashtable.find(ByName(t.records), t.byName, name) is null, "ecrs: component name registered twice");
 	char* owned = fp.string.clone(name).get(null);
 	if (owned is null) return fp.pointer.notFound;
-
-	assert(fp.hashtable.find(t.forwardMap, ForwardEntry(owned, 0)) is null, "ecrs: component name registered twice");
-	if (fp.hashtable.insertNew(t.forwardMap, ForwardEntry(owned, componentId)) is null) {
+	// The record comes first, since the view reads every id's name through it.
+	t.records[componentId] = Registered(owned, typeSize, hooks);
+	if (fp.hashtable.insertNew(ByName(t.records), t.byName, componentId) is null) {
 		fp.string.free(owned);
+		t.records[componentId] = Registered.init;
 		return fp.pointer.notFound;
 	}
-	// From here on, removing the forward entry frees `owned` too.
-	if (fp.hashtable.insertNew(t.reverseMap, ReverseEntry(componentId, owned)) is null) {
-		fp.hashtable.remove(t.forwardMap, ForwardEntry(owned, 0));
-		return fp.pointer.notFound;
-	}
-	if (fp.hashtable.insertNew(t.sizeMap, SizeEntry(componentId, typeSize)) is null) {
-		fp.hashtable.remove(t.reverseMap, ReverseEntry(componentId, null));
-		fp.hashtable.remove(t.forwardMap, ForwardEntry(owned, 0));
-		return fp.pointer.notFound;
-	}
-	t.hooksTable[componentId] = hooks;
-	assert(fp.hashtable.find(t.sizeMap, SizeEntry(componentId, 0)).size == typeSize, "ecrs: a registered size that reads back differently");
+	assert(*fp.hashtable.find(ByName(t.records), t.byName, name) == componentId, "ecrs: a registered name that reads back as another id");
 	return componentId;
 }
 
@@ -332,7 +285,7 @@ size_t componentId(T, size_t unique = 0)() @trusted {
 	if (core.atomic.atomicLoad!(core.atomic.MemoryOrder.raw)(cachedEpoch) != current) {
 		immutable registered = registerTypeLocked(tables.value, componentName!(T, unique), freshId(), T.sizeof, hooksFor!T());
 		if (registered == fp.pointer.notFound) return fp.pointer.notFound;
-		assert(registered < fp.dynarray.length(tables.value.hooksTable), "ecrs: a registered id with no hooks");
+		assert(registered < fp.dynarray.length(tables.value.records), "ecrs: a registered id with no record");
 		core.atomic.atomicStore!(core.atomic.MemoryOrder.raw)(id, registered);
 		core.atomic.atomicStore!(core.atomic.MemoryOrder.rel)(cachedEpoch, current);
 	}
@@ -366,10 +319,8 @@ bool register(Ts...)() {
 /// ---
 size_t idOf(const(char)* name) @trusted {
 	auto tables = bc.monitor.read(registry);
-	if (tables.value.forwardMap is null) return fp.pointer.notFound;
-	immutable at = fp.hashtable.positionOf(tables.value.forwardMap, ForwardEntry(cast(char*) name, probeId));
-	assert(at == fp.pointer.notFound || tables.value.forwardMap[at].id != probeId, "ecrs: a lookup's probe found in the registry");
-	return at == fp.pointer.notFound ? fp.pointer.notFound : tables.value.forwardMap[at].id;
+	auto found = fp.hashtable.find(ByName(tables.value.records), tables.value.byName, fp.string.sliceTerminated(name));
+	return found is null ? fp.pointer.notFound : *found;
 }
 
 /// The size in bytes registered for `componentId`, or `fp.pointer.notFound` for an unknown id.
@@ -381,10 +332,9 @@ size_t idOf(const(char)* name) @trusted {
 /// ---
 size_t elementSizeOf(size_t componentId) @trusted {
 	auto tables = bc.monitor.read(registry);
-	if (tables.value.sizeMap is null) return fp.pointer.notFound;
-	immutable at = fp.hashtable.positionOf(tables.value.sizeMap, SizeEntry(componentId, 0));
-	assert(at == fp.pointer.notFound || tables.value.sizeMap[at].id == componentId, "ecrs: a size lookup that found another component");
-	return at == fp.pointer.notFound ? fp.pointer.notFound : tables.value.sizeMap[at].size;
+	if (componentId >= fp.dynarray.length(tables.value.records)) return fp.pointer.notFound;
+	assert(tables.value.records[componentId].name !is null || tables.value.records[componentId].size == fp.pointer.notFound, "ecrs: a size recorded for an unregistered id");
+	return tables.value.records[componentId].size;
 }
 
 /// The hooks registered for `componentId`, or `Hooks.init`, no hooks, for an unknown id.
@@ -396,7 +346,7 @@ size_t elementSizeOf(size_t componentId) @trusted {
 /// ---
 Hooks hooksOf(size_t componentId) @trusted {
 	auto tables = bc.monitor.read(registry);
-	return componentId < fp.dynarray.length(tables.value.hooksTable) ? tables.value.hooksTable[componentId] : Hooks.init;
+	return componentId < fp.dynarray.length(tables.value.records) ? tables.value.records[componentId].hooks : Hooks.init;
 }
 
 private shared size_t traitChanges = 0;
@@ -414,10 +364,10 @@ private shared size_t traitChanges = 0;
 /// ---
 void setRelationTraits(size_t componentId, uint traits) @trusted {
 	auto tables = bc.monitor.write(registry);
-	auto hooksTable = tables.value.hooksTable;
-	assert(componentId < fp.dynarray.length(hooksTable), "ecrs: traits on an unregistered component");
-	assert(traits == 0 || hooksTable[componentId].shape.columns == 1, "ecrs: traits need a binary relation");
-	hooksTable[componentId].shape.traits = traits;
+	auto records = tables.value.records;
+	assert(componentId < fp.dynarray.length(records) && records[componentId].name !is null, "ecrs: traits on an unregistered component");
+	assert(traits == 0 || records[componentId].hooks.shape.columns == 1, "ecrs: traits need a binary relation");
+	records[componentId].hooks.shape.traits = traits;
 	core.atomic.atomicOp!"+="(traitChanges, 1);
 }
 
@@ -442,9 +392,7 @@ size_t traitsGeneration() { return core.atomic.atomicLoad(traitChanges); }
 /// ---
 const(char)* nameOf(size_t componentId) @trusted {
 	auto tables = bc.monitor.read(registry);
-	if (tables.value.reverseMap is null) return null;
-	immutable at = fp.hashtable.positionOf(tables.value.reverseMap, ReverseEntry(componentId, null));
-	return at == fp.pointer.notFound ? null : tables.value.reverseMap[at].name;
+	return componentId < fp.dynarray.length(tables.value.records) ? tables.value.records[componentId].name : null;
 }
 
 
@@ -461,10 +409,10 @@ const(char)* nameOf(size_t componentId) @trusted {
 /// ---
 void free() @trusted {
 	auto tables = bc.monitor.write(registry);
-	fp.hashtable.free(tables.value.forwardMap); // frees the names, which reverseMap only aliases
-	fp.hashtable.free(tables.value.reverseMap);
-	fp.hashtable.free(tables.value.sizeMap);
-	fp.dynarray.free(tables.value.hooksTable);
+	fp.hashtable.free(tables.value.byName);
+	foreach (ref record; fp.dynarray.slice(tables.value.records))
+		if (record.name !is null) fp.string.free(record.name);
+	fp.dynarray.free(tables.value.records);
 	core.atomic.atomicStore(idCounter, 0);
 	core.atomic.atomicOp!"+="(epoch, 1);
 }
